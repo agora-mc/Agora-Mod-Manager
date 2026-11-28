@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { setSwitch } from './support/switches';
 
 /**
  * Verify that one failed setting read does not prevent others from loading,
@@ -191,13 +192,13 @@ test('boolean settings are sent to Tauri as JSON booleans', async ({ page }) => 
   // General > Basics is the landing section, so the install toggles are here.
   await expect(page.getByLabel('Always auto-confirm installs', { exact: true })).toBeDisabled();
 
-  await page.getByLabel('Auto-confirm clean installs', { exact: true }).check();
+  await setSwitch(page.getByLabel('Auto-confirm clean installs', { exact: true }), true);
   await expect.poll(async () => page.evaluate(() => (window as any).__settingWrites)).toContainEqual({
     key: 'install_auto_confirm_clean',
     value: true,
   });
 
-  await page.getByLabel('Always auto-confirm installs', { exact: true }).check();
+  await setSwitch(page.getByLabel('Always auto-confirm installs', { exact: true }), true);
   await expect.poll(async () => page.evaluate(() => (window as any).__settingWrites)).toContainEqual({
     key: 'install_always_auto_confirm',
     value: true,
@@ -206,7 +207,7 @@ test('boolean settings are sent to Tauri as JSON booleans', async ({ page }) => 
   await page.getByRole('navigation', { name: 'Settings sections' })
     .getByRole('tab', { name: 'Services' }).click();
   await expect(page.getByText('Modrinth Integration', { exact: true })).toBeVisible();
-  await page.locator('#settings-services input[type="checkbox"]').first().check();
+  await page.locator('#settings-services').getByRole('switch').first().click();
 
   await expect.poll(async () => page.evaluate(() => (window as any).__settingWrites)).toContainEqual({
     key: 'modrinth_enabled',
@@ -248,7 +249,7 @@ test('software updates section shows the packaged app version from Tauri', async
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
   await page.getByRole('tab', { name: 'Updates' }).click();
   await expect(page.getByRole('heading', { name: 'Software Updates' })).toBeVisible();
-  await expect(page.locator('#settings-updates')).toContainText('Agora Launcher 9.8.7-test');
+  await expect(page.locator('#settings-updates')).toContainText('Agora Mod Manager 9.8.7-test');
 });
 
 test('open application data folder invokes the open_data_folder command', async ({ page }) => {

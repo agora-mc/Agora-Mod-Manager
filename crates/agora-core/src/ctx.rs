@@ -11,11 +11,11 @@
 use crate::app_paths::AppPaths;
 use crate::error::{LauncherError, LauncherResult};
 use crate::event_sink::{EventSink, NoopEventSink, NoopProgressSink, ProgressSink};
+use crate::game_hooks::{CatalogEvent, Extensions};
 use crate::http_client::HttpClients;
 use crate::lock_manager::LockManager;
 use crate::operation_manager::OperationManager;
 use crate::process_session_manager::ProcessSessionManager;
-use crate::runtime_catalog::{RuntimeCatalog, RuntimeCatalogHandle};
 use crate::task_scheduler::TaskScheduler;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -83,19 +83,23 @@ impl Clock for TestClock {
 pub struct CoreContext {
     /// Path layout for this host.
     pub paths: AppPaths,
-    /// Official Mojang launcher profile file. Test contexts point this at an
-    /// isolated fixture instead of the user's platform-default Minecraft data.
-    pub launcher_profiles_path: Option<std::path::PathBuf>,
+    /// Where game packages should look for a game's own user data (an official
+    /// launcher's files, a store's config) instead of the platform defaults.
+    /// `None` in production; test contexts set it. Only the Minecraft
+    /// package's launcher-profile path honours it so far: some read-only
+    /// lookups (the official `.minecraft` directory) still use the platform
+    /// default.
+    pub external_data_root: Option<std::path::PathBuf>,
     /// Category-aware pre-built HTTP clients.
     pub http_clients: HttpClients,
     /// Clock for time-sensitive operations.
     pub clock: Arc<dyn Clock>,
+    /// Settings shared by this context and its clones.
+    pub settings_cache: Arc<crate::settings::SettingsCache>,
     /// Cross-process filesystem lock manager.
     pub lock_manager: LockManager,
-    /// Validated Java runtime catalog active for this context.
-    /// Wrapped in an `Arc<RwLock>` so any holder can take an atomic snapshot
-    /// and so the catalog can be reloaded at runtime without process restart.
-    pub runtime_catalog: RuntimeCatalogHandle,
+    /// State owned by game packages (catalogs, caches), keyed by type.
+    pub extensions: Extensions,
     /// Sink for progress events emitted during long-running operations.
     pub progress_sink: Arc<dyn ProgressSink>,
     /// Sink for significant core events.
@@ -106,6 +110,20 @@ pub struct CoreContext {
     pub task_scheduler: TaskScheduler,
     /// Process session manager for direct-launch lifecycle tracking.
     pub process_session_manager: ProcessSessionManager,
+    /// Registry of supported games and their packages.
+    pub games: Arc<crate::game_registry::GameRegistry>,
+    /// The keys this context trusts for the signed catalog, and (in tests) the
+    /// debug-only permission to open an unsigned cache.
+    pub registry_trust: crate::registry_bundle::RegistryTrust,
+    /// The test seams installed on this context (MASTER_SPEC §32.9). Clones share
+    /// them, so a hook reaches the operation wherever it runs; no other context
+    /// sees them. Empty in production, so each seam costs one cheap check.
+    pub test_seams: crate::test_seams::TestSeams,
+    /// This context's outbound gate, shared with its HTTP clients (MASTER_SPEC §32.9).
+    ///
+    /// It reads this context's settings cache, so a request from this context answers by this
+    /// context's database even when another context exists in the same process.
+    pub gate: crate::network_gate::SharedGate,
 }
 
 /// The main context type alias — use `Ctx` throughout the codebase.
@@ -126,7 +144,46 @@ impl CoreContext {
     ///
     /// Warnings are returned as `Vec<String>` — genuinely recoverable
     /// observations that did not prevent initialization.
-    pub fn initialize(paths: AppPaths) -> LauncherResult<(Self, Vec<String>)> {
+    pub fn initialize(
+        paths: AppPaths,
+        game_builder: crate::game_registry::GameRegistryBuilder,
+    ) -> LauncherResult<(Self, Vec<String>)> {
+        Self::initialize_with_registry_trust(
+            paths,
+            game_builder,
+            crate::plugins::official::RegistryTrust::production(),
+        )
+    }
+
+    /// [`Self::initialize`] with an explicit registry key. Test support:
+    /// adapters call `initialize`, which trusts only the key compiled into the
+    /// app. The key decides which installed plugins count as official.
+    pub fn initialize_with_registry_trust(
+        paths: AppPaths,
+        game_builder: crate::game_registry::GameRegistryBuilder,
+        registry_trust: crate::plugins::official::RegistryTrust,
+    ) -> LauncherResult<(Self, Vec<String>)> {
+        Self::initialize_with_local_state_options(
+            paths,
+            game_builder,
+            registry_trust,
+            &crate::db::LocalStateOpenOptions::default(),
+        )
+        .map(|(ctx, warnings, _report)| (ctx, warnings))
+    }
+
+    /// [`Self::initialize_with_registry_trust`] with the startup choices for the
+    /// local database, returning what startup did to it.
+    ///
+    /// Adapters use this to offer the explicit overrides (a newer-schema
+    /// database, or a failed pre-migration backup) and to tell the player when
+    /// a corrupt database was recovered.
+    pub fn initialize_with_local_state_options(
+        paths: AppPaths,
+        mut game_builder: crate::game_registry::GameRegistryBuilder,
+        registry_trust: crate::plugins::official::RegistryTrust,
+        local_state_options: &crate::db::LocalStateOpenOptions,
+    ) -> LauncherResult<(Self, Vec<String>, crate::db::LocalStateStartupReport)> {
         let mut warnings = Vec::new();
 
         // 1. Create required directories.
@@ -134,26 +191,344 @@ impl CoreContext {
 
         // 2. Fatal: initialize / migrate local_state.db.
         let db_path = paths.local_state_db();
-        // Every adapter reaches the network through this context, so this is
-        // the one place the outbound policy has to be installed. Until it is,
-        // `network_gate` denies — a missing policy must not read as consent.
-        crate::network_gate::install(Arc::new(crate::network_gate::SettingsGate::new(
-            db_path.clone(),
-        )));
-        crate::db::init_local_state_db(&db_path).map_err(|e| {
-            let msg = format!(
-                "Failed to initialize local state database at {}: {e}",
-                db_path.display()
-            );
-            // Log the path without secrets or token data.
-            LauncherError::Generic {
-                code: "ERR_LOCAL_STATE_FAILED".into(),
-                message: msg,
+        let test_seams = crate::test_seams::TestSeams::default();
+        let local_state_report = crate::db::init_local_state_db_with(&db_path, local_state_options)
+            .map_err(|e| {
+                // A typed error already says what happened and what the player
+                // can do (a newer schema, a failed backup), so keep its code.
+                if let Some(known) = e.downcast_ref::<LauncherError>() {
+                    return known.clone();
+                }
+                let msg = format!(
+                    // `{e:#}` and not `{e}`: the outermost message says only *that* a step
+                    // failed, and the report underneath it names the rows that stopped it (an id
+                    // in both old tables, a row that would change owner). That report is what
+                    // the player can act on, so it has to survive as far as the screen.
+                    "Failed to initialize local state database at {}: {e:#}",
+                    db_path.display()
+                );
+                // Log the path without secrets or token data.
+                LauncherError::Generic {
+                    code: "ERR_LOCAL_STATE_FAILED".into(),
+                    message: msg,
+                }
+            })?;
+        if let Some(recovery) = &local_state_report.recovered_corrupt {
+            match &recovery.restored_from {
+                Some(backup) => warnings.push(format!(
+                    "The local database was damaged. It was kept at {} and the newest good \
+                     backup ({}) was restored.",
+                    recovery.kept_at.display(),
+                    backup.display()
+                )),
+                None => warnings.push(format!(
+                    "The local database was damaged and no good backup was found. It was kept \
+                     at {} and Agora started with a fresh database.",
+                    recovery.kept_at.display()
+                )),
             }
-        })?;
-        warnings.extend(crate::launcher_import_service::recover_interrupted_jobs(
-            &paths,
-        ));
+        }
+        if let Some(newer) = &local_state_report.newer_schema_kept {
+            warnings.push(format!(
+                "The local database (schema version {}) was written by a newer Agora. It was \
+                 kept at {} and Agora started with a fresh database.",
+                newer.found,
+                newer.kept_at.display()
+            ));
+        }
+        warnings.extend(local_state_report.warnings.iter().cloned());
+
+        // The plugin runtime is created later, but a scripted package needs a
+        // stable handle to it now. The handle is empty until the plugin service
+        // is built, and a hook called before then says so instead of guessing.
+        let behaviour_runtime = crate::game_registry::scripted::BehaviourRuntime::new();
+
+        // 2b. Read every plugin game package as raw JSON first, resolve inheritance, then register
+        //     the packages that survived. A plugin package never stops startup, but a failure to
+        //     read plugins is said out loud: silently losing games looks like a bug.
+        match crate::db::local_state_connection(&db_path) {
+            Err(e) => warnings.push(format!("Cannot read plugin game packages: {e}")),
+            Ok(conn) => {
+                // An install that was interrupted can leave the previous
+                // version stranded in the rollback folder and the game missing.
+                // Finish or undo it before anything reads the records.
+                match crate::plugins::install::recover_interrupted_installs(&conn, &paths) {
+                    Ok(recovered) => warnings.extend(recovered),
+                    Err(e) => {
+                        warnings.push(format!("Cannot recover interrupted plugin installs: {e}"))
+                    }
+                }
+
+                match crate::plugins::store::load_snapshot(&conn) {
+                    Err(e) => warnings.push(format!("Cannot read plugin game packages: {e}")),
+                    Ok(snapshot) => {
+                        let official = match crate::plugins::official::verify_snapshot(
+                            &snapshot,
+                            paths.root(),
+                            &registry_trust,
+                        ) {
+                            Ok(statuses) => statuses,
+                            Err(e) => {
+                                warnings.push(format!(
+                                    "Cannot verify official plugins, so none is treated as official: {e}"
+                                ));
+                                std::collections::BTreeMap::new()
+                            }
+                        };
+                        let crate::plugins::store::PluginLoadSnapshot {
+                            guard,
+                            mut records,
+                            pending,
+                        } = snapshot;
+
+                        warnings.extend(pending.values().cloned());
+                        // Official plugins register first. A game id or a store
+                        // product id goes to whoever claims it first, and the
+                        // records come back in plugin-id order, so without this
+                        // a community plugin named `aaaa.x` could take
+                        // `skyrim-se` before the official plugin was read.
+                        // Stable, so each group stays in plugin-id order.
+                        // Blocked (Unverified) official plugins come first
+                        // too: they hold their game ids even though they do
+                        // not load, so the reservation must happen before
+                        // any community package is read.
+                        records.sort_by_key(|record| {
+                            matches!(
+                                official.get(record.id().as_str()),
+                                None | Some(crate::plugins::official::OfficialStatus::Community)
+                            )
+                        });
+
+                        let mut inputs: Vec<crate::game_registry::PackageInput> = Vec::new();
+                        let mut has_entrypoint: std::collections::BTreeMap<String, bool> =
+                            std::collections::BTreeMap::new();
+                        for record in records {
+                            if !record.enabled
+                                || crate::plugins::store::is_tombstone(&record)
+                                || !record
+                                    .granted
+                                    .contains(agora_plugin_api::Capability::GameDefine)
+                            {
+                                continue;
+                            }
+                            if pending.contains_key(record.id().as_str()) {
+                                match crate::plugins::store::committed_game_packages(
+                                    &guard,
+                                    record.id(),
+                                ) {
+                                    Ok(declarations) => {
+                                        inputs.extend(declarations.into_iter().map(
+                                            |(path, json)| crate::game_registry::PackageInput {
+                                                source:
+                                                    crate::game_registry::PackageSource::Plugin {
+                                                        plugin_id: record.id().to_string(),
+                                                    },
+                                                blocked: true,
+                                                label: format!(
+                                                    "Plugin {}, committed game package {path}",
+                                                    record.id()
+                                                ),
+                                                json,
+                                            },
+                                        ));
+                                    }
+                                    Err(error) => warnings.push(format!(
+                                        "Cannot read committed game packages for {}: {error}",
+                                        record.id()
+                                    )),
+                                }
+                                continue;
+                            }
+                            has_entrypoint.insert(
+                                record.id().to_string(),
+                                record.manifest.entrypoint.is_some(),
+                            );
+
+                            let blocked = match official.get(record.id().as_str()) {
+                                Some(crate::plugins::official::OfficialStatus::Official {
+                                    ..
+                                }) => false,
+                                Some(crate::plugins::official::OfficialStatus::Unverified {
+                                    reason,
+                                }) => {
+                                    warnings.push(format!(
+                                        "Plugin {} is blocked and its games are not loaded: {reason}.",
+                                        record.id()
+                                    ));
+                                    true
+                                }
+                                Some(
+                                    crate::plugins::official::OfficialStatus::CatalogUnavailable {
+                                        reason,
+                                    },
+                                )
+                                | Some(crate::plugins::official::OfficialStatus::NotListed {
+                                    reason,
+                                }) => {
+                                    // It still loads from its installed files;
+                                    // say (once, on the plugin and here) that
+                                    // it could not be checked this time.
+                                    warnings.push(format!(
+                                        "Plugin {} is loaded from its installed files: {reason}",
+                                        record.id()
+                                    ));
+                                    false
+                                }
+                                Some(crate::plugins::official::OfficialStatus::Community)
+                                | None => false,
+                            };
+
+                            for pkg_contrib in &record.manifest.contributions.game_packages {
+                                let json = match crate::game_registry::inherit::read_game_package(
+                                    &record.install_dir,
+                                    &pkg_contrib.path,
+                                ) {
+                                    Ok(json) => json,
+                                    Err(error) => {
+                                        warnings.push(format!("Plugin {}: {error}", record.id()));
+                                        continue;
+                                    }
+                                };
+                                let file_path = record.install_dir.join(&pkg_contrib.path);
+                                inputs.push(crate::game_registry::PackageInput {
+                                    source: crate::game_registry::PackageSource::Plugin {
+                                        plugin_id: record.id().to_string(),
+                                    },
+                                    blocked,
+                                    label: format!(
+                                        "Plugin {}, game package {}",
+                                        record.id(),
+                                        file_path.display()
+                                    ),
+                                    json,
+                                });
+                            }
+                        }
+
+                        drop(guard);
+
+                        let from_pending = |source: &crate::game_registry::PackageSource| matches!(source, crate::game_registry::PackageSource::Plugin { plugin_id } if pending.contains_key(plugin_id));
+                        if inputs.iter().any(|input| from_pending(&input.source)) {
+                            // Resolve committed declarations for reservations, then remove them
+                            // before resolving any packages that will actually register.
+                            let (committed, _) =
+                                crate::game_registry::inherit::resolve(inputs.clone());
+                            for package in committed
+                                .iter()
+                                .filter(|package| from_pending(&package.source))
+                            {
+                                game_builder.reserve_blocked(&package.definition);
+                            }
+                            inputs.retain(|input| !from_pending(&input.source));
+                        }
+
+                        // All packages are read before any is resolved, so a parent may live in
+                        // another plugin. A broken package warns with its chain and the others
+                        // carry on.
+                        let (resolved, mut resolve_warnings) =
+                            crate::game_registry::inherit::resolve(inputs);
+                        warnings.append(&mut resolve_warnings);
+
+                        // A blocked official plugin's games stay reserved before any community
+                        // package is registered, even though the blocked package itself does not
+                        // register.
+                        for package in &resolved {
+                            if package.blocked {
+                                game_builder.reserve_blocked(&package.definition);
+                            }
+                        }
+                        for package in resolved {
+                            if package.blocked {
+                                continue;
+                            }
+                            let plugin_id = match &package.source {
+                                crate::game_registry::PackageSource::Plugin { plugin_id } => {
+                                    Some(plugin_id.clone())
+                                }
+                                _ => None,
+                            };
+                            let names_script = crate::game_registry::scripted::needs_entrypoint(
+                                &package.definition,
+                            )
+                            .is_some();
+                            if names_script {
+                                let Some(own_plugin) = plugin_id.as_deref() else {
+                                    warnings.push(format!(
+                                        "{}: skipped, because it names a script hook but has no plugin to run it",
+                                        package.label
+                                    ));
+                                    continue;
+                                };
+                                if let Some((owner, why)) =
+                                    crate::game_registry::scripted::missing_entrypoint(
+                                        &package.definition,
+                                        own_plugin,
+                                        &package.owners,
+                                        &has_entrypoint,
+                                    )
+                                {
+                                    warnings.push(format!(
+                                        "{}: skipped, because {why} but plugin {owner} has no entrypoint to run it",
+                                        package.label
+                                    ));
+                                    continue;
+                                }
+                            }
+                            // A base package with no games exists only for its children to inherit
+                            // from. It is not a game package and has nothing to register.
+                            if package.definition.games.is_empty() {
+                                continue;
+                            }
+                            let source = package.source.clone();
+                            let label = package.label.clone();
+                            let package: Arc<dyn agora_game_api::GamePackage> =
+                                match (&package.source, names_script) {
+                                    (
+                                        crate::game_registry::PackageSource::Plugin { plugin_id },
+                                        true,
+                                    ) => match agora_plugin_api::manifest::PluginId::parse(
+                                        plugin_id,
+                                    ) {
+                                        Ok(id) => Arc::new(
+                                            crate::game_registry::scripted::ScriptedPackage::new(
+                                                package.definition,
+                                                id,
+                                                package.owners.clone(),
+                                                behaviour_runtime.clone(),
+                                            ),
+                                        ),
+                                        Err(error) => {
+                                            warnings.push(format!(
+                                                "{}: skipped, because its plugin id is invalid: {}",
+                                                label, error.message
+                                            ));
+                                            continue;
+                                        }
+                                    },
+                                    _ => Arc::new(crate::game_registry::DeclarativePackage(
+                                        package.definition,
+                                    )),
+                                };
+                            if let Err(err) = game_builder.add(source, package) {
+                                warnings.push(format!(
+                                    "{}: rejected game package: {err}. A game or store product \
+                                     already claimed (official plugins register first) cannot be \
+                                     claimed again.",
+                                    label
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let games = Arc::new(game_builder.build());
+        // The packages' own crash recovery (game-registry `recover_at_startup`) does NOT run
+        // here: it is part of the one startup recovery pass every adapter calls once the context
+        // exists, `startup_recovery::run_at_startup` (MASTER_SPEC §32.11). The plugin-install
+        // recovery above is the one exception: it must finish before the plugin records are
+        // read to build this registry, so it stays inside construction.
 
         // 3. Verify the cached registry's Ed25519 signature before anything
         //    reads it. Download-time verification only covers transit; the
@@ -161,19 +536,38 @@ impl CoreContext {
         //    download URL and expected hash the launcher trusts. A failing db is
         //    quarantined here, which also leaves no `registry.db` behind so the
         //    next sync re-downloads a good copy.
-        if let crate::registry_sync::CachedRegistryIntegrity::Quarantined(reason) =
-            crate::registry_sync::verify_cached_registry(paths.root())
-        {
-            warnings.push(reason);
-        }
+        let registry_trusted = match crate::registry_sync::verify_cached_registry_with_trust(
+            paths.root(),
+            &registry_trust,
+        ) {
+            crate::registry_sync::CachedRegistryIntegrity::Verified => true,
+            crate::registry_sync::CachedRegistryIntegrity::Absent => false,
+            crate::registry_sync::CachedRegistryIntegrity::Stale(reason)
+            | crate::registry_sync::CachedRegistryIntegrity::Recovered(reason) => {
+                warnings.push(reason);
+                true
+            }
+            crate::registry_sync::CachedRegistryIntegrity::Quarantined(reason)
+            | crate::registry_sync::CachedRegistryIntegrity::Error(reason) => {
+                warnings.push(reason);
+                false
+            }
+        };
 
         //    Then validate the cached registry schema version (warning only —
-        //    the cached db may be absent or stale, which is recoverable).
-        let reg_path = paths.registry_db();
-        let mut runtime_catalog = RuntimeCatalog::embedded();
-        if reg_path.exists() {
-            match crate::db::registry_connection(&reg_path) {
-                Ok(conn) => {
+        //    the cached db may be absent or stale, which is recoverable). A db
+        //    that failed verification is not opened at all.
+        let mut registry_conn = None;
+        if registry_trusted {
+            match crate::registry_sync::open_verified_registry_with_trust(
+                paths.root(),
+                &registry_trust,
+            ) {
+                Ok(registry) => {
+                    // Said once, here: an unusable staged bundle that was kept
+                    // rather than opened does not refuse the catalog.
+                    warnings.extend(registry.warnings().iter().cloned());
+                    let conn = registry.into_connection();
                     let version: Result<i64, _> = conn.query_row(
                         "SELECT COALESCE(MAX(version), 0) FROM schema_version",
                         [],
@@ -187,33 +581,12 @@ impl CoreContext {
                             ));
                         }
                     }
-                    match crate::loader_manifests::LoaderCatalog::init_from_registry(&conn) {
-                        Ok(true) => {
-                            warnings.push("Using merged signed and embedded loader catalogs".into())
-                        }
-                        Ok(false) => warnings.push("Using embedded loader catalog".into()),
-                        Err(error) => warnings.push(format!(
-                            "Cannot load signed loader catalog; using embedded fallback: {error}"
-                        )),
-                    }
-                    match RuntimeCatalog::from_registry_db(&conn) {
-                        Ok(Some(catalog)) => {
-                            runtime_catalog = catalog;
-                            warnings.push("Using signed registry Java runtime catalog".into());
-                        }
-                        Ok(None) => warnings.push("Using embedded Java runtime catalog".into()),
-                        Err(errors) => warnings.push(format!(
-                            "Cannot load signed Java runtime catalog; using embedded fallback: {errors:?}"
-                        )),
-                    }
+                    registry_conn = Some(conn);
                 }
                 Err(e) => {
                     warnings.push(format!("Cannot open cached registry: {e}"));
-                    warnings.push("Using embedded loader and Java runtime catalogs".into());
                 }
             }
-        } else {
-            warnings.push("Using embedded loader and Java runtime catalogs".into());
         }
 
         // 4. Conservative stale-staging cleanup.
@@ -253,7 +626,14 @@ impl CoreContext {
             }
         }
 
-        // 5. Validate lock directory is usable (warning only).
+        // 5. Sweep base and deploy staging folders whose owning process is gone. A live build or
+        //    deploy keeps its staging.
+        let _ = crate::game_base::sweep_stale_staging(&paths);
+
+        // 6. Validate lock directory is usable (warning only).
+        //    Known write: every open, read or write, creates and removes `locks/.probe`, which
+        //    changes the folder's modified time and leaves no file behind. It is the writability
+        //    check itself, so it stays.
         let locks_root = paths.locks_root();
         if locks_root.exists() {
             let probe = locks_root.join(".probe");
@@ -271,9 +651,9 @@ impl CoreContext {
             crate::http_client::configure_proxy(crate::http_client::saved_proxy(&conn));
         }
 
-        let ctx = Self {
+        let mut ctx = Self {
             lock_manager: LockManager::new(paths.locks_root()),
-            launcher_profiles_path: crate::paths::launcher_profiles_path(),
+            external_data_root: None,
             paths,
             http_clients: HttpClients::new().map_err(|e| {
                 // Convert HTTP client init failure to a fatal error.
@@ -282,16 +662,51 @@ impl CoreContext {
                     message: format!("Failed to build HTTP clients: {e}"),
                 }
             })?,
-            runtime_catalog: RuntimeCatalogHandle::new(runtime_catalog),
+            extensions: Extensions::default(),
             clock: Arc::new(WallClock),
+            settings_cache: Arc::new(crate::settings::SettingsCache::default()),
             progress_sink: Arc::new(NoopProgressSink),
             event_sink: Arc::new(NoopEventSink),
             operation_manager: OperationManager::new(),
             task_scheduler: TaskScheduler::default(),
             process_session_manager: ProcessSessionManager::new(),
+            games,
+            registry_trust: registry_trust.clone(),
+            test_seams,
+            // Replaced below, once the context exists and its gate can read its cache. Until then
+            // nothing here can make a request, and denying is the safe placeholder.
+            gate: Arc::new(crate::network_gate::DenyAll),
         };
+        ctx.extensions.insert(behaviour_runtime);
 
-        Ok((ctx, warnings))
+        // 6b. Give the context its outbound policy, now that it exists. Every request this context
+        //     makes asks this gate: it reads through this context's settings cache, so a second
+        //     process's Lockdown reaches the next request here, and a second context in this
+        //     process is not affected (§32.9). It is also installed process-wide, for the clients
+        //     built outside a context — in production there is one context per process, so that is
+        //     the same gate; failing closed is what happens when an adapter installs none.
+        let gate: crate::network_gate::SharedGate =
+            Arc::new(crate::network_gate::SettingsGate::for_context(&ctx));
+        ctx.gate = Arc::clone(&gate);
+        ctx.http_clients = ctx.http_clients.clone().with_gate(Arc::clone(&gate));
+        crate::network_gate::install(gate);
+
+        // 7. Let game packages load their catalogs from the signed registry
+        //    (or fall back to embedded data when there is none).
+        if ctx.games.is_empty() {
+            warnings.push(
+                "No game package is registered; no game catalogs or providers are available".into(),
+            );
+        }
+        match ctx
+            .games
+            .load_catalogs(&ctx, registry_conn.as_ref(), CatalogEvent::Startup)
+        {
+            Ok(more) => warnings.extend(more),
+            Err(error) => warnings.push(format!("Cannot load game catalogs: {error}")),
+        }
+
+        Ok((ctx, warnings, local_state_report))
     }
 
     /// Create a context for testing with temporary paths.
@@ -299,30 +714,42 @@ impl CoreContext {
     /// The caller should create a temp directory and pass its path.
     /// Uses a fast single-client HTTP client (no policy enforcement).
     pub fn for_testing(root: std::path::PathBuf) -> Self {
-        let launcher_profiles_path = root
-            .join("official-minecraft")
-            .join("launcher_profiles.json");
+        let external_data_root = Some(root.clone());
         let paths = AppPaths::from_root(root);
         let lock_manager = LockManager::new(paths.locks_root());
         let _ = std::fs::create_dir_all(paths.locks_root());
-        // Outbound requests are denied until an adapter installs a policy, so
-        // a test context installs a permissive one. Production adapters must
-        // install `SettingsGate` instead — there is no production constructor
-        // that yields an unrestricted gate.
-        crate::network_gate::install(std::sync::Arc::new(crate::network_gate::AllowAll));
+        // A test context's own clients are permissive, and only its own: the gate is not
+        // installed process-wide, so a test that needs refusal sets its gate on its own context
+        // and no other test in the same process inherits it. Production adapters install
+        // `SettingsGate` instead — there is no production constructor that yields an unrestricted
+        // gate.
+        let gate: crate::network_gate::SharedGate =
+            std::sync::Arc::new(crate::network_gate::AllowAll);
         Self {
             paths,
-            launcher_profiles_path: Some(launcher_profiles_path),
-            http_clients: HttpClients::for_testing(reqwest::Client::new()),
-            runtime_catalog: RuntimeCatalogHandle::new(RuntimeCatalog::embedded()),
+            external_data_root,
+            http_clients: HttpClients::for_testing(reqwest::Client::new())
+                .with_gate(std::sync::Arc::clone(&gate)),
+            extensions: Extensions::default(),
             clock: Arc::new(WallClock),
+            settings_cache: Arc::new(crate::settings::SettingsCache::default()),
             lock_manager,
             progress_sink: Arc::new(NoopProgressSink),
             event_sink: Arc::new(NoopEventSink),
             operation_manager: OperationManager::new(),
             task_scheduler: TaskScheduler::default(),
             process_session_manager: ProcessSessionManager::new(),
+            games: Arc::new(crate::game_registry::GameRegistry::empty()),
+            registry_trust: crate::registry_bundle::RegistryTrust::unverified_debug(),
+            test_seams: crate::test_seams::TestSeams::default(),
+            gate,
         }
+    }
+
+    /// Replace the game registry.
+    pub fn with_games(mut self, games: Arc<crate::game_registry::GameRegistry>) -> Self {
+        self.games = games;
+        self
     }
 
     /// Replace the progress sink (e.g., to wire in a Tauri event emitter).
@@ -349,6 +776,22 @@ impl CoreContext {
         self
     }
 
+    /// Give this context its own outbound gate, and hand it to its HTTP clients.
+    ///
+    /// The gate belongs to the context (MASTER_SPEC §32.9): two contexts in one process each ask
+    /// their own settings, and a test that wants a refusing or panicking gate sets it on its own
+    /// context rather than on a process-wide slot every other test shares.
+    pub fn with_network_gate(mut self, gate: crate::network_gate::SharedGate) -> Self {
+        self.gate = Arc::clone(&gate);
+        self.http_clients = self.http_clients.with_gate(gate);
+        self
+    }
+
+    /// This context's outbound gate: the same one its HTTP clients ask.
+    pub fn network_gate(&self) -> crate::network_gate::SharedGate {
+        Arc::clone(&self.gate)
+    }
+
     /// Replace the process session manager (e.g., for testing with a shared
     /// manager between service and test harness).
     pub fn with_process_session_manager(mut self, mgr: ProcessSessionManager) -> Self {
@@ -356,83 +799,36 @@ impl CoreContext {
         self
     }
 
-    /// Atomically reload the Java runtime catalog from the signed
-    /// `registry.db`, preserving the current catalog on validation failure.
+    /// Replace the test seams (e.g. to share a set with the handle a test arms).
+    pub fn with_test_seams(mut self, seams: crate::test_seams::TestSeams) -> Self {
+        self.test_seams = seams;
+        self
+    }
+
+    /// Re-run every game package's catalog hook against the freshly installed
+    /// registry. Each package replaces its catalogs only if all of them parse.
     ///
-    /// The loader catalog is also reloaded through the existing
-    /// [`LoaderCatalog::init_from_registry`] path so both catalogs stay
-    /// coordinated after a fresh registry download.
-    ///
-    /// Returns a list of human-readable warnings (e.g. fallback to embedded).
-    /// Errors are reserved for I/O failures opening the database.
-    pub fn reload_runtime_catalog(&self) -> LauncherResult<Vec<String>> {
-        let mut warnings = Vec::new();
-        let reg_path = self.paths.registry_db();
-        if !reg_path.exists() {
-            warnings.push("No registry database found; runtime catalog unchanged".into());
-            return Ok(warnings);
-        }
-        let conn = match crate::db::registry_connection(&reg_path) {
+    /// Returns human-readable warnings; errors opening the database are
+    /// reported as warnings too, leaving the active catalogs in place. An error
+    /// means a package's catalogs parsed but could not be activated.
+    pub fn reload_game_catalogs(&self) -> LauncherResult<Vec<String>> {
+        let conn = match self.registry_connection() {
             Ok(conn) => conn,
+            Err(LauncherError::RegistryMissing) => {
+                return Ok(vec![
+                    "No registry database found; runtime catalog unchanged".into(),
+                ]);
+            }
             Err(e) => {
-                warnings.push(format!(
+                return Ok(vec![format!(
                     "Cannot open registry database; runtime catalog unchanged: {e}"
-                ));
-                return Ok(warnings);
+                )]);
             }
         };
-
-        // Parse both catalogs before replacing either active snapshot. This
-        // keeps loader and runtime data consistent when one catalog is corrupt.
-        let registry_loader_catalog = match crate::loader_manifests::LoaderCatalog::from_registry(
-            &conn,
-        ) {
-            Ok(catalog) => catalog,
-            Err(error) => {
-                warnings.push(format!(
-                    "Cannot load signed loader catalog; preserving existing active catalogs: {error}"
-                ));
-                return Ok(warnings);
-            }
-        };
-        let has_registry_loader_catalog = registry_loader_catalog.is_some();
-        let loader_catalog = match crate::loader_manifests::LoaderCatalog::merge_with_embedded(
-            registry_loader_catalog,
-        ) {
-            Ok(catalog) => catalog,
-            Err(error) => {
-                warnings.push(format!(
-                    "Cannot merge signed loader catalog; preserving existing active catalogs: {error}"
-                ));
-                return Ok(warnings);
-            }
-        };
-        let runtime_catalog = match RuntimeCatalog::from_registry_db(&conn) {
-            Ok(Some(catalog)) => {
-                warnings.push("Using signed registry Java runtime catalog".into());
-                catalog
-            }
-            Ok(None) => {
-                warnings.push("No runtime catalog in registry; using embedded".into());
-                RuntimeCatalog::embedded()
-            }
-            Err(errors) => {
-                warnings.push(format!(
-                    "Cannot reload Java runtime catalog; preserving existing active catalogs: {errors:?}"
-                ));
-                return Ok(warnings);
-            }
-        };
-
-        crate::loader_manifests::LoaderCatalog::replace_active(Some(loader_catalog))?;
-        self.runtime_catalog.replace(runtime_catalog);
-        warnings.push(if has_registry_loader_catalog {
-            "Using merged signed and embedded loader catalogs".into()
-        } else {
-            "Using embedded loader catalog".into()
-        });
-
-        Ok(warnings)
+        // The wording above predates game packages; the CLI's JSON output
+        // carries it as `catalog_warnings`, so it is kept.
+        self.games
+            .load_catalogs(self, Some(&conn), CatalogEvent::Reload)
     }
 
     /// The lock manager reference.
@@ -441,6 +837,36 @@ impl CoreContext {
     }
 
     /// The path model reference.
+    /// Open the cached catalog only after its signed bundle verified.
+    ///
+    /// This is the one opener every core and game-package reader should use;
+    /// `db::registry_connection` takes a bare path and cannot tell whether the
+    /// bytes beside it were verified.
+    pub fn registry_connection(&self) -> LauncherResult<rusqlite::Connection> {
+        crate::registry_sync::open_verified_registry_with_trust(
+            self.paths.root(),
+            &self.registry_trust,
+        )
+        .map(crate::registry_sync::VerifiedRegistry::into_connection)
+    }
+
+    /// Like [`Self::registry_connection`], but refuses a catalog past its signed
+    /// expiry. Use this for anything that downloads or replaces software from
+    /// catalog-provided URLs and hashes.
+    pub fn registry_connection_fresh(&self) -> LauncherResult<rusqlite::Connection> {
+        let registry = crate::registry_sync::open_verified_registry_with_trust(
+            self.paths.root(),
+            &self.registry_trust,
+        )?;
+        registry.require_fresh()?;
+        Ok(registry.into_connection())
+    }
+
+    /// The verified catalog's digest, or `None` when there is no catalog.
+    pub fn registry_digest(&self) -> LauncherResult<Option<String>> {
+        crate::registry_sync::verified_registry_digest(self.paths.root(), &self.registry_trust)
+    }
+
     pub fn paths(&self) -> &AppPaths {
         &self.paths
     }
@@ -449,16 +875,40 @@ impl CoreContext {
     pub fn http_clients(&self) -> &HttpClients {
         &self.http_clients
     }
+
+    /// What the OS says about a recorded process identity (MASTER_SPEC §32.13).
+    ///
+    /// Every liveness question goes through here rather than calling
+    /// [`crate::process_identity::check`] directly, so a test can make each source of "could not
+    /// tell" happen — a failed lookup, an unreadable table, a failed job query — through the seam
+    /// this context carries, without a seam that changes what production does.
+    pub fn process_check(
+        &self,
+        identity: &crate::process_identity::ProcessIdentity,
+    ) -> crate::process_identity::ProcessCheck {
+        if let Some(view) = self.test_seams.process_view() {
+            return crate::process_identity::check_with(identity, &*view);
+        }
+        crate::process_identity::check(identity)
+    }
+
+    /// The process table this context's liveness questions are answered from: the real one in
+    /// production, or the stand-in a test installed.
+    pub fn process_view(&self) -> std::sync::Arc<dyn crate::process_identity::ProcessView> {
+        self.test_seams
+            .process_view()
+            .unwrap_or_else(|| std::sync::Arc::new(crate::process_identity::OsProcesses))
+    }
 }
 
 impl std::fmt::Debug for CoreContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CoreContext")
             .field("paths", &self.paths)
-            .field("launcher_profiles_path", &self.launcher_profiles_path)
+            .field("external_data_root", &self.external_data_root)
             .field("http_clients", &self.http_clients)
             .field("lock_manager", &self.lock_manager)
-            .field("runtime_catalog", &self.runtime_catalog)
+            .field("extensions", &self.extensions)
             .finish_non_exhaustive()
     }
 }
@@ -476,8 +926,32 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("agora-ctx-init-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let paths = AppPaths::from_root(tmp.clone());
+        struct TestServices;
+        impl crate::game_hooks::CompiledServices for TestServices {
+            fn load_catalogs(
+                &self,
+                _: &CoreContext,
+                registry: Option<&rusqlite::Connection>,
+                event: CatalogEvent,
+            ) -> crate::error::LauncherResult<Vec<String>> {
+                Ok(match (registry, event) {
+                    (None, CatalogEvent::Startup) => {
+                        vec!["test catalog hook: startup without a registry".into()]
+                    }
+                    _ => Vec::new(),
+                })
+            }
+        }
+        let mut games = crate::game_registry::GameRegistry::builder();
+        games
+            .add_compiled(
+                "test",
+                crate::game_registry::test_support::package("test-game"),
+                Arc::new(TestServices),
+            )
+            .unwrap();
 
-        let (ctx, warnings) = CoreContext::initialize(paths).unwrap();
+        let (ctx, warnings) = CoreContext::initialize(paths, games).unwrap();
         assert!(ctx.paths.root().exists(), "root should exist");
         assert!(
             ctx.paths.local_state_db().exists(),
@@ -491,8 +965,8 @@ mod tests {
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("embedded loader and Java runtime catalogs")),
-            "clean init should report embedded catalog sources: {:?}",
+                .any(|warning| warning == "test catalog hook: startup without a registry"),
+            "registered catalog hooks run at startup: {:?}",
             warnings
         );
 
@@ -528,8 +1002,10 @@ mod tests {
     fn test_clock_abstraction() {
         let start = std::time::SystemTime::now();
         let test_clock = TestClock::new(start);
-        let ctx = CoreContext::for_testing(std::env::temp_dir().join("agora-clock-test"))
-            .with_clock(Arc::new(test_clock));
+        let ctx = CoreContext::for_testing(
+            std::env::temp_dir().join(format!("agora-clock-test-{}", std::process::id())),
+        )
+        .with_clock(Arc::new(test_clock));
         let _now = ctx.clock.now();
     }
 
@@ -555,143 +1031,10 @@ mod tests {
         // Create root dir but make local_state.db path unwritable by
         // creating it as a directory beforehand.
         std::fs::create_dir_all(tmp.join("local_state.db")).unwrap();
-        let result = CoreContext::initialize(paths);
+        let result = CoreContext::initialize(paths, crate::game_registry::GameRegistry::builder());
         assert!(result.is_err(), "should fail when db cannot be created");
         let err = result.unwrap_err();
         assert_eq!(err.code(), "ERR_LOCAL_STATE_FAILED");
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn test_runtime_catalog_handle_snapshot_via_ctx() {
-        let tmp = std::env::temp_dir().join(format!("agora-ctx-snap-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&tmp);
-        let ctx = CoreContext::for_testing(tmp.clone());
-        let catalog = ctx.runtime_catalog.snapshot();
-        assert!(
-            !catalog.entries.is_empty(),
-            "snapshot should have embedded entries"
-        );
-        // A second snapshot is independent
-        let catalog2 = ctx.runtime_catalog.snapshot();
-        assert_eq!(catalog, catalog2);
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn test_reload_no_registry_db_returns_warning() {
-        let tmp =
-            std::env::temp_dir().join(format!("agora-ctx-reload-nodb-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&tmp);
-        let ctx = CoreContext::for_testing(tmp.clone());
-        let warnings = ctx.reload_runtime_catalog().unwrap();
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("No registry database found")),
-            "should warn when registry.db is absent: {:?}",
-            warnings
-        );
-        // Snapshot should still return embedded catalog (unchanged).
-        let catalog = ctx.runtime_catalog.snapshot();
-        assert!(!catalog.entries.is_empty());
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn test_reload_runtime_catalog_with_valid_registry() {
-        let tmp = std::env::temp_dir().join(format!("agora-ctx-reload-ok-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        // Create a minimal registry.db with runtime_catalog and loader_catalog tables.
-        let reg_path = tmp.join("registry.db");
-        let conn = rusqlite::Connection::open(&reg_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE runtime_catalog (singleton_id INTEGER PRIMARY KEY, catalog_json TEXT NOT NULL);
-             CREATE TABLE loader_catalog (singleton_id INTEGER PRIMARY KEY, catalog_json TEXT NOT NULL);
-             CREATE TABLE schema_version (version INTEGER PRIMARY KEY);"
-        ).unwrap();
-
-        let embedded_json = include_str!("../../../runtime-catalog/runtime_catalog.json");
-        conn.execute(
-            "INSERT INTO runtime_catalog (singleton_id, catalog_json) VALUES (1, ?1)",
-            [embedded_json],
-        )
-        .unwrap();
-        let manifests = include_str!("../../../loader-manifests/loader_manifests.json");
-        conn.execute(
-            "INSERT INTO loader_catalog (singleton_id, catalog_json) VALUES (1, ?1)",
-            [manifests],
-        )
-        .unwrap();
-        drop(conn);
-
-        let ctx = CoreContext::for_testing(tmp.clone());
-
-        // Confirm we start with embedded.
-        let before = ctx.runtime_catalog.snapshot();
-        assert!(!before.entries.is_empty());
-
-        // Reload from the registry.db we just placed.
-        let warnings = ctx.reload_runtime_catalog().unwrap();
-        assert!(
-            warnings.iter().any(|w| w.contains("signed registry")),
-            "should report signed registry load: {:?}",
-            warnings
-        );
-
-        // After reload, the catalog should still be valid (same data).
-        let after = ctx.runtime_catalog.snapshot();
-        assert!(!after.entries.is_empty());
-        assert_eq!(after.schema_version, before.schema_version);
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn test_reload_runtime_catalog_old_preserved_on_failure() {
-        let tmp =
-            std::env::temp_dir().join(format!("agora-ctx-reload-fail-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        // Create a registry.db with invalid runtime catalog JSON.
-        let reg_path = tmp.join("registry.db");
-        let conn = rusqlite::Connection::open(&reg_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE runtime_catalog (singleton_id INTEGER PRIMARY KEY, catalog_json TEXT NOT NULL);
-             CREATE TABLE schema_version (version INTEGER PRIMARY KEY);"
-        ).unwrap();
-        conn.execute(
-            "INSERT INTO runtime_catalog (singleton_id, catalog_json) VALUES (1, ?1)",
-            [r#"{"invalid": "no schema version"}"#],
-        )
-        .unwrap();
-        drop(conn);
-
-        let ctx = CoreContext::for_testing(tmp.clone());
-
-        // Snapshot before reload is the embedded catalog.
-        let before = ctx.runtime_catalog.snapshot();
-        assert!(!before.entries.is_empty());
-
-        // Reload should fail validation but NOT replace the catalog.
-        let warnings = ctx.reload_runtime_catalog().unwrap();
-        assert!(
-            warnings.iter().any(|w| w.contains("preserving existing")),
-            "should warn about preserving existing catalog: {:?}",
-            warnings
-        );
-
-        // The catalog must still be the embedded one.
-        let after = ctx.runtime_catalog.snapshot();
-        assert!(!after.entries.is_empty());
-        assert_eq!(
-            after, before,
-            "catalog should be unchanged after failed reload"
-        );
-
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

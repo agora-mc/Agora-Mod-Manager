@@ -14,7 +14,7 @@ import { formatError } from '@/lib/tauri';
 import {
   listPluginContributions,
   listPlugins,
-  pluginsEnabled,
+  pluginCodeAllowed,
   startPlugins,
 } from './api';
 import type {
@@ -77,7 +77,7 @@ export function PluginProvider({ children }: { children: ReactNode }) {
   const refresh = useCallback(async () => {
     const mine = ++generation.current;
     try {
-      const on = (await pluginsEnabled()) === true;
+      const on = (await pluginCodeAllowed()) === true;
       const summaries = await listPlugins();
       const contributed = on ? await listPluginContributions() : [];
       if (mine !== generation.current) return;
@@ -106,10 +106,9 @@ export function PluginProvider({ children }: { children: ReactNode }) {
     void (async () => {
       let on = false;
       try {
-        // Only an explicit `true` turns the subsystem on. Anything else — a
-        // rejection, a `null` from a build without this command — reads as off,
-        // which is also the default the user has not changed.
-        on = (await pluginsEnabled()) === true;
+        // Only an explicit "not stopped" lets plugin code start. A rejection, or a
+        // `null` from a build without this command, reads as stopped.
+        on = (await pluginCodeAllowed()) === true;
       } catch {
         on = false;
       }

@@ -14,6 +14,7 @@ interface PageHeroProps {
   /** A block that spans the full width below the title row. */
   panel?: ReactNode;
   className?: string;
+  testId?: string;
 }
 
 export function PageHero({
@@ -25,9 +26,10 @@ export function PageHero({
   actions,
   panel,
   className,
+  testId,
 }: PageHeroProps) {
   return (
-    <section className={cn('agora-hero relative overflow-hidden', className)}>
+    <section className={cn('agora-hero relative overflow-hidden', className)} data-testid={testId}>
       <span className="hero-ring -right-16 -top-20 h-56 w-56" aria-hidden="true" />
       <span className="hero-ring -bottom-28 right-20 h-64 w-64" aria-hidden="true" />
       <div className="relative flex items-center gap-4">

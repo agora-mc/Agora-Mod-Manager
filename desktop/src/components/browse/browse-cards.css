@@ -221,6 +221,30 @@
 
 .browse-primary-action:hover { opacity: 0.9; }
 
+/* The quieter button beside the primary one (a game's Browse card: Install, Preview). */
+.browse-secondary-action {
+  border: 1px solid hsl(var(--border));
+  border-radius: var(--radius);
+  background: hsl(var(--card));
+  color: hsl(var(--card-foreground));
+  padding: calc(0.4rem - 1px) 0.75rem;
+  font-size: calc(0.8125rem * var(--font-scale));
+  font-weight: 500;
+  line-height: calc(1.25rem * var(--font-scale));
+  transition: background-color 150ms ease;
+}
+
+.browse-secondary-action:hover { background: hsl(var(--accent)); }
+
+.browse-primary-action:disabled,
+.browse-secondary-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+/* Two buttons of equal weight in a card's side column share its width. */
+.browse-card-action-row.browse-card-action-row--pair > button { flex: 1 1 0; }
+
 .browse-source-link {
   display: inline-flex;
   align-items: center;
@@ -390,6 +414,18 @@
 }
 
 .browse-card-action-row .browse-primary-action { flex: none; }
+
+/* "Get from <host>" is longer than Install, so it shares the pair's width with
+   Preview and wraps its own label instead of overflowing the card. */
+.browse-card-action-row .browse-primary-action.browse-primary-action--manual {
+  flex: 1 1 0;
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: center;
+  line-height: 1.15;
+  padding-inline: 0.5rem;
+}
 
 .browse-card-action-row .browse-source-link {
   flex: 1 1 auto;

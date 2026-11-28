@@ -24,12 +24,16 @@
 //! forgets to install one loses network access, which is a bug that surfaces
 //! immediately, rather than losing lockdown, which is a bug nobody sees.
 //!
-//! The gate is read live rather than snapshotted at startup, so toggling
-//! lockdown takes effect on the next request — including in a second process
-//! sharing the same settings database.
+//! The gate reads the settings version before every request and reloads the values only when
+//! it changed, so toggling lockdown takes effect on the next request — including in a second
+//! process sharing the same settings database.
+//!
+//! A settings read that fails denies: an unreadable store cannot establish that the user
+//! permits the request, and the gate does not fall back to the last snapshot it read.
 
 use crate::error::{LauncherError, LauncherResult};
 use crate::http_client::ClientCategory;
+use crate::settings::{SettingsCache, SettingsReads};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -68,15 +72,36 @@ impl NetworkGate for AllowAll {
     }
 }
 
-/// The production gate: Lockdown Mode plus the per-endpoint toggles, read from
-/// the local settings database on every request.
+/// The production gate: Lockdown Mode plus the per-endpoint toggles, read through the
+/// context's settings cache (§32.9).
+///
+/// The cache reads the settings version (one single-row read) before each request and reloads
+/// the values only when it changed, so a request costs one read instead of a connection and a
+/// full settings load. A refresh that fails denies: the gate never answers from the last
+/// snapshot it managed to read.
 pub struct SettingsGate {
-    db_path: PathBuf,
+    reads: SettingsReads,
+    cache: Arc<SettingsCache>,
 }
 
 impl SettingsGate {
+    /// A gate for a database path alone, with no seams and no shared cache.
+    ///
+    /// Test support, and the shape a caller that has nothing but a path needs; a context's
+    /// gate comes from [`Self::for_context`].
     pub fn new(db_path: PathBuf) -> Self {
-        Self { db_path }
+        Self {
+            reads: SettingsReads::standalone(db_path),
+            cache: Arc::new(SettingsCache::new()),
+        }
+    }
+
+    /// The gate of a context: its database, its clock, its seams and its settings cache.
+    pub fn for_context(ctx: &crate::ctx::Ctx) -> Self {
+        Self {
+            reads: SettingsReads::of(ctx),
+            cache: Arc::clone(&ctx.settings_cache),
+        }
     }
 }
 
@@ -118,19 +143,16 @@ fn endpoint_setting(category: ClientCategory) -> Option<&'static str> {
 
 impl NetworkGate for SettingsGate {
     fn check(&self, category: ClientCategory) -> LauncherResult<()> {
-        let conn = crate::db::local_state_connection(&self.db_path).map_err(|error| {
-            // An unreadable settings store cannot establish that the user
-            // permits this request, so it does not.
-            LauncherError::Generic {
+        // A failed read is a refusal, and names what could not be read (§32.9, §32.13).
+        let settings = self
+            .cache
+            .load(&self.reads)
+            .map_err(|error| LauncherError::Generic {
                 code: "ERR_NETWORK_SETTINGS_UNREADABLE".into(),
-                message: format!(
-                    "Refusing a {category:?} request: the settings database could not be read, so \
-                     the network policy is unknown ({error})."
-                ),
-            }
-        })?;
+                message: format!("Refusing a {category:?} request: {error}"),
+            })?;
 
-        if crate::db::lockdown_denies_network(&conn)? {
+        if settings.lockdown_denies_network()? {
             return Err(LauncherError::Generic {
                 code: "ERR_NETWORK_LOCKDOWN".into(),
                 message: format!(
@@ -141,7 +163,7 @@ impl NetworkGate for SettingsGate {
         }
 
         if let Some(key) = endpoint_setting(category) {
-            if !crate::db::is_network_enabled(&conn, key) {
+            if !settings.network_enabled(key) {
                 return Err(LauncherError::Generic {
                     code: "ERR_NETWORK_ENDPOINT_DISABLED".into(),
                     message: format!(
@@ -155,7 +177,9 @@ impl NetworkGate for SettingsGate {
     }
 }
 
-type SharedGate = Arc<dyn NetworkGate>;
+/// A gate, shared: a context holds one and its HTTP clients hold the same one, so a clone of
+/// either answers from the same settings.
+pub type SharedGate = Arc<dyn NetworkGate>;
 
 fn slot() -> &'static RwLock<Option<SharedGate>> {
     static SLOT: OnceLock<RwLock<Option<SharedGate>>> = OnceLock::new();
@@ -166,6 +190,41 @@ fn slot() -> &'static RwLock<Option<SharedGate>> {
 pub fn install(gate: SharedGate) {
     if let Ok(mut slot) = slot().write() {
         *slot = Some(gate);
+    }
+}
+
+/// A test's hold on the process-wide gate: while it lives, no other test that installs a gate
+/// through [`install_for_test`] runs, and dropping it puts back the gate it found.
+#[doc(hidden)]
+pub struct TestGate {
+    previous: Option<SharedGate>,
+    _exclusive: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for TestGate {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = slot().write() {
+            *slot = self.previous.take();
+        }
+    }
+}
+
+/// **Tests only.** Install `gate` process-wide for the life of the returned guard. The gate is one
+/// slot per process and `cargo test` runs a crate's tests as threads of one process, so every test
+/// that installs a gate must hold this for its whole run: a bare [`install`] in one test changes
+/// what another test's requests are allowed to do (a Lockdown test once downloaded a real runtime
+/// this way).
+#[doc(hidden)]
+pub fn install_for_test(gate: SharedGate) -> TestGate {
+    static EXCLUSIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A test that panicked while holding it left the gate restored by its guard's drop.
+    let exclusive = EXCLUSIVE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous = slot().write().ok().and_then(|mut slot| slot.replace(gate));
+    TestGate {
+        previous,
+        _exclusive: exclusive,
     }
 }
 
@@ -186,6 +245,18 @@ pub fn authorize(category: ClientCategory) -> LauncherResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_test_that_fails_holding_the_gate_does_not_block_the_next_one() {
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = install_for_test(Arc::new(AllowAll));
+            assert!(authorize(ClientCategory::GitHub).is_ok());
+            panic!("a test failing while it holds the gate");
+        }));
+        assert!(failed.is_err());
+        let _next = install_for_test(Arc::new(DenyAll));
+        assert!(authorize(ClientCategory::GitHub).is_err());
+    }
 
     #[test]
     fn nothing_installed_denies() {
@@ -242,6 +313,31 @@ mod tests {
         // toggle rather than slipping past it.
         assert!(gate.check(ClientCategory::Modpack).is_err());
         assert!(gate.check(ClientCategory::MojangContent).is_ok());
+    }
+
+    #[test]
+    fn every_switch_the_gate_can_name_is_a_declared_fail_closed_boolean() {
+        use crate::settings_registry::{lookup, SettingKind};
+
+        let mut keys: Vec<&str> = ClientCategory::ALL
+            .iter()
+            .filter_map(|category| endpoint_setting(*category))
+            .collect();
+        keys.push("network_plugins_enabled");
+        keys.push("plugin_updates_enabled");
+        keys.sort_unstable();
+        keys.dedup();
+
+        for key in keys {
+            let definition = lookup(key)
+                .unwrap_or_else(|| panic!("{key} is named by the network gate but is undeclared"));
+            match definition.kind {
+                SettingKind::Bool { invalid: false, .. } => {}
+                other => {
+                    panic!("{key} must be a boolean whose fail direction is off, got {other:?}")
+                }
+            }
+        }
     }
 
     #[test]

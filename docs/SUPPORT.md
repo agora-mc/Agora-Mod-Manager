@@ -15,6 +15,17 @@ The output lists the root, instances, catalog database and signature, Java runti
 
 The CLI resolves the root the same way the desktop app does, so by default they share it. `AGORA_DATA_DIR` and a `portable.txt` marker beside the executable apply to both. If you used `--data-dir` or `AGORA_DATA_DIR` when the problem happened, run `agora paths` with the same override.
 
+### Other games and plugins
+
+`agora paths` prints the shared root; the rest of this section is relative to it:
+
+- A game instance is a folder under `instances/<ID>`, like a Minecraft instance, with its own `instance_manifest.json`.
+- The content store is under `content/`, with one manifest per item under `content/items/` and the file bytes under `content/objects/`.
+- Pinned bases are listed by `agora games base list`, with their state. A base record lives under `bases/manifests/`; `bases/roots.json` names base folders Agora keeps outside the data root.
+- Plugin packages are under `plugins/installed/`, and each plugin's log is `plugins/logs/<PLUGIN-ID>.log` (`agora plugin log <ID>` reads it). A plugin's saved data lives in `local_state.db`, not in its package folder.
+
+`agora games list` and `agora games discover` show which games and installs were found. `agora plugin list` shows each plugin's status, and `agora plugin official list` shows the official ones and whether an installed copy still verifies. `agora games instance check <INSTANCE>` is the cheapest summary of a game instance's framework and load-order findings.
+
 ## Identify the build
 
 ```bash
@@ -31,6 +42,9 @@ Also record which `v*` release the binary came from, or the Git commit for a sou
 | Command result | Standard output, preferably with `--output json` | The result itself. In JSON mode an error envelope goes to standard error instead |
 | Game log | The instance's `logs/latest.log` and, if present, `logs/debug.log` | Minecraft, loader, and mod startup or runtime errors |
 | Crash report | The instance's `crash-reports/`, or a JVM `hs_err_pid*.log` at the instance root | Game crashes and fatal JVM failures |
+| Plugin log | `<root>/plugins/logs/<PLUGIN-ID>.log`, or `agora plugin log <ID>` | What one plugin did, and its errors |
+
+The game-log and crash-report rows describe Minecraft. `agora log` shares Minecraft logs and crash reports. `agora crash` works for any game whose plugin brings a crash pack: `agora --json crash last <INSTANCE>` reads the stored answer, and `agora crash analyze <FILE> --instance <INSTANCE>` diagnoses a crash file you have. `crash investigate` collects an instance's recent evidence automatically for any game whose plugin brings a crash pack; name a file with `--file` when the log came from elsewhere, and include the output of `agora games instance check <INSTANCE>`.
 
 List an instance's logs and crash reports:
 
@@ -52,6 +66,7 @@ Agora doesn't generate a support archive. Build a small folder by hand and revie
    agora --output json registry status
    agora --output json health <INSTANCE>
    agora crash list <INSTANCE>
+   agora --output json crash last <INSTANCE>
    ```
 
 3. Add only the relevant `latest.log`, `debug.log`, crash report, or JVM fatal-error log, with personal data removed.
@@ -85,4 +100,11 @@ Agora has no factory-reset command. Resetting is destructive, so rename rather t
 4. Rename the root folder.
 5. Run `agora paths` and `agora registry sync` to confirm a clean profile is created, then remove the renamed copy once you no longer need it.
 
-Microsoft credentials live in the operating-system credential store, so neither `--data-dir` nor `AGORA_DATA_DIR` isolates them. Renaming the root doesn't sign you out, and `agora auth logout` removes the shared entry the desktop app also uses. A portable copy is the exception: it keeps its credentials encrypted inside its own data folder.
+Where Microsoft credentials live depends on the platform and the root:
+
+- **Windows, normal data root:** a DPAPI-protected file inside the data root. Only this Windows account on this machine can decrypt it. Renaming the root, or using `--data-dir`, gives you a root with its own sign-in.
+- **Windows, relocated or portable root:** a file encrypted with a device key stored beside it in the same folder. That is obfuscation, not OS protection: anyone who can read the folder can read the sign-in. The Settings notice says so. This is deliberate, because a DPAPI file would stop working if the profile moved to another machine or Windows account.
+- **macOS and Linux:** the operating-system credential store. Neither `--data-dir` nor `AGORA_DATA_DIR` isolates it, and `agora auth logout` removes the shared entry the desktop app also uses.
+- **Portable copy (`portable.txt`):** both sign-ins stay in the copy's own folder, encrypted with a device key that travels with them.
+
+All signed-in Microsoft accounts are kept together in one encrypted record that is replaced in a single write. A killed process leaves either the previous complete record or the new one, and an unreadable record is reported as an error rather than shown as an empty account list.

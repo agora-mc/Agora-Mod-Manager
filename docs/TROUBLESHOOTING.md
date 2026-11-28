@@ -59,6 +59,45 @@ agora proxy show
 agora proxy none
 ```
 
+### A game or a plugin is not working
+
+List what Agora supports and what is installed:
+
+```bash
+agora games list
+agora games discover
+agora plugin list
+agora plugin official list
+```
+
+A game other than Minecraft arrives as a plugin. Install an official one with `agora plugin official install <ID> --yes`, or a community package with `agora plugin install --yes package <FILE.zip>` (or `--yes development <FOLDER>` while you work on it). A game plugin can depend on another, shared plugin; `agora plugin list` shows the dependent plugin as needing it.
+
+A game that the store scan missed can be added:
+
+```bash
+agora games folder add <PATH>
+agora games folder list
+```
+
+`games folder add` refuses a folder that is not the install of exactly one game Agora knows, and the message says why. `games folder list` shows whether each folder is still on disk.
+
+For a game instance:
+
+```bash
+agora games instance list
+agora games instance check <INSTANCE>
+agora games instance plugins <INSTANCE>
+agora games instance plugins check <INSTANCE>
+agora games instance plugins conflicts <INSTANCE>
+agora games instance tools list <INSTANCE>
+```
+
+`games instance check` names a framework built for another game version, a plugin load order a launch would refuse, and stale or unknown tool output, and says which command rebuilds the tool. `games instance plugins check` prints the load-order findings. `games instance plugins conflicts` shows pairs of plugins that change the same record, and the command to keep the current order (`--keep`) or let the other one win (`--let-win`); a rule added there survives a later sort. `games instance tools list` shows each tool's output state.
+
+`agora log` shares Minecraft logs and crash reports. `agora crash` works for any game whose plugin brings a crash pack: `agora --json crash last <INSTANCE>` reads the answer Agora stored, and `agora crash analyze <FILE> --instance <INSTANCE>` diagnoses a crash file you have. `crash investigate` collects recent evidence automatically through the crash packs' declared sources, for any supported game; name a file with `--file` when it came from elsewhere.
+
+`agora plugin log <ID>` reads a plugin's own log. Plugin packages are under `<root>/plugins/installed/`, their logs under `<root>/plugins/logs/`, and a plugin's saved data is in `local_state.db`; `agora paths` prints the root. A failed install leaves the previous package in place and names the reason.
+
 ### A loader requirement blocks launch
 
 ```bash
@@ -108,11 +147,13 @@ Check the plan for the target instance, the selected files, dependencies, what g
 ```bash
 agora crash list <INSTANCE>
 agora crash inspect <INSTANCE> <FILE>
+agora --json crash last <INSTANCE>
 agora crash investigate <INSTANCE>
 agora crash investigate <INSTANCE> --file extra-log.txt
+agora --json crash analyze <FILE> --instance <INSTANCE>
 ```
 
-`crash investigate` ranks suspects from recent logs. If none stands out, bisect:
+`crash last` prints the newest answer Agora stored for the instance; `crash analyze` reads a crash file or log from any supported game, and `--instance` lets it attribute names to installed mods. `crash investigate` ranks suspects from recent logs. An answer says how sure it is ("possible", "likely" or "very likely") and names the plugin behind each finding; "could not check" means the evidence was unreadable, not clean. If no mod stands out, bisect:
 
 ```bash
 agora bisect start <INSTANCE>
@@ -167,6 +208,39 @@ Offline readiness is per instance. While you are still online:
 4. Turn on Lockdown Mode in **Settings > Privacy**, launch again, and fix anything missing before you disconnect.
 
 Microsoft sign-in, updates, and uncached downloads cannot complete offline.
+
+### Steam and Proton on Linux
+
+Steam starts the game, so Agora runs through the game's launch options:
+
+1. Open the game in Steam, choose **Properties → Launch Options**, and paste
+   `agora games wrap %command%`.
+2. Run `agora games instance launch <ID>` once. It asks Steam to start the game (the `steam`
+   command, or `flatpak run com.valvesoftware.Steam` when Steam is a Flatpak) and checks the
+   setting. When the wrapper is missing it prints the exact text to paste and the `localconfig.vdf`
+   files it read. Agora never writes Steam's files.
+3. To make a launch use one instance, run `agora games instance default <ID>`. Launching from
+   Steam uses the launch Agora recorded for two minutes, else that default, else Steam's command
+   runs untouched.
+
+Steam starts a Proton game as `<proton> waitforexitandrun <game exe>` (Valve's Proton README,
+<https://github.com/ValveSoftware/Proton>), so its command names the game's own executable and a
+framework loader installed beside it would never load. When the instance's deployed view has a
+launch alternative whose condition holds — SKSE's `skse64_loader.exe` for Skyrim SE — the wrapper
+swaps that one argument for the loader from the same folder and prints `Starting through 'skse'`;
+Proton, its arguments and the rest of Steam's command are unchanged. Both the launcher name Steam
+uses (`SkyrimSELauncher.exe`) and the game executable the definition declares (`SkyrimSE.exe`) map
+to the loader. If the game's executable is not in Steam's command, the wrapper says so on standard
+error and runs the command untouched. `agora games instance launch <ID> --plain` records a plain
+start, which the wrapper honours; use it to check the game without SKSE or another framework loader.
+
+Launching through Proton on Linux has not been tested on real hardware yet.
+
+A **step-down** means the overlay could not be mounted over the game folder (for example because
+user namespaces are unavailable). Agora says why and runs from linked files, or copies when links
+cannot work. Nothing is written to the game's install before the step-down is announced. The
+game's Windows `Documents` and `LocalAppData` files live inside
+`steamapps/compatdata/<appid>/pfx/drive_c/users/steamuser`, and crash sources are read there.
 
 ### A script gets unexpected results
 

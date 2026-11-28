@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
+import { setSwitch } from './support/switches';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -118,6 +119,8 @@ interface SnapshotEditorMockOptions {
   snapshots?: Record<string, unknown>[];
   driftResult?: Record<string, unknown>;
   restoreReject?: boolean;
+  /** Reject the first restore with the core's not-idle code, then succeed. */
+  restoreNotIdleFirst?: boolean;
 }
 
 async function installSnapshotEditorMock(page: Page, opts: SnapshotEditorMockOptions = {}) {
@@ -125,6 +128,7 @@ async function installSnapshotEditorMock(page: Page, opts: SnapshotEditorMockOpt
     snapshots = DEFAULT_SNAPSHOTS,
     driftResult = DRIFT_RESULT,
     restoreReject = false,
+    restoreNotIdleFirst = false,
   } = opts;
 
   await page.addInitScript(
@@ -132,9 +136,10 @@ async function installSnapshotEditorMock(page: Page, opts: SnapshotEditorMockOpt
       snapshots: Record<string, unknown>[];
       driftResult: Record<string, unknown>;
       restoreReject: boolean;
+      restoreNotIdleFirst: boolean;
       detail: Record<string, unknown>;
     }) => {
-      const { snapshots, driftResult, restoreReject, detail } = params;
+      const { snapshots, driftResult, restoreReject, restoreNotIdleFirst, detail } = params;
 
       const callbacks = new Map<number, (...args: unknown[]) => void>();
       let callbackId = 0;
@@ -192,6 +197,15 @@ async function installSnapshotEditorMock(page: Page, opts: SnapshotEditorMockOpt
           if (command === 'list_snapshots') return Promise.resolve(snapshots);
           if (command === 'detect_drift') return Promise.resolve(driftResult);
           if (command === 'restore_snapshot') {
+            const restoreCalls = (commandCalls['restore_snapshot'] ?? 0);
+            if (restoreNotIdleFirst && restoreCalls === 1) {
+              // The message deliberately does not say "running": the page must
+              // branch on the code, not the words.
+              return Promise.reject({
+                code: 'ERR_SNAPSHOT_NOT_IDLE',
+                message: 'The instance could not be confirmed idle.',
+              });
+            }
             return restoreReject
               ? Promise.reject(new Error('Snapshot restore failed: disk I/O error'))
               : Promise.resolve(null);
@@ -212,7 +226,7 @@ async function installSnapshotEditorMock(page: Page, opts: SnapshotEditorMockOpt
         __commandArgs: commandArgs,
       });
     },
-    { snapshots, driftResult, restoreReject, detail: INSTANCE_DETAIL },
+    { snapshots, driftResult, restoreReject, restoreNotIdleFirst, detail: INSTANCE_DETAIL },
   );
 }
 
@@ -229,6 +243,7 @@ async function navigateToInstanceEditor(page: Page) {
 }
 
 async function openSnapshotsTab(page: Page) {
+  await page.getByRole('button', { name: 'Backups & Versions' }).click();
   await page.getByRole('button', { name: 'Snapshots' }).click();
   // Wait for the snapshot section heading to appear
   await expect(page.getByRole('heading', { name: 'Snapshots' })).toBeVisible();
@@ -288,20 +303,21 @@ test('JVM preview follows GC and pre-touch controls', async ({ page }) => {
   await installSnapshotEditorMock(page);
   await navigateToInstanceEditor(page);
 
+  await page.getByRole('button', { name: 'Java & Logs' }).click();
   await page.getByRole('button', { name: 'Java & Args' }).click();
   await expect(page.getByText(/^Generational ZGC ·/)).toBeVisible();
-  await expect(page.getByRole('checkbox', { name: 'Automatic GC selection' })).toBeChecked();
+  await expect(page.getByRole('switch', { name: 'Automatic GC selection' })).toBeChecked();
 
-  await page.getByRole('checkbox', { name: 'Automatic GC selection' }).uncheck();
+  await setSwitch(page.getByRole('switch', { name: 'Automatic GC selection' }), false);
   await expect(page.getByText(/^Tuned G1GC ·/)).toBeVisible();
-  await page.getByRole('checkbox', { name: 'Pre-touch allocated memory' }).uncheck();
+  await setSwitch(page.getByRole('switch', { name: 'Pre-touch allocated memory' }), false);
   await expect.poll(async () => page.evaluate(() => (
     (window as unknown as { __commandArgs: Record<string, Record<string, unknown>> }).__commandArgs
       .compute_gc_args?.alwaysPreTouch
   ))).toBe(false);
   await expect(page.getByText('NoPreTouch')).toBeVisible();
 
-  await page.getByRole('checkbox', { name: 'Automatic GC selection' }).uncheck();
+  await setSwitch(page.getByRole('switch', { name: 'Automatic GC selection' }), false);
   await page.getByRole('combobox', { name: 'Garbage collector' }).selectOption('manual');
   await page.getByLabel('Additional JVM flags').fill('-Xss1M');
   await expect(page.getByText(/^Manual JVM flags ·/)).toBeVisible();
@@ -437,6 +453,32 @@ test.describe('InstanceEditor — Snapshots tab: restore flow', () => {
 
     // Snapshots section heading is still visible after refresh
     await expect(page.getByRole('heading', { name: 'Snapshots' })).toBeVisible();
+  });
+
+  test('restore retries with force when the core says the game is not proven idle', async ({ page }) => {
+    await installSnapshotEditorMock(page, {
+      snapshots: DEFAULT_SNAPSHOTS,
+      restoreNotIdleFirst: true,
+    });
+    await navigateToInstanceEditor(page);
+    await openSnapshotsTab(page);
+
+    await page.getByRole('button', { name: 'Restore' }).first().click();
+
+    // The message never says "running"; only the code makes the page offer this.
+    await expect(page.getByText('The game is running')).toBeVisible();
+    await page.getByRole('button', { name: 'Restore anyway' }).click();
+    await expect(page.getByRole('heading', { name: 'Snapshots' })).toBeVisible();
+
+    const calls = await page.evaluate(() => {
+      const calls = (window as any).__commandCalls as Record<string, number>;
+      return calls['restore_snapshot'] ?? 0;
+    });
+    expect(calls).toBeGreaterThanOrEqual(2);
+    const lastArgs = await page.evaluate(
+      () => (window as any).__commandArgs['restore_snapshot'] as Record<string, unknown>,
+    );
+    expect(lastArgs.force).toBe(true);
   });
 
   test('restore failure shows error and remains recoverable', async ({ page }) => {

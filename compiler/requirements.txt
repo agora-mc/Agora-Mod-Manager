@@ -3,3 +3,5 @@ PyNaCl==1.6.2
 # Used by the nightly compiler for NLP review filtering per MASTER_SPEC.md §3.1.
 profanity-check==1.0.3
 vaderSentiment==3.3.2
+# Catalog deltas (MASTER_SPEC §33), built by scripts/deploy_release_assets.py.
+zstandard==0.23.0

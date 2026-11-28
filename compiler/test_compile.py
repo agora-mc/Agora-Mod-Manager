@@ -5,14 +5,16 @@ Run with:  python compiler/test_compile.py
 No pytest dependency â€” uses only stdlib (unittest, sys, tempfile, json, os, re).
 
 Covers: validate_sha256, _get_registry_repo, _load_poll_blacklist,
-        _extract_mod_id, _extract_review_text, _scrub_review_text,
         and regex DoS protections via insert_crash_signature.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import contextlib
+import hashlib
+import io
 import json
+import logging
 import os
 import re
 from pathlib import Path
@@ -26,6 +28,13 @@ from unittest import mock
 # Ensure we can import the compiler module from the repo root.
 sys.path.insert(0, os.path.dirname(__file__))
 import compile as _compile  # noqa: E402
+
+
+def write_empty_known_conflicts(registry: Path) -> None:
+    """A temp registry root still needs the committed governance catalog file."""
+    governance = registry / "governance"
+    governance.mkdir(parents=True, exist_ok=True)
+    (governance / "known_conflicts.json").write_text("[]", encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -470,194 +479,56 @@ class TestGetRegistryRepo(unittest.TestCase):
 class TestLoadPollBlacklist(unittest.TestCase):
     """Tests for _load_poll_blacklist."""
 
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._patch = mock.patch.object(_compile, "REGISTRY_DIR", Path(self._tmp.name))
+        self._patch.start()
+        self.target = Path(self._tmp.name) / "governance" / "poll_blacklist.json"
+        self.target.parent.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        self._patch.stop()
+        self._tmp.cleanup()
+
+    def _write(self, text: str) -> None:
+        self.target.write_text(text, encoding="utf-8")
+
     def test_valid_json_returns_lowercase_set(self):
         """Valid JSON with usernames is returned as a lowercase set."""
-        blacklist_dir = _compile.REGISTRY_DIR / "governance"
-        target = blacklist_dir / "poll_blacklist.json"
-        # Back up if exists.
-        backup = None
-        if target.exists():
-            backup = target.read_bytes()
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(json.dumps({"usernames": ["Alice", "BOB"]}), encoding="utf-8")
-            result = _compile._load_poll_blacklist()
-            self.assertEqual(result, {"alice", "bob"})
-        finally:
-            if backup is not None:
-                target.write_bytes(backup)
-            else:
-                target.unlink(missing_ok=True)
+        self._write(json.dumps({"usernames": ["Alice", "BOB"]}))
+        self.assertEqual(_compile._load_poll_blacklist(), {"alice", "bob"})
 
-    def test_missing_file_returns_empty_set(self):
-        """When the file does not exist, returns empty set (no crash)."""
-        blacklist_dir = _compile.REGISTRY_DIR / "governance"
-        target = blacklist_dir / "poll_blacklist.json"
-        backup = None
-        if target.exists():
-            backup = target.read_bytes()
-        try:
-            target.unlink(missing_ok=True)
-            result = _compile._load_poll_blacklist()
-            self.assertEqual(result, set())
-        finally:
-            if backup is not None:
-                target.write_bytes(backup)
+    def test_missing_file_stops_the_run_and_names_the_file(self):
+        """A committed governance input must exist; absence is not an empty poll list."""
+        with self.assertRaisesRegex(_compile.GovernanceError, "poll_blacklist.json"):
+            _compile._load_poll_blacklist()
 
-    def test_malformed_json_returns_empty_set(self):
-        """Invalid JSON returns empty set (no crash)."""
-        blacklist_dir = _compile.REGISTRY_DIR / "governance"
-        target = blacklist_dir / "poll_blacklist.json"
-        backup = None
-        if target.exists():
-            backup = target.read_bytes()
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text("{not valid json!!!", encoding="utf-8")
-            result = _compile._load_poll_blacklist()
-            self.assertEqual(result, set())
-        finally:
-            if backup is not None:
-                target.write_bytes(backup)
-            else:
-                target.unlink(missing_ok=True)
+    def test_malformed_json_stops_the_run_and_names_the_file(self):
+        """Invalid JSON must stop rather than count blacklisted users' votes."""
+        self._write("{not valid json!!!")
+        with self.assertRaisesRegex(_compile.GovernanceError, "poll_blacklist.json"):
+            _compile._load_poll_blacklist()
 
+    def test_wrong_shape_stops_the_run(self):
+        """A JSON object without a usernames list is malformed."""
+        self._write(json.dumps({"names": ["alice"]}))
+        with self.assertRaisesRegex(_compile.GovernanceError, "usernames"):
+            _compile._load_poll_blacklist()
 
-# ---------------------------------------------------------------------------
-# _extract_mod_id
-# ---------------------------------------------------------------------------
+    def test_override_returns_empty_and_logs_when_missing(self):
+        """The maintainer override logs the skipped input and proceeds."""
+        with self.assertLogs("compiler", level="WARNING") as logs:
+            result = _compile._load_poll_blacklist(allow_partial=True)
+        self.assertEqual(result, set())
+        self.assertTrue(any("poll_blacklist.json" in line for line in logs.output))
 
-class TestExtractModId(unittest.TestCase):
-    """Tests for _extract_mod_id."""
-
-    def test_from_realistic_body(self):
-        """A review-form body with Mod Registry ID returns the ID."""
-        body = (
-            "### Mod Registry ID\n"
-            "sodium\n"
-            "\n"
-            "### Your Technical Review\n"
-            "Great mod.\n"
-        )
-        self.assertEqual(_compile._extract_mod_id(body), "sodium")
-
-    def test_none_body(self):
-        """None body returns None."""
-        self.assertIsNone(_compile._extract_mod_id(None))
-
-    def test_empty_body(self):
-        """Empty string body returns None."""
-        self.assertIsNone(_compile._extract_mod_id(""))
-
-    def test_no_field_returns_none(self):
-        """Body without the Mod Registry ID field returns None."""
-        body = "### Feature Request\nAdd mod X.\n"
-        self.assertIsNone(_compile._extract_mod_id(body))
-
-    def test_case_insensitive_heading(self):
-        """Heading casing is ignored; ID is lowercased."""
-        body = "### mod registry ID\n" "CaveClient\n"
-        self.assertEqual(_compile._extract_mod_id(body), "caveclient")
-
-    def test_with_crlf(self):
-        """Windows CRLF line endings parse correctly."""
-        body = "### Mod Registry ID\r\n" "sodium\r\n"
-        self.assertEqual(_compile._extract_mod_id(body), "sodium")
-
-    def test_trailing_whitespace_trimmed(self):
-        """Trailing whitespace after the ID is trimmed."""
-        body = "### Mod Registry ID\n" "sodium   \n"
-        self.assertEqual(_compile._extract_mod_id(body), "sodium")
-
-
-# ---------------------------------------------------------------------------
-# _extract_review_text
-# ---------------------------------------------------------------------------
-
-class TestExtractReviewText(unittest.TestCase):
-    """Tests for _extract_review_text."""
-
-    def test_from_realistic_body(self):
-        """Body with review heading â†’ extracted text."""
-        body = (
-            "### Mod Registry ID\n"
-            "sodium\n"
-            "\n"
-            "### Your Technical Review (50 character minimum)\n"
-            "Excellent performance improvement over vanilla rendering.\n"
-            "\n"
-            "### Additional Comments\n"
-            "None.\n"
-        )
-        result = _compile._extract_review_text(body)
-        self.assertIsNotNone(result)
-        self.assertIn("Excellent performance improvement", result)
-
-    def test_none_body(self):
-        """None body returns None."""
-        self.assertIsNone(_compile._extract_review_text(None))
-
-    def test_empty_body(self):
-        """Empty string body returns None."""
-        self.assertIsNone(_compile._extract_review_text(""))
-
-    def test_no_review_field_returns_none(self):
-        """Body without the review field returns None."""
-        body = "### Mod Registry ID\n" "sodium\n"
-        self.assertIsNone(_compile._extract_review_text(body))
-
-    def test_strips_whitespace(self):
-        """Leading/trailing whitespace in the extracted text is stripped."""
-        body = "### Your Technical Review\n" "  lots of text  \n"
-        result = _compile._extract_review_text(body)
-        self.assertEqual(result, "lots of text")
-
-
-# ---------------------------------------------------------------------------
-# _scrub_review_text
-# ---------------------------------------------------------------------------
-
-class TestScrubReviewText(unittest.TestCase):
-    """Tests for _scrub_review_text."""
-
-    def test_version_begging_filtered(self):
-        """Version-begging text is filtered out."""
-        passed, cleaned, reason = _compile._scrub_review_text("Please update to 1.21")
-        self.assertFalse(passed)
-        self.assertEqual(reason, "version-begging")
-
-    def test_legitimate_review_preserved(self):
-        """A substantive review passes the scrub pipeline."""
-        passed, cleaned, reason = _compile._scrub_review_text(
-            "This mod adds great features and runs smoothly."
-        )
-        self.assertTrue(passed)
-        self.assertEqual(reason, "")
-        self.assertEqual(cleaned, "This mod adds great features and runs smoothly.")
-
-    def test_empty_praise_filtered(self):
-        """Short empty praise is filtered."""
-        passed, cleaned, reason = _compile._scrub_review_text("Good mod.")
-        self.assertFalse(passed)
-        self.assertEqual(reason, "empty-praise")
-
-    def test_empty_text_filtered(self):
-        """Empty text is filtered."""
-        passed, cleaned, reason = _compile._scrub_review_text("")
-        self.assertFalse(passed)
-        self.assertEqual(reason, "empty")
-
-    def test_whitespace_only_filtered(self):
-        """Whitespace-only text is filtered."""
-        passed, cleaned, reason = _compile._scrub_review_text("   \t\n  ")
-        self.assertFalse(passed)
-        self.assertEqual(reason, "empty")
-
-    def test_strips_clean_text(self):
-        """Passed text is stripped of leading/trailing whitespace."""
-        passed, cleaned, reason = _compile._scrub_review_text("  hello world  ")
-        self.assertTrue(passed)
-        self.assertEqual(cleaned, "hello world")
+    def test_override_returns_empty_and_logs_when_malformed(self):
+        """The maintainer override logs the skipped malformed input and proceeds."""
+        self._write("{not valid json!!!")
+        with self.assertLogs("compiler", level="WARNING") as logs:
+            result = _compile._load_poll_blacklist(allow_partial=True)
+        self.assertEqual(result, set())
+        self.assertTrue(any("poll_blacklist.json" in line for line in logs.output))
 
 
 # ---------------------------------------------------------------------------
@@ -673,9 +544,14 @@ class TestRegexDosProtection(unittest.TestCase):
             CREATE TABLE IF NOT EXISTS crash_signatures (
                 id TEXT PRIMARY KEY,
                 name TEXT,
+                games_json TEXT NOT NULL,
                 regex_pattern TEXT,
-                solution_markdown TEXT,
-                action_button_json TEXT
+                level TEXT,
+                cause TEXT,
+                text TEXT,
+                action_kind TEXT,
+                action_content_key TEXT,
+                action_label TEXT
             )
         """)
 
@@ -687,16 +563,21 @@ class TestRegexDosProtection(unittest.TestCase):
     def tearDown(self):
         self._conn.close()
 
+    def _signature(self, **overrides):
+        sig = {
+            "id": "example_signature",
+            "name": "Example Crash",
+            "games": ["minecraft"],
+            "regex_pattern": r"java\.lang\.ExampleException",
+            "text": "An example thing failed.",
+        }
+        sig.update(overrides)
+        return sig
+
     def test_long_pattern_rejected(self):
         """A pattern >256 characters is rejected."""
         long_pattern = "a" * 257
-        sig = {
-            "id": "long_test",
-            "name": "Long Pattern",
-            "regex_pattern": long_pattern,
-            "solution_markdown": "",
-            "action_button_json": "[]",
-        }
+        sig = self._signature(id="long_test", regex_pattern=long_pattern)
         _compile.insert_crash_signature(self._conn, sig, self._rejected)
         self.assertEqual(self._rejected[0], 1)
         # Should not have been inserted.
@@ -707,13 +588,12 @@ class TestRegexDosProtection(unittest.TestCase):
 
     def test_valid_pattern_accepted(self):
         """A normal short pattern is accepted and inserted."""
-        sig = {
-            "id": "nullptr_test",
-            "name": "Null Pointer",
-            "regex_pattern": r"java\.lang\.NullPointerException",
-            "solution_markdown": "Check for nulls.",
-            "action_button_json": "[]",
-        }
+        sig = self._signature(
+            id="nullptr_test",
+            name="Null Pointer",
+            regex_pattern=r"java\.lang\.NullPointerException",
+            text="A null pointer was the failure.",
+        )
         _compile.insert_crash_signature(self._conn, sig, self._rejected)
         self.assertEqual(self._rejected[0], 0)
         row = self._conn.execute(
@@ -726,26 +606,14 @@ class TestRegexDosProtection(unittest.TestCase):
 
     def test_invalid_regex_rejected(self):
         """An invalid regex pattern is rejected."""
-        sig = {
-            "id": "bad_regex",
-            "name": "Bad Regex",
-            "regex_pattern": "[invalid(regex",
-            "solution_markdown": "",
-            "action_button_json": "[]",
-        }
+        sig = self._signature(id="bad_regex", regex_pattern="[invalid(regex")
         _compile.insert_crash_signature(self._conn, sig, self._rejected)
         self.assertEqual(self._rejected[0], 1)
 
     def test_exact_256_pattern_accepted(self):
         """A pattern exactly 256 characters is accepted (boundary)."""
         pattern_256 = "a" * 256
-        sig = {
-            "id": "boundary_test",
-            "name": "Boundary",
-            "regex_pattern": pattern_256,
-            "solution_markdown": "",
-            "action_button_json": "[]",
-        }
+        sig = self._signature(id="boundary_test", regex_pattern=pattern_256)
         _compile.insert_crash_signature(self._conn, sig, self._rejected)
         self.assertEqual(self._rejected[0], 0)
         row = self._conn.execute(
@@ -754,445 +622,146 @@ class TestRegexDosProtection(unittest.TestCase):
         self.assertIsNotNone(row)
 
 
+class TestCrashSignatureFormat(unittest.TestCase):
+    """V2 signature validation: the app converts every row into a crash rule."""
 
-# ---------------------------------------------------------------------------
-# Ported from _test_social_metrics.py (no equivalents in this file)
-# ---------------------------------------------------------------------------
+    def _create_schema(self, conn):
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS crash_signatures (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                games_json TEXT NOT NULL,
+                regex_pattern TEXT,
+                level TEXT,
+                cause TEXT,
+                text TEXT,
+                action_kind TEXT,
+                action_content_key TEXT,
+                action_label TEXT
+            )
+        """)
 
-class TestParseReaction(unittest.TestCase):
-    """Tests for _parse_reaction."""
+    def setUp(self):
+        self._conn = _compile.sqlite3.connect(":memory:")
+        self._create_schema(self._conn)
+        self._rejected: list[int] = [0]
 
-    def test_parse_reaction_upvote(self):
-        """A +1 reaction on the issue itself is an upvote with comment_id=None."""
-        obj = {
-            "user": {"login": "alice"},
-            "content": "+1",
-            "created_at": "2026-01-15T12:00:00Z",
+    def tearDown(self):
+        self._conn.close()
+
+    def _signature(self, **overrides):
+        sig = {
+            "id": "example_signature",
+            "name": "Example Crash",
+            "games": ["skyrim-se"],
+            "regex_pattern": r"Unhandled exception",
+            "text": "An example thing failed.",
         }
-        r = _compile._parse_reaction(obj, comment_id=None)
-        self.assertIsNotNone(r)
-        self.assertEqual(r.user, "alice")
-        self.assertTrue(r.is_upvote)
-        self.assertIsNone(r.comment_id)
-        self.assertEqual(r.timestamp, datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc))
+        sig.update(overrides)
+        return sig
 
-    def test_parse_reaction_downvote(self):
-        """A -1 reaction is a downvote."""
-        obj = {
-            "user": {"login": "bob"},
-            "content": "-1",
-            "created_at": "2026-02-20T08:30:00Z",
-        }
-        r = _compile._parse_reaction(obj, comment_id=42)
-        self.assertIsNotNone(r)
-        self.assertFalse(r.is_upvote)
-        self.assertEqual(r.comment_id, 42)
+    def test_defaults_are_possible_and_other(self):
+        _compile.insert_crash_signature(self._conn, self._signature(), self._rejected)
+        self.assertEqual(self._rejected[0], 0)
+        row = self._conn.execute(
+            "SELECT games_json, level, cause, action_kind FROM crash_signatures"
+        ).fetchone()
+        self.assertEqual(row, ('["skyrim-se"]', "possible", "other", None))
 
-    def test_parse_reaction_neutral(self):
-        """Neutral emoji (laugh, heart, etc.) sets is_upvote to None."""
-        for content in ("laugh", "hooray", "confused", "heart", "rocket", "eyes"):
-            obj = {
-                "user": {"login": "charlie"},
-                "content": content,
-                "created_at": "2026-03-01T00:00:00Z",
-            }
-            r = _compile._parse_reaction(obj, comment_id=None)
-            self.assertIsNotNone(r)
-            self.assertIsNone(r.is_upvote)
+    def test_missing_games_is_rejected(self):
+        sig = self._signature()
+        del sig["games"]
+        _compile.insert_crash_signature(self._conn, sig, self._rejected)
+        self.assertEqual(self._rejected[0], 1)
 
-    def test_parse_reaction_malformed_no_user(self):
-        """Missing user field returns None."""
-        obj = {"content": "+1", "created_at": "2026-01-01T00:00:00Z"}
-        self.assertIsNone(_compile._parse_reaction(obj, comment_id=None))
-
-    def test_parse_reaction_malformed_no_content(self):
-        """Missing content field returns None."""
-        obj = {"user": {"login": "dave"}, "created_at": "2026-01-01T00:00:00Z"}
-        self.assertIsNone(_compile._parse_reaction(obj, comment_id=None))
-
-    def test_parse_reaction_malformed_no_created_at(self):
-        """Missing created_at field returns None."""
-        obj = {"user": {"login": "eve"}, "content": "+1"}
-        self.assertIsNone(_compile._parse_reaction(obj, comment_id=None))
-
-    def test_parse_reaction_malformed_created_at(self):
-        """Unparseable created_at returns None."""
-        obj = {
-            "user": {"login": "frank"},
-            "content": "+1",
-            "created_at": "not-a-date",
-        }
-        self.assertIsNone(_compile._parse_reaction(obj, comment_id=None))
-
-    def test_parse_reaction_user_login_lowercased(self):
-        """User login is always lowercased."""
-        obj = {
-            "user": {"login": "AliceWunderland"},
-            "content": "+1",
-            "created_at": "2026-01-01T00:00:00Z",
-        }
-        r = _compile._parse_reaction(obj, comment_id=None)
-        self.assertEqual(r.user, "alicewunderland")
-
-
-class TestUserReactionDataclass(unittest.TestCase):
-    """Tests for UserReaction dataclass."""
-
-    def test_user_reaction_dataclass_defaults(self):
-        """comment_id defaults to None."""
-        ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        r = _compile.UserReaction(user="test", is_upvote=True, timestamp=ts)
-        self.assertIsNone(r.comment_id)
-
-    def test_user_reaction_dataclass_with_comment_id(self):
-        """comment_id can be provided explicitly."""
-        ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        r = _compile.UserReaction(user="test", is_upvote=False, timestamp=ts, comment_id=99)
-        self.assertEqual(r.comment_id, 99)
-
-
-class TestModSocialMetrics(unittest.TestCase):
-    """Tests for ModSocialMetrics dataclass."""
-
-    def test_mod_social_metrics_defaults(self):
-        """reactions defaults to empty list; each instance gets its own list."""
-        m1 = _compile.ModSocialMetrics(mod_id="foo", issue_number=1)
-        m2 = _compile.ModSocialMetrics(mod_id="bar", issue_number=2)
-        self.assertEqual(m1.reactions, [])
-        self.assertEqual(m2.reactions, [])
-        self.assertIsNot(m1.reactions, m2.reactions)
-        m1.reactions.append("x")
-        self.assertEqual(m2.reactions, [])
-
-    def test_mod_social_metrics_with_reactions(self):
-        """Reactions can be appended after construction."""
-        ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        r = _compile.UserReaction(user="alice", is_upvote=True, timestamp=ts)
-        m = _compile.ModSocialMetrics(mod_id="sodium", issue_number=5)
-        m.reactions.append(r)
-        self.assertEqual(len(m.reactions), 1)
-        self.assertEqual(m.reactions[0].user, "alice")
-
-
-class TestHydrateGithubSocialMetricsLabelGating(unittest.TestCase):
-    """The registry-vote label is REQUIRED to harvest reactions (votes)."""
-
-    def _issue(self, num: int, mod_id: str, labels: list[str]) -> dict:
-        return {
-            "number": num,
-            "body": f"### Mod Registry ID\n{mod_id}\n\n",
-            "labels": [{"name": name} for name in labels],
-            "user": {"login": "alice"},
-            "created_at": "2026-01-01T00:00:00Z",
-        }
-
-    def test_reactions_only_harvested_from_registry_vote_labeled_issues(self):
-        """Votes are harvested only from registry-vote-labeled issues."""
-        issues = [
-            self._issue(1, "sodium", ["registry-vote"]),
-            self._issue(2, "sodium", ["community-review"]),
-        ]
-        with mock.patch.object(_compile, "_load_github_token", return_value="token"), \
-             mock.patch.object(_compile, "_get_registry_repo", return_value="owner/repo"), \
-             mock.patch.object(_compile, "_load_poll_blacklist", return_value=set()), \
-             mock.patch.object(_compile, "_github_paginate", return_value=issues), \
-             mock.patch.object(_compile, "_fetch_reactions_for_issue", return_value=[]) as fetch:
-            items = [{"id": "sodium", "name": "Sodium"}]
-            _compile._hydrate_github_social_metrics(items)
-        called_issue_numbers = [call.args[2] for call in fetch.call_args_list]
-        self.assertEqual(called_issue_numbers, [1])
-
-    def test_unlabeled_issue_harvests_no_reactions(self):
-        """An issue with neither label must not contribute votes."""
-        issues = [self._issue(1, "sodium", [])]
-        with mock.patch.object(_compile, "_load_github_token", return_value="token"), \
-             mock.patch.object(_compile, "_get_registry_repo", return_value="owner/repo"), \
-             mock.patch.object(_compile, "_load_poll_blacklist", return_value=set()), \
-             mock.patch.object(_compile, "_github_paginate", return_value=issues), \
-             mock.patch.object(_compile, "_fetch_reactions_for_issue", return_value=[]) as fetch:
-            items = [{"id": "sodium", "name": "Sodium"}]
-            _compile._hydrate_github_social_metrics(items)
-        fetch.assert_not_called()
-
-
-class TestSybilDiversityWeight(unittest.TestCase):
-    """Tests for _sybil_diversity_weight."""
-
-    def test_sybil_diversity_weight_single_mod(self):
-        """User who only reacted on one mod gets 0.5 weight."""
-        self.assertEqual(_compile._sybil_diversity_weight("alice", ["sodium"]), 0.5)
-
-    def test_sybil_diversity_weight_multiple_mods(self):
-        """User who reacted on multiple mods gets 1.0 weight."""
-        self.assertEqual(_compile._sybil_diversity_weight("alice", ["sodium", "iris"]), 1.0)
-
-    def test_sybil_diversity_weight_repeated_single_mod(self):
-        """Repeated reactions on a single mod still count as one distinct mod."""
-        self.assertEqual(_compile._sybil_diversity_weight("alice", ["sodium", "sodium", "sodium"]), 0.5)
-
-
-class TestUserInteractionCounts(unittest.TestCase):
-    """Tests for _user_interaction_counts."""
-
-    def test_user_interaction_counts_counts_per_user(self):
-        """Counts are correct for shared and exclusive users across mods."""
-        ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        m1 = _compile.ModSocialMetrics(mod_id="sodium", issue_number=1)
-        m1.reactions.extend([
-            _compile.UserReaction(user="alice", is_upvote=True, timestamp=ts),
-            _compile.UserReaction(user="bob", is_upvote=False, timestamp=ts),
-        ])
-        m2 = _compile.ModSocialMetrics(mod_id="iris", issue_number=2)
-        m2.reactions.extend([
-            _compile.UserReaction(user="alice", is_upvote=True, timestamp=ts),
-            _compile.UserReaction(user="charlie", is_upvote=True, timestamp=ts),
-        ])
-        by_mod = {"sodium": m1, "iris": m2}
-        cache: dict[str, int] = {}
-        result = _compile._user_interaction_counts(by_mod, token="", org="", cache=cache)
-        self.assertEqual(cache["alice"], 0)
-        self.assertEqual(cache["bob"], 0)
-        self.assertEqual(cache["charlie"], 0)
-        self.assertIs(result, cache)
-
-
-class TestComputeVelocity(unittest.TestCase):
-    """Tests for _compute_velocity."""
-
-    def test_compute_velocity_zero_history_zero_recent(self):
-        """With zero history and zero recent, velocity is clamped."""
-        now_dt = datetime(2026, 6, 22, tzinfo=timezone.utc)
-        velocity, is_anomaly, anomaly_start = _compile._compute_velocity([], [], now_dt)
-        self.assertGreaterEqual(velocity, -1.5)
-        self.assertLessEqual(velocity, 0.0)
-        self.assertFalse(is_anomaly)
-        self.assertIsNone(anomaly_start)
-
-    def test_compute_velocity_anomaly_fires_on_large_recent_downvote_burst(self):
-        """25 downvotes in the last 6h with minimal historical context fires anomaly."""
-        now_dt = datetime(2026, 6, 22, tzinfo=timezone.utc)
-        six_h_ago = now_dt - timedelta(hours=6)
-        down_ts = [
-            now_dt - timedelta(hours=1, minutes=i)
-            for i in range(25)
-        ]
-        historical_ts = [
-            now_dt - timedelta(days=3),
-            now_dt - timedelta(days=5),
-        ]
-        down_ts.extend(historical_ts)
-        velocity, is_anomaly, anomaly_start = _compile._compute_velocity([], down_ts, now_dt)
-        self.assertTrue(is_anomaly)
-        self.assertIsNotNone(anomaly_start)
-        self.assertAlmostEqual(anomaly_start, six_h_ago, delta=timedelta(minutes=1))
-        self.assertGreater(velocity, 0.0)
-        self.assertLessEqual(velocity, 10.0)
-
-    def test_compute_velocity_no_anomaly_at_low_recent_count(self):
-        """10 downvotes in 6h vs. historical 5/7d: ratio > 5 but recent_count <= 20 -> no anomaly."""
-        now_dt = datetime(2026, 6, 22, tzinfo=timezone.utc)
-        down_6h = [
-            now_dt - timedelta(hours=1, minutes=i)
-            for i in range(10)
-        ]
-        down_7d = [
-            now_dt - timedelta(days=d)
-            for d in [1, 2, 3, 4, 5]
-        ]
-        down_ts = down_6h + down_7d
-        velocity, is_anomaly, anomaly_start = _compile._compute_velocity([], down_ts, now_dt)
-        self.assertFalse(is_anomaly)
-        self.assertIsNone(anomaly_start)
-
-
-class TestRegexFilterComment(unittest.TestCase):
-    """Tests for _regex_filter_comment."""
-
-    def test_version_begging_regex_drops(self):
-        """Version-begging comments are rejected."""
-        passed, reason = _compile._regex_filter_comment("when is 1.21 release?")
-        self.assertFalse(passed)
-        self.assertEqual(reason, "version-begging")
-
-    def test_empty_praise_regex_drops(self):
-        """Empty praise comments are rejected."""
-        passed, reason = _compile._regex_filter_comment("nice mod!")
-        self.assertFalse(passed)
-        self.assertEqual(reason, "empty-praise")
-
-    def test_legit_review_passes_regex(self):
-        """A substantive technical review passes regex filters."""
-        passed, reason = _compile._regex_filter_comment(
-            "This mod significantly improved my framerate from 30 to 120 FPS."
+    def test_empty_games_is_rejected(self):
+        _compile.insert_crash_signature(
+            self._conn, self._signature(games=[]), self._rejected
         )
-        self.assertTrue(passed)
-        self.assertEqual(reason, "")
+        self.assertEqual(self._rejected[0], 1)
 
-    def test_empty_text_dropped(self):
-        """Empty or whitespace-only text is dropped."""
-        passed, reason = _compile._regex_filter_comment("")
-        self.assertFalse(passed)
-        self.assertEqual(reason, "empty")
-        passed, reason = _compile._regex_filter_comment("   ")
-        self.assertFalse(passed)
-        self.assertEqual(reason, "empty")
+    def test_level_must_be_possible_or_likely(self):
+        _compile.insert_crash_signature(
+            self._conn, self._signature(level="very_likely"), self._rejected
+        )
+        self.assertEqual(self._rejected[0], 1)
 
-    def test_port_to_regex_drops(self):
-        """'port to' and 'update to' variants are also dropped."""
-        for text in ("update to 1.21?", "port to 1.20 release", "for 1.22"):
-            passed, reason = _compile._regex_filter_comment(text)
-            self.assertFalse(passed, f"Expected drop for '{text}', got pass")
-            self.assertEqual(reason, "version-begging")
+    def test_unknown_cause_is_rejected(self):
+        _compile.insert_crash_signature(
+            self._conn, self._signature(cause="banana"), self._rejected
+        )
+        self.assertEqual(self._rejected[0], 1)
 
+    def test_install_action_needs_a_content_key(self):
+        _compile.insert_crash_signature(
+            self._conn,
+            self._signature(action={"kind": "install_content"}),
+            self._rejected,
+        )
+        self.assertEqual(self._rejected[0], 1)
 
-class TestNlpFilterComment(unittest.TestCase):
-    """Tests for _nlp_filter_comment."""
+    def test_action_is_stored(self):
+        _compile.insert_crash_signature(
+            self._conn,
+            self._signature(
+                level="likely",
+                cause="missing_requirement",
+                action={
+                    "kind": "install_content",
+                    "content_key": "example-api",
+                    "label": "Install Example API",
+                },
+            ),
+            self._rejected,
+        )
+        self.assertEqual(self._rejected[0], 0)
+        row = self._conn.execute(
+            "SELECT level, cause, action_kind, action_content_key, action_label "
+            "FROM crash_signatures"
+        ).fetchone()
+        self.assertEqual(
+            row,
+            ("likely", "missing_requirement", "install_content", "example-api", "Install Example API"),
+        )
 
-    def test_nlp_filter_comment_handles_missing_deps_gracefully(self):
-        """If profanity-check import fails, _nlp_filter_comment returns (True, "")."""
+    def test_rust_incompatible_regex_is_rejected(self):
+        """The app runs Rust's regex crate, which has no look-around or backreferences.
+
+        A pattern Python accepts but Rust refuses compiles into the catalog and then makes
+        the row unreadable at run time, so the compiler must refuse it here.
+        """
+        _compile.insert_crash_signature(
+            self._conn,
+            self._signature(id="lookahead", regex_pattern="(?=abc)"),
+            self._rejected,
+        )
+        self.assertEqual(self._rejected[0], 1)
+        row = self._conn.execute(
+            "SELECT id FROM crash_signatures WHERE id = ?", ("lookahead",)
+        ).fetchone()
+        self.assertIsNone(row)
+
+    def test_duplicate_id_is_rejected_not_a_crash(self):
+        """Two signature files may carry the same id; the second is skipped, never fatal.
+
+        The app promises one bad row never stops the others, and the nightly compile keeps
+        going. A bare INSERT on the primary key raises IntegrityError and loses the whole
+        catalog instead.
+        """
+        _compile.insert_crash_signature(self._conn, self._signature(id="dupe"), self._rejected)
         try:
-            import profanity_check  # noqa: F401
-            has_deps = True
-        except ImportError:
-            has_deps = False
-        passed, reason = _compile._nlp_filter_comment("This mod is fantastic and very well made.")
-        self.assertTrue(passed)
-        self.assertEqual(reason, "")
-
-
-class TestPass3Constants(unittest.TestCase):
-    """Tests for Pass 3 circuit-breaker constants."""
-
-    def test_organic_under_review_threshold_constant(self):
-        """ORGANIC_UNDER_REVIEW_THRESHOLD must equal -10."""
-        self.assertEqual(_compile.ORGANIC_UNDER_REVIEW_THRESHOLD, -10)
-
-    def test_triage_poll_duration_constant(self):
-        """TRIAGE_POLL_DURATION_DAYS must equal 7."""
-        self.assertEqual(_compile.TRIAGE_POLL_DURATION_DAYS, 7)
-
-
-class TestAppendAuditEntry(unittest.TestCase):
-    """Tests for _append_audit_entry."""
-
-    def setUp(self):
-        # Redirect REGISTRY_DIR at a tempdir: _append_audit_entry writes both
-        # audit_log.json AND (on rotation) audit_log_archive.<date>.json under
-        # it. Backing up only the former left rotation archives behind in the
-        # real, git-tracked registry/governance/, which the governance pipeline
-        # reads and which AGENTS.md says must carry only governance-state.json.
-        self._tmp = tempfile.TemporaryDirectory()
-        self._prev_registry_dir = _compile.REGISTRY_DIR
-        _compile.REGISTRY_DIR = Path(self._tmp.name)
-        self._audit_path = _compile.REGISTRY_DIR / "governance" / "audit_log.json"
-
-    def tearDown(self):
-        _compile.REGISTRY_DIR = self._prev_registry_dir
-        self._tmp.cleanup()
-
-    def test_append_audit_entry_creates_file_when_absent(self):
-        """_append_audit_entry creates the file if it doesn't exist."""
-        if self._audit_path.exists():
-            self._audit_path.unlink()
-        _compile._append_audit_entry("test_action", "test_details")
-        self.assertTrue(self._audit_path.exists())
-        with self._audit_path.open("r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        self.assertIn("entries", data)
-        self.assertEqual(len(data["entries"]), 1)
-        self.assertEqual(data["entries"][0]["action"], "test_action")
-        self.assertEqual(data["entries"][0]["details"], "test_details")
-        self.assertIn("timestamp", data["entries"][0])
-
-    def test_append_audit_entry_rotates_at_10000(self):
-        """After 10000 entries, adding one more rotates to keep <= 10000."""
-        data = {"log_format_version": 1, "entries": [{"timestamp": "2026-01-01T00:00:00Z", "action": f"dummy_{i}", "details": ""} for i in range(10000)]}
-        self._audit_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._audit_path.open("w", encoding="utf-8") as fh:
-            json.dump(data, fh)
-        _compile._append_audit_entry("rotate_test", "should rotate")
-        with self._audit_path.open("r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        self.assertLessEqual(len(data["entries"]), 10000)
-        self.assertIn("log_format_version", data)
-
-
-class TestFindTriageDiscussionCategory(unittest.TestCase):
-    """Tests for _find_triage_discussion_category."""
-
-    def test_find_triage_discussion_category_returns_none_without_network(self):
-        """With a dummy nonexistent repo, the function should return None."""
-        result = _compile._find_triage_discussion_category(
-            "og-nonexistent-xyz", "og-nonexistent-xyz", token="invalid-token-for-test",
-        )
-        self.assertIsNone(result)
-
-
-class TestCreateAdminAlertIssue(unittest.TestCase):
-    """Tests for _create_admin_alert_issue."""
-
-    def test_create_admin_alert_issue_failure_logged_not_raised(self):
-        """Invalid token should log a warning but not raise."""
-        _compile._create_admin_alert_issue(
-            "og-nonexistent-xyz", "og-nonexistent-xyz",
-            mod_id="test", offending_reactions=[], token="invalid-token",
-        )
-        self.assertTrue(True)
-
-
-class TestDiscordAlert(unittest.TestCase):
-    """Tests for Discord webhook notification channel."""
-
-    _prev_discord_url: str | None = None
-
-    def setUp(self):
-        self._prev_discord_url = os.environ.pop("DISCORD_WEBHOOK_URL", None)
-
-    def tearDown(self):
-        if self._prev_discord_url is not None:
-            os.environ["DISCORD_WEBHOOK_URL"] = self._prev_discord_url
-
-    def test_load_discord_webhook_url_returns_none_when_unset(self):
-        """When DISCORD_WEBHOOK_URL is absent, _load_discord_webhook_url returns None."""
-        os.environ.pop("DISCORD_WEBHOOK_URL", None)
-        result = _compile._load_discord_webhook_url()
-        self.assertIsNone(result)
-
-    def test_load_discord_webhook_url_returns_value_when_set(self):
-        """When DISCORD_WEBHOOK_URL is set, _load_discord_webhook_url returns it."""
-        os.environ["DISCORD_WEBHOOK_URL"] = "https://discord.com/api/webhooks/test/abc"
-        result = _compile._load_discord_webhook_url()
-        self.assertEqual(result, "https://discord.com/api/webhooks/test/abc")
-
-    def test_post_discord_alert_is_noop_when_url_unset(self):
-        """When DISCORD_WEBHOOK_URL is unset, _post_discord_alert returns without making a network call."""
-        os.environ.pop("DISCORD_WEBHOOK_URL", None)
-        _compile._post_discord_alert(mod_id="testmod", reason="test", severity="spike")
-        self.assertTrue(True)
-
-    @unittest.skipIf(os.environ.get("CI") == "true", "skip network test on CI")
-    def test_post_discord_alert_swallows_invalid_webhook_failures(self):
-        """An invalid webhook URL must not raise."""
-        os.environ["DISCORD_WEBHOOK_URL"] = "https://discord.com/api/webhooks/INVALID/INVALID"
-        _compile._post_discord_alert(
-            mod_id="testmod",
-            reason="test reason",
-            severity="spike",
-            offending_reactions=[{"user": "bob"}],
-        )
-        self.assertTrue(True)
-
-    def test_post_discord_alert_accepts_optional_fields(self):
-        """Calling _post_discord_alert with optional fields still returns cleanly when no webhook is configured."""
-        os.environ.pop("DISCORD_WEBHOOK_URL", None)
-        _compile._post_discord_alert(
-            mod_id="testmod",
-            reason="test reason",
-            severity="spike",
-            offending_reactions=[{"user": "alice"}],
-            admin_alert_issue_url="https://example.com/issues/1",
-        )
-        self.assertTrue(True)
+            _compile.insert_crash_signature(
+                self._conn,
+                self._signature(id="dupe", regex_pattern="Another invented line"),
+                self._rejected,
+            )
+        except _compile.sqlite3.IntegrityError:
+            self.fail("a duplicate id raised instead of being rejected")
+        self.assertEqual(self._rejected[0], 1)
+        rows = self._conn.execute(
+            "SELECT COUNT(*) FROM crash_signatures WHERE id = ?", ("dupe",)
+        ).fetchone()
+        self.assertEqual(rows[0], 1)
 
 
 # ---------------------------------------------------------------------------
@@ -1405,9 +974,15 @@ class TestLoadKnownConflicts(unittest.TestCase):
     applying A's window to B would silently mis-scope every reversed entry.
     """
 
-    def _load(self, entries):
-        conn = sqlite3.connect(":memory:")
-        conn.execute(
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._patch = mock.patch.object(_compile, "REGISTRY_DIR", Path(self._tmp.name))
+        self._patch.start()
+        gov = Path(self._tmp.name) / "governance"
+        gov.mkdir(parents=True)
+        self.path = gov / "known_conflicts.json"
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.execute(
             """CREATE TABLE known_conflicts (
                    mod_a_id TEXT, mod_b_id TEXT, severity TEXT,
                    mitigated_by_json TEXT, notes TEXT,
@@ -1415,14 +990,19 @@ class TestLoadKnownConflicts(unittest.TestCase):
                    version_grammar TEXT,
                    PRIMARY KEY (mod_a_id, mod_b_id))"""
         )
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        gov = Path(tmp.name) / "governance"
-        gov.mkdir(parents=True)
-        (gov / "known_conflicts.json").write_text(json.dumps(entries), encoding="utf-8")
-        with mock.patch.object(_compile, "REGISTRY_DIR", Path(tmp.name)):
-            count = _compile.load_known_conflicts(conn)
-        rows = conn.execute(
+
+    def tearDown(self):
+        self.conn.close()
+        self._patch.stop()
+        self._tmp.cleanup()
+
+    def _write(self, text: str) -> None:
+        self.path.write_text(text, encoding="utf-8")
+
+    def _load(self, entries, *, allow_partial: bool = False):
+        self._write(json.dumps(entries))
+        count = _compile.load_known_conflicts(self.conn, allow_partial=allow_partial)
+        rows = self.conn.execute(
             "SELECT mod_a_id, mod_b_id, mod_a_versions_json,"
             " mod_b_versions_json, version_grammar FROM known_conflicts"
         ).fetchall()
@@ -1460,6 +1040,843 @@ class TestLoadKnownConflicts(unittest.TestCase):
              "version_grammar": "Maven", "a_versions": ["[1.0,2.0)"]},
         ])
         self.assertEqual(rows[0][4], "maven")
+
+    def test_missing_file_stops_the_run_and_names_the_file(self):
+        with self.assertRaisesRegex(_compile.GovernanceError, "known_conflicts.json"):
+            _compile.load_known_conflicts(self.conn)
+
+    def test_malformed_json_stops_the_run_and_names_the_file(self):
+        self._write("{not valid json!!!")
+        with self.assertRaisesRegex(_compile.GovernanceError, "known_conflicts.json"):
+            _compile.load_known_conflicts(self.conn)
+
+    def test_non_array_stops_the_run(self):
+        self._write(json.dumps({"a": "alpha", "b": "zebra"}))
+        with self.assertRaisesRegex(_compile.GovernanceError, "known_conflicts.json"):
+            _compile.load_known_conflicts(self.conn)
+
+    def test_non_object_entry_stops_the_run(self):
+        self._write(json.dumps(["alpha"]))
+        with self.assertRaisesRegex(_compile.GovernanceError, "known_conflicts.json"):
+            _compile.load_known_conflicts(self.conn)
+
+    def test_override_proceeds_and_logs_when_missing(self):
+        with self.assertLogs("compiler", level="WARNING") as logs:
+            count = _compile.load_known_conflicts(self.conn, allow_partial=True)
+        self.assertEqual(count, 0)
+        self.assertTrue(any("known_conflicts.json" in line for line in logs.output))
+
+    def test_override_proceeds_and_logs_when_malformed(self):
+        self._write("{not valid json!!!")
+        with self.assertLogs("compiler", level="WARNING") as logs:
+            count = _compile.load_known_conflicts(self.conn, allow_partial=True)
+        self.assertEqual(count, 0)
+        self.assertTrue(any("known_conflicts.json" in line for line in logs.output))
+
+
+# ---------------------------------------------------------------------------
+# Catalog entries for other games (MASTER_SPEC §26.8, REGISTRY_CURATION_REFERENCE)
+# ---------------------------------------------------------------------------
+
+# A stand-in for a game package. The real Skyrim package declares no frameworks
+# yet, so the fixture declares SKSE to exercise a satisfiable requirement.
+FIXTURE_PACKAGE = {
+    "id": "agora.test-creation",
+    "games": [
+        {
+            "id": "skyrim-se",
+            "stores": [{"store": "steam", "product": "1"}, {"store": "gog", "product": "2"}],
+            "framework_ids": [],
+        }
+    ],
+    "frameworks": [
+        {"id": "skse", "game": "skyrim-se", "name": "SKSE", "version": "2.2.6"},
+    ],
+}
+
+
+def _skyrim_github_entry(item_id="crash-logger"):
+    return {
+        "id": item_id,
+        "name": "CrashLogger",
+        "content_type": "mod",
+        "author": "Example",
+        "license": "MIT",
+        "game": "skyrim-se",
+        "download_strategy": "github_release",
+        "source_identifier": "example-author/crash-logger",
+        "sha256": "a" * 64,
+        "game_compatibility": [
+            {
+                "stores": ["steam", "gog"],
+                "game_versions": ["1.6.1170.*", "1.6.1179.0"],
+                "requires": [{"framework": "skse", "min_version": "2.2.6"}],
+                "asset": "CrashLogger-*.7z",
+            }
+        ],
+        "curator_note": "Logs crashes.",
+        "base_categories": ["tools"],
+    }
+
+
+def _skyrim_direct_entry(item_id="skyrim-archive-mod", url="https://example.com/files/Mod-1.0.zip"):
+    return {
+        "id": item_id,
+        "name": "Archive Mod",
+        "content_type": "mod",
+        "author": "Example",
+        "license": "LicenseRef-Proprietary",
+        "game": "skyrim-se",
+        "download_strategy": "direct_hash",
+        "source_identifier": url,
+        "sha256": "b" * 64,
+        "game_compatibility": [{"stores": ["steam"], "game_versions": ["1.6.1170.0"]}],
+        "curator_note": "",
+        "base_categories": ["content"],
+    }
+
+
+def _skyrim_manual_entry(
+    item_id="address-library",
+    url="https://www.nexusmods.com/skyrimspecialedition/mods/32444",
+):
+    return {
+        "id": item_id,
+        "name": "Address Library for SKSE Plugins",
+        "content_type": "mod",
+        "author": "meh321",
+        "license": "MIT",
+        "game": "skyrim-se",
+        "download_strategy": "manual_link",
+        "source_identifier": url,
+        "game_compatibility": [
+            {
+                "stores": ["steam", "gog"],
+                "game_versions": ["1.6.*"],
+                "requires": [{"framework": "skse", "min_version": "2.2.6"}],
+                "asset": "*-32444-*.zip",
+                "download_hint": "Main file: Address Library for SKSE Plugins",
+            }
+        ],
+    }
+
+
+def _minecraft_direct_entry(item_id="minecraft-pinned-mod"):
+    return {
+        "id": item_id,
+        "name": "Pinned Mod",
+        "content_type": "mod",
+        "author": "Example",
+        "license": "LicenseRef-Proprietary",
+        "download_strategy": "direct_hash",
+        "source_identifier": "https://example.com/files/pinned-1.0.0.jar",
+        "sha256": "c" * 64,
+        "compatible_versions": [
+            {"mc_version": "1.21", "loader": "fabric", "mod_version": "1.0.0"},
+        ],
+        "curator_note": "",
+        "base_categories": ["content"],
+    }
+
+
+class OtherGameDeclarationTests(unittest.TestCase):
+    """What the game packages declare, read from their JSON."""
+
+    def test_real_packages_declare_skyrim_and_the_tracer_games(self):
+        declared = _compile.load_game_declarations()
+        self.assertEqual(declared["skyrim-se"].stores, frozenset({"steam", "gog"}))
+        self.assertEqual(declared["valheim"].stores, frozenset({"steam"}))
+        self.assertEqual(declared["witcher-3"].stores, frozenset({"gog"}))
+        self.assertNotIn("minecraft", declared)
+
+    def test_minecraft_cannot_be_declared_by_a_package(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp) / "package.json"
+            package.write_text(json.dumps({"games": [{"id": "minecraft", "stores": []}]}), encoding="utf-8")
+            with self.assertRaises(SystemExit) as caught:
+                _compile.load_game_declarations([package])
+        self.assertIn("minecraft", str(caught.exception.code))
+
+    def test_a_game_declared_twice_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first, second = Path(tmp) / "a.json", Path(tmp) / "b.json"
+            game = {"games": [{"id": "skyrim-se", "stores": []}]}
+            first.write_text(json.dumps(game), encoding="utf-8")
+            second.write_text(json.dumps(game), encoding="utf-8")
+            with self.assertRaises(SystemExit) as caught:
+                _compile.load_game_declarations([first, second])
+        self.assertIn("skyrim-se", str(caught.exception.code))
+
+
+class OtherGameEntryTests(unittest.TestCase):
+    """Entries for other games compile through the real pipeline. Every rule they
+    break is refused, and the refusal names the file and the field."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.registry = self.tmp / "registry"
+        self.registry.mkdir()
+        write_empty_known_conflicts(self.registry)
+        self.package = self.tmp / "package.json"
+        self.package.write_text(json.dumps(FIXTURE_PACKAGE), encoding="utf-8")
+        patches = [
+            mock.patch.object(_compile, "REGISTRY_DIR", self.registry),
+            mock.patch.object(_compile, "game_package_paths", lambda: [self.package]),
+            mock.patch.object(_compile, "_hydrate_modrinth_metadata", lambda items: None),
+            mock.patch.object(_compile, "_hydrate_modrinth_versions", lambda items: None),
+            mock.patch.object(_compile, "_hydrate_version_changelogs", lambda items: []),
+            mock.patch.object(_compile, "_load_github_token", lambda: None),
+            mock.patch.object(
+                _compile, "manifest_date_added", lambda path: "2026-01-01T00:00:00+00:00"
+            ),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def reset_registry(self):
+        shutil.rmtree(self.registry)
+        self.registry.mkdir()
+        write_empty_known_conflicts(self.registry)
+
+    def write(self, rel, data):
+        path = self.registry / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return path
+
+    def skyrim_entry_at(self, data, rel=None):
+        return self.write(rel or f"games/skyrim-se/mods/{data['id']}.json", data)
+
+    def compile(self):
+        out = self.tmp / "out" / "registry.db"
+        _compile.compile_registry(out, skip_sign=True, no_governance_write=True, governance_mode_str="off")
+        return out
+
+    def _rows_of(self, out, table):
+        conn = sqlite3.connect(str(out))
+        conn.row_factory = sqlite3.Row
+        try:
+            return {row["id"]: dict(row) for row in conn.execute(f"SELECT * FROM {table}")}
+        finally:
+            conn.close()
+
+    def game_rows(self, out):
+        """Entries for other games, from game_catalog_items."""
+        return self._rows_of(out, "game_catalog_items")
+
+    def minecraft_rows(self, out):
+        """Minecraft entries, from registry_items."""
+        return self._rows_of(out, "registry_items")
+
+    def assertRefused(self, *needles):
+        """The compile must exit. The refusal, whether raised with its message or
+        logged first (the Minecraft URL checks log then exit 1), must name each needle."""
+        logged = []
+        handler = logging.Handler(level=logging.ERROR)
+        handler.emit = lambda record: logged.append(record.getMessage())
+        compiler_logger = logging.getLogger("compiler")
+        compiler_logger.addHandler(handler)
+        try:
+            with self.assertRaises(SystemExit) as caught:
+                self.compile()
+        finally:
+            compiler_logger.removeHandler(handler)
+        message = " ".join([str(caught.exception.code), *logged])
+        for needle in needles:
+            self.assertIn(needle, message)
+        return message
+
+    # -- valid entries -------------------------------------------------------
+
+    def test_valid_github_and_direct_hash_entries_compile(self):
+        self.skyrim_entry_at(_skyrim_github_entry())
+        self.skyrim_entry_at(_skyrim_direct_entry())
+        out = self.compile()
+        rows = self.game_rows(out)
+
+        github = rows["crash-logger"]
+        self.assertEqual(github["game"], "skyrim-se")
+        self.assertEqual(github["download_strategy"], "github_release")
+        self.assertEqual(github["status"], "active")
+        self.assertEqual(github["license_id"], "MIT")
+        compat = json.loads(github["game_compatibility_json"])
+        self.assertEqual(compat[0]["asset"], "CrashLogger-*.7z")
+        self.assertEqual(compat[0]["requires"], [{"framework": "skse", "min_version": "2.2.6"}])
+        self.assertEqual(
+            json.loads(github["download_sources_json"]),
+            [{"strategy": "github_release", "identifier": "example-author/crash-logger"}],
+        )
+
+        direct = rows["skyrim-archive-mod"]
+        self.assertEqual(direct["game"], "skyrim-se")
+        self.assertEqual(direct["download_strategy"], "direct_hash")
+        self.assertNotIn("asset", json.loads(direct["game_compatibility_json"])[0])
+
+    def test_other_game_entries_stay_out_of_registry_items(self):
+        self.skyrim_entry_at(_skyrim_github_entry())
+        out = self.compile()
+        self.assertNotIn("crash-logger", self.minecraft_rows(out))
+        conn = sqlite3.connect(str(out))
+        try:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(registry_items)")}
+        finally:
+            conn.close()
+        self.assertNotIn("game", columns)
+        self.assertNotIn("game_compatibility_json", columns)
+
+    def test_archive_names_are_accepted_for_direct_hash(self):
+        for index, name in enumerate(("Mod-1.0.7z", "Mod-1.0.zip", "Mod-1.0.rar")):
+            self.skyrim_entry_at(
+                _skyrim_direct_entry(item_id=f"archive-{index}", url=f"https://example.com/files/{name}")
+            )
+        rows = self.game_rows(self.compile())
+        self.assertEqual({"archive-0", "archive-1", "archive-2"}, set(rows))
+
+    def test_minecraft_entry_may_name_its_game(self):
+        entry = _minecraft_direct_entry()
+        entry["game"] = "minecraft"
+        self.write("mods/minecraft-pinned-mod.json", entry)
+        out = self.compile()
+        self.assertIn("minecraft-pinned-mod", self.minecraft_rows(out))
+        self.assertNotIn("minecraft-pinned-mod", self.game_rows(out))
+
+    def test_compiled_schema_version_is_the_compiler_constant(self):
+        self.skyrim_entry_at(_skyrim_github_entry())
+        conn = sqlite3.connect(str(self.compile()))
+        try:
+            version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(version, _compile.SCHEMA_VERSION)
+        # Schema 10: crash_signatures changed shape (format v2), and that is a
+        # table older clients read, so the version moves with it.
+        self.assertEqual(_compile.SCHEMA_VERSION, 10)
+
+    # -- folder and game ----------------------------------------------------
+
+    def test_an_entry_whose_game_disagrees_with_its_folder_is_refused(self):
+        entry = _skyrim_github_entry()
+        entry["game"] = "valheim"
+        self.skyrim_entry_at(entry)
+        self.assertRefused("crash-logger.json", '"game" must be', "skyrim-se")
+
+    def test_a_folder_for_an_undeclared_game_is_refused(self):
+        entry = _skyrim_github_entry()
+        entry["game"] = "not-a-game"
+        self.write("games/not-a-game/mods/crash-logger.json", entry)
+        self.assertRefused("crash-logger.json", "not-a-game")
+
+    def test_an_other_game_entry_outside_the_games_folder_is_refused(self):
+        self.write("mods/crash-logger.json", _skyrim_github_entry())
+        self.assertRefused("crash-logger.json", '"game" is', "registry/games/skyrim-se")
+
+    def test_a_minecraft_folder_entry_may_not_carry_game_compatibility(self):
+        entry = _minecraft_direct_entry()
+        entry["game_compatibility"] = [{"stores": ["steam"], "game_versions": ["1.0"]}]
+        self.write("mods/minecraft-pinned-mod.json", entry)
+        self.assertRefused("minecraft-pinned-mod.json", '"game_compatibility"')
+
+    def test_an_other_game_packs_folder_is_refused(self):
+        self.write("games/skyrim-se/packs/crash-logger.json", _skyrim_github_entry())
+        self.assertRefused("packs", "only mods entries")
+
+    # -- compatibility ------------------------------------------------------
+
+    def test_unknown_store_is_refused(self):
+        entry = _skyrim_github_entry()
+        entry["game_compatibility"][0]["stores"] = ["epic"]
+        self.skyrim_entry_at(entry)
+        self.assertRefused("crash-logger.json", "game_compatibility[0].stores", "'epic'")
+
+    def test_unknown_framework_is_refused(self):
+        entry = _skyrim_github_entry()
+        entry["game_compatibility"][0]["requires"] = [{"framework": "nvse", "min_version": "1.0"}]
+        self.skyrim_entry_at(entry)
+        self.assertRefused("crash-logger.json", "requires", "'nvse'")
+
+    def test_empty_arrays_are_refused(self):
+        cases = {
+            "game_compatibility": lambda e: e.update(game_compatibility=[]),
+            "stores": lambda e: e["game_compatibility"][0].update(stores=[]),
+            "game_versions": lambda e: e["game_compatibility"][0].update(game_versions=[]),
+        }
+        for field_name, break_entry in cases.items():
+            with self.subTest(field=field_name):
+                self.reset_registry()
+                entry = _skyrim_github_entry()
+                break_entry(entry)
+                self.skyrim_entry_at(entry)
+                self.assertRefused("crash-logger.json", field_name)
+
+    def test_non_numeric_min_version_is_refused(self):
+        entry = _skyrim_github_entry()
+        entry["game_compatibility"][0]["requires"] = [{"framework": "skse", "min_version": "2.2.6b"}]
+        self.skyrim_entry_at(entry)
+        self.assertRefused("crash-logger.json", "min_version", "'2.2.6b'")
+
+    def test_game_version_globs_must_cover_whole_components(self):
+        for bad in ("1.6.11*", "1.6.1170.0-1", "1.6.1170.x", ""):
+            with self.subTest(version=bad):
+                self.reset_registry()
+                entry = _skyrim_github_entry()
+                entry["game_compatibility"][0]["game_versions"] = [bad]
+                self.skyrim_entry_at(entry)
+                self.assertRefused("crash-logger.json", "game_versions")
+
+    def test_a_github_entry_needs_an_asset(self):
+        entry = _skyrim_github_entry()
+        del entry["game_compatibility"][0]["asset"]
+        self.skyrim_entry_at(entry)
+        self.assertRefused("crash-logger.json", "game_compatibility[0].asset", "required")
+
+    def test_a_direct_hash_entry_may_not_name_an_asset(self):
+        entry = _skyrim_direct_entry()
+        entry["game_compatibility"][0]["asset"] = "Mod-*.zip"
+        self.skyrim_entry_at(entry)
+        self.assertRefused("skyrim-archive-mod.json", "game_compatibility[0].asset", "only for github_release")
+
+    def test_unknown_compatibility_keys_are_refused(self):
+        entry = _skyrim_github_entry()
+        entry["game_compatibility"][0]["game_version"] = ["1.6.1170.0"]
+        self.skyrim_entry_at(entry)
+        self.assertRefused("crash-logger.json", "game_version")
+
+    # -- Minecraft-only fields and strategies ---------------------------------
+
+    def test_minecraft_only_fields_are_refused_on_other_game_entries(self):
+        extras = {
+            "compatible_versions": [{"mc_version": "1.21", "loader": "fabric", "mod_version": "1.0"}],
+            "mod_dependencies": {"required": ["fabric-api"]},
+            "package_signatures": ["com.example.mod"],
+            "mod_jar_aliases": ["example"],
+            "modrinth_id": "AAAAAAAA",
+        }
+        for field_name, value in extras.items():
+            with self.subTest(field=field_name):
+                self.reset_registry()
+                entry = _skyrim_github_entry()
+                entry[field_name] = value
+                self.skyrim_entry_at(entry)
+                self.assertRefused("crash-logger.json", f'"{field_name}"')
+
+    def test_modrinth_strategy_is_refused_for_another_game(self):
+        entry = _skyrim_github_entry()
+        entry["download_strategy"] = "modrinth_id"
+        entry["source_identifier"] = "AAAAAAAA"
+        self.skyrim_entry_at(entry)
+        self.assertRefused("crash-logger.json", "'modrinth_id'", "github_release or direct_hash")
+
+    def test_a_github_identifier_must_be_owner_and_repo(self):
+        entry = _skyrim_github_entry()
+        entry["source_identifier"] = "just-a-name"
+        self.skyrim_entry_at(entry)
+        self.assertRefused("crash-logger.json", "owner/repo")
+
+    def test_a_direct_hash_url_must_be_https(self):
+        self.skyrim_entry_at(_skyrim_direct_entry(url="http://example.com/files/Mod-1.0.zip"))
+        self.assertRefused("skyrim-archive-mod.json", "https://")
+
+    def test_sha256_is_required_on_other_game_entries(self):
+        entry = _skyrim_github_entry()
+        entry["sha256"] = "not-a-hash"
+        self.skyrim_entry_at(entry)
+        self.assertRefused("crash-logger.json", "sha256")
+
+    # -- download hashes and pins ----------------------------------------------
+
+    def test_a_github_entry_for_another_game_compiles_without_sha256(self):
+        entry = _skyrim_github_entry()
+        del entry["sha256"]
+        self.skyrim_entry_at(entry)
+        out = self.compile()
+        self.assertIsNone(self.game_rows(out)["crash-logger"]["sha256"])
+
+    def test_a_direct_hash_entry_for_another_game_still_requires_sha256(self):
+        entry = _skyrim_direct_entry()
+        del entry["sha256"]
+        self.skyrim_entry_at(entry)
+        self.assertRefused("skyrim-archive-mod.json", "sha256", "required")
+
+    def test_a_valid_pin_on_another_game_entry_compiles_and_is_stored(self):
+        entry = _skyrim_github_entry()
+        entry["download_sources"] = [
+            {
+                "strategy": "github_release",
+                "identifier": "example-author/crash-logger",
+                "pins": [{"tag": "v1.0", "asset": "CrashLogger-1.0.7z", "sha256": "D" * 64}],
+            }
+        ]
+        self.skyrim_entry_at(entry)
+        out = self.compile()
+        sources = json.loads(self.game_rows(out)["crash-logger"]["download_sources_json"])
+        self.assertEqual(
+            sources[0]["pins"],
+            [{"tag": "v1.0", "asset": "CrashLogger-1.0.7z", "sha256": "d" * 64}],
+        )
+
+    def test_a_malformed_pin_on_another_game_entry_is_refused(self):
+        entry = _skyrim_github_entry()
+        entry["download_sources"] = [
+            {
+                "strategy": "github_release",
+                "identifier": "example-author/crash-logger",
+                "pins": [{"tag": "v1.0", "asset": "CrashLogger-1.0.7z", "sha256": "short"}],
+            }
+        ]
+        self.skyrim_entry_at(entry)
+        self.assertRefused("crash-logger.json", "pins[0].sha256", "64 hex")
+
+    # -- identity -----------------------------------------------------------
+
+    def test_an_id_used_by_two_games_is_refused_naming_both_files(self):
+        self.write("mods/shared-id.json", _minecraft_direct_entry("shared-id"))
+        self.skyrim_entry_at(_skyrim_github_entry("shared-id"))
+        message = self.assertRefused("Duplicate catalog id 'shared-id'", "shared-id.json")
+        self.assertEqual(message.count("shared-id.json"), 2)
+
+
+class ManualLinkEntryTests(OtherGameEntryTests):
+    """Entries whose file the player downloads themselves. Minecraft keeps its
+    own strategies, so a manual_link page is for another game only."""
+
+    def test_a_valid_manual_link_entry_compiles_and_keeps_its_page_and_hint(self):
+        self.skyrim_entry_at(_skyrim_manual_entry())
+        out = self.compile()
+        row = self.game_rows(out)["address-library"]
+        self.assertEqual(row["download_strategy"], "manual_link")
+        self.assertEqual(
+            row["source_identifier"],
+            "https://www.nexusmods.com/skyrimspecialedition/mods/32444",
+        )
+        self.assertIsNone(row["sha256"])
+        compat = json.loads(row["game_compatibility_json"])
+        self.assertEqual(compat[0]["asset"], "*-32444-*.zip")
+        self.assertEqual(
+            compat[0]["download_hint"], "Main file: Address Library for SKSE Plugins"
+        )
+        self.assertEqual(
+            json.loads(row["download_sources_json"]),
+            [
+                {
+                    "strategy": "manual_link",
+                    "identifier": "https://www.nexusmods.com/skyrimspecialedition/mods/32444",
+                }
+            ],
+        )
+
+    def test_a_manual_link_url_must_be_https_and_the_refusal_names_the_field(self):
+        entry = _skyrim_manual_entry(url="http://www.nexusmods.com/skyrimspecialedition/mods/32444")
+        self.skyrim_entry_at(entry)
+        self.assertRefused("address-library.json", "source_identifier", "http://")
+
+    def test_a_manual_link_entry_needs_an_asset(self):
+        entry = _skyrim_manual_entry()
+        del entry["game_compatibility"][0]["asset"]
+        self.skyrim_entry_at(entry)
+        self.assertRefused("address-library.json", "game_compatibility[0].asset", "required")
+
+    def test_a_manual_link_entry_may_carry_pins_without_a_release_tag(self):
+        entry = _skyrim_manual_entry()
+        entry["download_sources"] = [
+            {
+                "strategy": "manual_link",
+                "identifier": "https://www.nexusmods.com/skyrimspecialedition/mods/32444",
+                "pins": [{"asset": "Address Library-32444-1.0-1700000000.zip", "sha256": "E" * 64}],
+            }
+        ]
+        self.skyrim_entry_at(entry)
+        out = self.compile()
+        sources = json.loads(self.game_rows(out)["address-library"]["download_sources_json"])
+        self.assertEqual(
+            sources[0]["pins"],
+            [{"asset": "Address Library-32444-1.0-1700000000.zip", "sha256": "e" * 64}],
+        )
+
+    def test_a_manual_link_may_only_be_the_last_fallback(self):
+        entry = _skyrim_manual_entry()
+        entry["download_sources"] = [
+            {
+                "strategy": "manual_link",
+                "identifier": "https://www.nexusmods.com/skyrimspecialedition/mods/32444",
+            },
+            {"strategy": "github_release", "identifier": "example/address-library"},
+        ]
+        self.skyrim_entry_at(entry)
+        self.assertRefused("address-library.json", "download_sources[0]", "last fallback")
+
+    def test_a_manual_link_alone_is_the_entrys_only_source(self):
+        entry = _skyrim_manual_entry()
+        entry["download_sources"] = [
+            {
+                "strategy": "manual_link",
+                "identifier": "https://www.nexusmods.com/skyrimspecialedition/mods/32444",
+            }
+        ]
+        self.skyrim_entry_at(entry)
+        out = self.compile()
+        sources = json.loads(self.game_rows(out)["address-library"]["download_sources_json"])
+        self.assertEqual([source["strategy"] for source in sources], ["manual_link"])
+
+    def test_a_manual_link_fallback_after_a_github_source_compiles(self):
+        entry = _skyrim_manual_entry()
+        entry["download_strategy"] = "github_release"
+        entry["source_identifier"] = "example/address-library"
+        entry["download_sources"] = [
+            {"strategy": "github_release", "identifier": "example/address-library"},
+            {
+                "strategy": "manual_link",
+                "identifier": "https://www.nexusmods.com/skyrimspecialedition/mods/32444",
+            },
+        ]
+        self.skyrim_entry_at(entry)
+        out = self.compile()
+        sources = json.loads(self.game_rows(out)["address-library"]["download_sources_json"])
+        self.assertEqual([source["strategy"] for source in sources], ["github_release", "manual_link"])
+
+    def test_minecraft_cannot_use_manual_link(self):
+        entry = _minecraft_direct_entry("manual-in-minecraft")
+        entry["download_strategy"] = "manual_link"
+        entry["source_identifier"] = "https://example.com/files/mod-page"
+        del entry["sha256"]
+        self.write("mods/manual-in-minecraft.json", entry)
+        self.assertRefused("manual-in-minecraft.json", "manual_link")
+
+    def test_a_download_hint_must_be_one_short_line(self):
+        for bad in ("", "line one\nline two", "x" * 201):
+            with self.subTest(hint=bad):
+                self.reset_registry()
+                entry = _skyrim_manual_entry()
+                entry["game_compatibility"][0]["download_hint"] = bad
+                self.skyrim_entry_at(entry)
+                self.assertRefused("address-library.json", "download_hint")
+
+    def test_provides_framework_is_stored_and_must_be_declared(self):
+        entry = _skyrim_manual_entry()
+        entry["provides_framework"] = "skse"
+        self.skyrim_entry_at(entry)
+        out = self.compile()
+        self.assertEqual(self.game_rows(out)["address-library"]["provides_framework"], "skse")
+
+        self.reset_registry()
+        bad = _skyrim_manual_entry("bad-provider")
+        bad["provides_framework"] = "nvse"
+        self.skyrim_entry_at(bad)
+        self.assertRefused("bad-provider.json", "provides_framework", "'nvse'")
+
+
+class RealSkyrimPackageEntryTests(unittest.TestCase):
+    """The brief's SKSE example compiles against the real Skyrim package, which
+    declares SKSE (MASTER_SPEC §26.8). Nothing here patches the game packages."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.registry = self.tmp / "registry"
+        self.registry.mkdir()
+        write_empty_known_conflicts(self.registry)
+        patches = [
+            mock.patch.object(_compile, "REGISTRY_DIR", self.registry),
+            mock.patch.object(_compile, "_hydrate_modrinth_metadata", lambda items: None),
+            mock.patch.object(_compile, "_hydrate_modrinth_versions", lambda items: None),
+            mock.patch.object(_compile, "_hydrate_version_changelogs", lambda items: []),
+            mock.patch.object(_compile, "_load_github_token", lambda: None),
+            mock.patch.object(
+                _compile, "manifest_date_added", lambda path: "2026-01-01T00:00:00+00:00"
+            ),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def write_entry(self, data):
+        path = self.registry / "games" / "skyrim-se" / "mods" / f"{data['id']}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+    def compile_rows(self):
+        out = self.tmp / "out" / "registry.db"
+        _compile.compile_registry(out, skip_sign=True, no_governance_write=True, governance_mode_str="off")
+        conn = sqlite3.connect(str(out))
+        conn.row_factory = sqlite3.Row
+        try:
+            return {row["id"]: dict(row) for row in conn.execute("SELECT * FROM game_catalog_items")}
+        finally:
+            conn.close()
+
+    def test_the_real_package_declares_skse(self):
+        declared = _compile.load_game_declarations()
+        self.assertIn("skse", declared["skyrim-se"].frameworks)
+
+    def test_the_brief_example_compiles_against_the_real_package(self):
+        self.write_entry(_skyrim_github_entry())
+        rows = self.compile_rows()
+        compat = json.loads(rows["crash-logger"]["game_compatibility_json"])
+        self.assertEqual(compat[0]["requires"], [{"framework": "skse", "min_version": "2.2.6"}])
+        self.assertEqual(compat[0]["stores"], ["steam", "gog"])
+
+    def test_an_undeclared_framework_is_still_refused_against_the_real_package(self):
+        entry = _skyrim_github_entry()
+        entry["game_compatibility"][0]["requires"] = [{"framework": "nvse", "min_version": "1.0"}]
+        self.write_entry(entry)
+        with self.assertRaises(SystemExit) as caught:
+            self.compile_rows()
+        self.assertIn("'nvse'", str(caught.exception.code))
+
+
+class DownloadHashPolicyTests(unittest.TestCase):
+    """The manifest sha256 is required only where a pinned source needs it, and
+    curator pins validate. Covers Minecraft entries; other games are in
+    OtherGameEntryTests."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.manifest = self.tmp / "item.json"
+        self.manifest.write_text("{}", encoding="utf-8")
+        patch = mock.patch.object(
+            _compile, "manifest_date_added", lambda path: "2026-01-01T00:00:00+00:00"
+        )
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.conn = sqlite3.connect(":memory:")
+        self.addCleanup(self.conn.close)
+        _compile.create_tables(self.conn)
+
+    def _github_item(self, **overrides):
+        item = {
+            "id": "xaeros-minimap",
+            "name": "Xaero's Minimap",
+            "content_type": "mod",
+            "download_strategy": "github_release",
+            "source_identifier": "owner/repo",
+            "compatible_versions": [
+                {"mc_version": "1.21", "loader": "fabric", "mod_version": "1.2.0"},
+            ],
+        }
+        item.update(overrides)
+        return item
+
+    def _insert(self, item):
+        _compile.insert_registry_item(self.conn, item, self.manifest)
+        return self.conn.execute(
+            "SELECT sha256, download_sources_json FROM registry_items WHERE id = ?",
+            (item["id"],),
+        ).fetchone()
+
+    def test_a_github_release_entry_compiles_without_sha256(self):
+        sha256, _ = self._insert(self._github_item())
+        self.assertIsNone(sha256)
+
+    def test_a_modrinth_entry_compiles_without_sha256(self):
+        item = self._github_item(download_strategy="modrinth_id", source_identifier="AANobbMI")
+        sha256, _ = self._insert(item)
+        self.assertIsNone(sha256)
+
+    def test_a_github_entry_that_states_a_sha256_keeps_it(self):
+        sha256, _ = self._insert(self._github_item(sha256="a" * 64))
+        self.assertEqual(sha256, "a" * 64)
+
+    def test_a_malformed_sha256_is_refused_even_though_it_is_optional(self):
+        with self.assertRaises(SystemExit):
+            self._insert(self._github_item(sha256="not-a-hash"))
+
+    def test_direct_hash_still_requires_sha256(self):
+        item = _minecraft_direct_entry("direct-no-hash")
+        del item["sha256"]
+        with self.assertRaises(SystemExit):
+            self._insert(item)
+
+    def test_a_pinned_fallback_source_requires_sha256_even_on_a_github_primary(self):
+        item = self._github_item(
+            download_sources=[
+                {"strategy": "github_release", "identifier": "owner/repo"},
+                {"strategy": "direct_hash", "identifier": "https://example.com/files/mod-1.2.0.jar"},
+            ],
+        )
+        with self.assertRaises(SystemExit):
+            self._insert(item)
+        item["sha256"] = "b" * 64
+        sha256, _ = self._insert(item)
+        self.assertEqual(sha256, "b" * 64)
+
+    def test_a_valid_pin_is_kept_in_download_sources(self):
+        pin = {"tag": "v1.2.0", "asset": "xaeros-1.2.0.jar", "sha256": "C" * 64}
+        item = self._github_item(
+            download_sources=[{"strategy": "github_release", "identifier": "owner/repo", "pins": [pin]}],
+        )
+        _, sources_json = self._insert(item)
+        sources = json.loads(sources_json)
+        self.assertEqual(
+            sources[0]["pins"],
+            [{"tag": "v1.2.0", "asset": "xaeros-1.2.0.jar", "sha256": "c" * 64}],
+            "pins are stored in canonical (lowercase) form",
+        )
+
+    def test_a_source_without_pins_stores_no_pins_key(self):
+        _, sources_json = self._insert(self._github_item())
+        self.assertNotIn("pins", json.loads(sources_json)[0])
+
+    def test_malformed_pins_are_refused(self):
+        good = {"tag": "v1.2.0", "asset": "xaeros-1.2.0.jar", "sha256": "c" * 64}
+        bad_pins = {
+            "empty tag": {**good, "tag": " "},
+            "empty asset": {**good, "asset": ""},
+            "asset with a path": {**good, "asset": "dir/xaeros.jar"},
+            "short sha256": {**good, "sha256": "c" * 63},
+            "non-hex sha256": {**good, "sha256": "z" * 64},
+            "unknown key": {**good, "size": 10},
+            "missing sha256": {"tag": "v1.2.0", "asset": "xaeros-1.2.0.jar"},
+        }
+        for label, pin in bad_pins.items():
+            with self.subTest(pin=label):
+                item = self._github_item(
+                    download_sources=[
+                        {"strategy": "github_release", "identifier": "owner/repo", "pins": [pin]},
+                    ],
+                )
+                with self.assertRaises(SystemExit):
+                    self._insert(item)
+
+    def test_a_pin_repeated_for_the_same_release_file_is_refused(self):
+        pin = {"tag": "v1.2.0", "asset": "xaeros-1.2.0.jar", "sha256": "c" * 64}
+        item = self._github_item(
+            download_sources=[
+                {"strategy": "github_release", "identifier": "owner/repo", "pins": [pin, dict(pin)]},
+            ],
+        )
+        with self.assertRaises(SystemExit):
+            self._insert(item)
+
+    def test_pins_are_only_for_github_release_sources(self):
+        item = _minecraft_direct_entry("direct-with-pin")
+        del item["sha256"]
+        item["download_sources"] = [
+            {
+                "strategy": "direct_hash",
+                "identifier": "https://example.com/files/pinned-1.0.0.jar",
+                "pins": [{"tag": "v1", "asset": "pinned-1.0.0.jar", "sha256": "c" * 64}],
+            },
+        ]
+        with self.assertRaises(SystemExit):
+            normalize_download_sources_for_test(item)
+
+    def test_the_live_manifests_that_state_a_sha256_still_normalize(self):
+        registry = Path(_compile.REGISTRY_DIR) / "mods"
+        manifests = sorted(registry.glob("*.json"))
+        self.assertTrue(manifests, "the live registry has mod manifests")
+        for path in manifests:
+            with self.subTest(manifest=path.name):
+                item = json.loads(path.read_text(encoding="utf-8"))
+                if item.get("archived") or item.get("status") == "archived":
+                    continue
+                sources = _compile.normalize_download_sources(item)
+                _compile.require_manifest_sha256(item["id"], sources, item.get("sha256"))
+
+
+def normalize_download_sources_for_test(item):
+    return _compile.normalize_download_sources(item)
 
 
 class TestNormalizeCuratorWarning(unittest.TestCase):
@@ -1511,6 +1928,375 @@ class TestNormalizeCuratorWarning(unittest.TestCase):
             _compile.normalize_curator_warning({"curator_warning": raw}),
             "a" * _compile.CURATOR_WARNING_MAX_CHARS,
         )
+
+
+class OfficialPluginTests(unittest.TestCase):
+    """registry/official-plugins/<id>.json compiles into the official_plugins table, and every
+    malformed entry stops the compile with a message naming the file and the field."""
+
+    EXAMPLE = Path(__file__).resolve().parent.parent / "examples" / "official-plugins" / "acme.fixture.json"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.registry = self.tmp / "registry"
+        self.registry.mkdir()
+        write_empty_known_conflicts(self.registry)
+        patches = [
+            mock.patch.object(_compile, "REGISTRY_DIR", self.registry),
+            mock.patch.object(_compile, "_hydrate_modrinth_metadata", lambda items: None),
+            mock.patch.object(_compile, "_hydrate_modrinth_versions", lambda items: None),
+            mock.patch.object(_compile, "_hydrate_version_changelogs", lambda items: []),
+            mock.patch.object(_compile, "_load_github_token", lambda: None),
+            mock.patch.object(
+                _compile, "manifest_date_added", lambda path: "2026-01-01T00:00:00+00:00"
+            ),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def entry(self):
+        return json.loads(self.EXAMPLE.read_text(encoding="utf-8"))
+
+    def write(self, data, name=None):
+        path = self.registry / "official-plugins" / (name or f"{data['id']}.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return path
+
+    def compile(self, official_fetcher=None):
+        out = self.tmp / "out" / "registry.db"
+        _compile.compile_registry(
+            out,
+            skip_sign=True,
+            no_governance_write=True,
+            governance_mode_str="off",
+            official_fetcher=official_fetcher,
+        )
+        return out
+
+    def rows(self, out):
+        conn = sqlite3.connect(str(out))
+        conn.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in conn.execute("SELECT * FROM official_plugins ORDER BY version")]
+        finally:
+            conn.close()
+
+    def assertRefused(self, *needles):
+        with self.assertRaises(SystemExit) as caught:
+            self.compile()
+        message = str(caught.exception.code)
+        for needle in needles:
+            self.assertIn(needle, message)
+
+    def test_the_example_entry_compiles_to_a_current_and_a_previous_row(self):
+        self.write(self.entry())
+        rows = self.rows(self.compile())
+        self.assertEqual([r["version"] for r in rows], ["1.0.0", "1.1.0"])
+        by_version = {r["version"]: r for r in rows}
+        self.assertEqual(by_version["1.1.0"]["channel"], "current")
+        self.assertEqual(by_version["1.0.0"]["channel"], "previous")
+        current = by_version["1.1.0"]
+        self.assertEqual(current["plugin_id"], "acme.fixture")
+        self.assertEqual(current["name"], "Acme Fixture")
+        self.assertEqual(json.loads(current["game_ids_json"]), ["fixture-game"])
+        self.assertEqual(current["package_url"], "https://plugins.example.org/acme.fixture-1.1.0.zip")
+        self.assertEqual(current["package_sha256"], "1" * 64)
+        self.assertEqual(current["package_tree_sha256"], "3" * 64)
+        self.assertEqual(by_version["1.0.0"]["package_tree_sha256"], "4" * 64)
+        self.assertEqual(current["package_size"], 4096)
+        self.assertEqual(current["min_agora_version"], "0.1.0")
+
+    def test_an_official_package_must_match_its_pinned_bytes(self):
+        payload = b"acme fixture package"
+        digest = hashlib.sha256(payload).hexdigest()
+        data = self.entry()
+        del data["previous"]
+        data["current"]["sha256"] = digest
+        data["current"]["size"] = len(payload)
+        self.write(data)
+
+        # A fetcher that serves the pinned bytes lets the entry through.
+        rows = self.rows(self.compile(official_fetcher=lambda url: payload))
+        self.assertEqual(rows[0]["package_sha256"], digest)
+
+        with self.assertRaises(SystemExit) as caught:
+            self.compile(official_fetcher=lambda url: payload.upper())
+        self.assertIn("current.sha256", str(caught.exception.code))
+
+        data["current"]["size"] = len(payload) + 1
+        self.write(data)
+        with self.assertRaises(SystemExit) as caught:
+            self.compile(official_fetcher=lambda url: payload)
+        self.assertIn("current.size", str(caught.exception.code))
+
+    def test_a_missing_official_package_leaves_the_entry_out_with_a_warning(self):
+        payload = b"acme fixture package"
+        data = self.entry()
+        del data["previous"]
+        data["current"]["sha256"] = hashlib.sha256(payload).hexdigest()
+        data["current"]["size"] = len(payload)
+        self.write(data)
+
+        def missing(url):
+            raise OSError("404")
+
+        with self.assertLogs(_compile.logger, level="WARNING") as logs:
+            rows = self.rows(self.compile(official_fetcher=missing))
+        self.assertEqual(rows, [])
+        self.assertIn("left out of the catalog", "\n".join(logs.output))
+
+        # In Actions the same message is a workflow annotation, so the run shows it as a warning.
+        printed = io.StringIO()
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), contextlib.redirect_stdout(printed):
+            self.compile(official_fetcher=missing)
+        self.assertIn("::warning::", printed.getvalue())
+        self.assertIn("left out of the catalog", printed.getvalue())
+
+    def test_an_additive_table_does_not_hide_the_schema_version(self):
+        self.write(self.entry())
+        out = self.compile()
+        conn = sqlite3.connect(str(out))
+        try:
+            version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        finally:
+            conn.close()
+        self.assertEqual(version, _compile.SCHEMA_VERSION)
+        # Everything an older client reads is still there; the new table is purely additive.
+        self.assertIn("registry_items", tables)
+        self.assertIn("game_catalog_items", tables)
+        self.assertIn("official_plugins", tables)
+
+    def test_no_official_plugins_folder_compiles_to_an_empty_table(self):
+        self.assertEqual(self.rows(self.compile()), [])
+
+    def test_previous_is_optional(self):
+        data = self.entry()
+        del data["previous"]
+        self.write(data)
+        self.assertEqual([r["channel"] for r in self.rows(self.compile())], ["current"])
+
+    def test_a_non_https_url_is_refused(self):
+        for bad in [
+            "http://plugins.example.org/a.zip",
+            "ftp://plugins.example.org/a.zip",
+            "https://user:pw@plugins.example.org/a.zip",
+            "https://plugins.example.org:8443/a.zip",
+            "plugins.example.org/a.zip",
+            "https://",
+            "https://plugins.example.org/a b.zip",
+            "",
+        ]:
+            with self.subTest(url=bad):
+                data = self.entry()
+                data["current"]["package_url"] = bad
+                self.write(data)
+                self.assertRefused("current.package_url", "acme.fixture.json")
+
+    def test_a_malformed_hash_is_refused(self):
+        for bad in ["", "abc", "1" * 63, "1" * 65, "G" * 64, "A" * 64, None, 5]:
+            with self.subTest(sha256=bad):
+                data = self.entry()
+                data["previous"]["sha256"] = bad
+                self.write(data)
+                self.assertRefused("previous.sha256")
+
+    def test_a_missing_or_malformed_tree_digest_is_refused(self):
+        for bad in ["", "abc", "3" * 63, "3" * 65, "G" * 64, "A" * 64, None, 5]:
+            with self.subTest(tree_sha256=bad):
+                data = self.entry()
+                data["current"]["tree_sha256"] = bad
+                self.write(data)
+                self.assertRefused("current.tree_sha256")
+        data = self.entry()
+        del data["previous"]["tree_sha256"]
+        self.write(data)
+        self.assertRefused("missing", "tree_sha256")
+
+    def test_a_bad_size_is_refused(self):
+        for bad in [0, -1, 64 * 1024 * 1024 + 1, 1.5, "10", True, None]:
+            with self.subTest(size=bad):
+                data = self.entry()
+                data["current"]["size"] = bad
+                self.write(data)
+                self.assertRefused("current.size")
+
+    def test_ids_must_be_lowercase_publisher_dot_plugin_and_match_the_file(self):
+        for bad in ["", "acme", "Acme.Fixture", "acme.fixture ", "../x.y", "acme..fixture", "-a.b", "a.b-"]:
+            with self.subTest(id=bad):
+                data = self.entry()
+                data["id"] = bad
+                self.write(data, name="acme.fixture.json")
+                self.assertRefused("id must be")
+        data = self.entry()
+        data["id"] = "acme.other"
+        self.write(data, name="acme.fixture.json")
+        self.assertRefused("file name must be the plugin id")
+
+    def test_versions_must_be_semver_and_previous_must_differ(self):
+        data = self.entry()
+        data["current"]["version"] = "latest"
+        self.write(data)
+        self.assertRefused("current.version")
+        data = self.entry()
+        data["previous"]["version"] = data["current"]["version"]
+        self.write(data)
+        self.assertRefused("previous must be a different version")
+        data = self.entry()
+        data["min_agora_version"] = "newest"
+        self.write(data)
+        self.assertRefused("min_agora_version")
+
+    def test_unknown_missing_and_stray_fields_are_refused(self):
+        data = self.entry()
+        data["official"] = True
+        self.write(data)
+        self.assertRefused("unknown field", "official")
+        data = self.entry()
+        del data["current"]["size"]
+        self.write(data)
+        self.assertRefused("missing", "size")
+        self.write(self.entry())
+        (self.registry / "official-plugins" / "notes.txt").write_text("x", encoding="utf-8")
+        self.assertRefused("official-plugins/<plugin-id>.json")
+
+    def test_a_malformed_file_is_refused_not_skipped(self):
+        path = self.registry / "official-plugins" / "acme.fixture.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("{ not json", encoding="utf-8")
+        self.assertRefused("acme.fixture.json", "cannot read")
+
+    def test_archived_entries_are_skipped_like_everywhere_else(self):
+        data = self.entry()
+        path = self.registry / "official-plugins" / "archived" / "acme.fixture.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(self.rows(self.compile()), [])
+
+
+class OfficialPluginDigestTests(unittest.TestCase):
+    """scripts/official_plugin_digest.py computes the tree digest the signed entry pins. The app
+    computes it too (official.rs), so a shared vector keeps the two in step."""
+
+    # The same two files, hashed by tree_digest and zip_tree_digest in
+    # crates/agora-core/src/plugins/official.rs (test `the_tree_digest_matches_the_python_script`).
+    GOLDEN = "edf96c2334a03f422f09963524f136c27b969682ebead88f3d40865741d830a8"
+
+    def setUp(self):
+        scripts = str(Path(__file__).resolve().parent.parent / "scripts")
+        sys.path.insert(0, scripts)
+        self.addCleanup(sys.path.remove, scripts)
+        import official_plugin_digest
+
+        self.digest = official_plugin_digest
+
+    def make_zip(self, entries):
+        import io
+        import zipfile
+
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            for name, data in entries:
+                archive.writestr(name, data)
+        return buffer.getvalue()
+
+    def test_the_shared_vector(self):
+        files = {"agora-plugin.json": b"{}", "games/package.json": b"[]"}
+        self.assertEqual(self.digest.tree_digest(files), self.GOLDEN)
+
+    def test_a_zip_and_a_folder_of_the_same_files_agree(self):
+        data = self.make_zip([("agora-plugin.json", b"{}"), ("games/package.json", b"[]")])
+        self.assertEqual(self.digest.tree_digest(self.digest.files_of_zip(data)), self.GOLDEN)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "games").mkdir()
+            (root / "agora-plugin.json").write_bytes(b"{}")
+            (root / "games" / "package.json").write_bytes(b"[]")
+            self.assertEqual(self.digest.describe(root)["tree_sha256"], self.GOLDEN)
+
+    def test_backslash_and_dot_segments_unpack_to_the_same_path(self):
+        data = self.make_zip([("./agora-plugin.json", b"{}"), ("games\\package.json", b"[]")])
+        self.assertEqual(self.digest.tree_digest(self.digest.files_of_zip(data)), self.GOLDEN)
+
+    def test_any_change_moves_the_digest(self):
+        base = {"a.json": b"1", "d/b.json": b"2"}
+        digest = self.digest.tree_digest(base)
+        self.assertNotEqual(digest, self.digest.tree_digest({**base, "a.json": b"3"}))
+        self.assertNotEqual(digest, self.digest.tree_digest({**base, "c.json": b""}))
+        self.assertNotEqual(
+            digest, self.digest.tree_digest({"a.json": b"1", "e/b.json": b"2"})
+        )
+
+    def test_a_later_duplicate_entry_wins_as_unpacking_does(self):
+        data = self.make_zip([("a.json", b"old"), ("a.json", b"new")])
+        self.assertEqual(self.digest.files_of_zip(data), {"a.json": b"new"})
+
+    def test_hostile_entry_names_are_refused(self):
+        for bad in ["../x", "a/../../x", "/etc/passwd", "C:/x", "a/b:c", ""]:
+            with self.subTest(name=bad):
+                with self.assertRaises(SystemExit):
+                    self.digest.files_of_zip(self.make_zip([(bad, b"x")]))
+
+    def test_describe_reports_the_zip_hash_and_size(self):
+        import hashlib
+
+        data = self.make_zip([("agora-plugin.json", b"{}"), ("games/package.json", b"[]")])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "p.zip"
+            path.write_bytes(data)
+            described = self.digest.describe(path)
+        self.assertEqual(described["sha256"], hashlib.sha256(data).hexdigest())
+        self.assertEqual(described["size"], len(data))
+        self.assertEqual(described["tree_sha256"], self.GOLDEN)
+
+
+class AuditLogTests(unittest.TestCase):
+    """The audit log is append-only: unreadable files stop the compile."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_missing_log_starts_empty(self):
+        data = _compile._read_audit_log(self.tmp / "audit_log.json")
+        self.assertEqual(data, {"log_format_version": 1, "entries": []})
+
+    def test_corrupt_log_is_refused_not_reset(self):
+        path = self.tmp / "audit_log.json"
+        path.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            _compile._read_audit_log(path)
+        self.assertEqual(path.read_text(encoding="utf-8"), "{not json")
+
+    def test_log_without_entries_list_is_refused(self):
+        path = self.tmp / "audit_log.json"
+        path.write_text('{"entries": {}}', encoding="utf-8")
+        with self.assertRaises(ValueError):
+            _compile._read_audit_log(path)
+
+    def test_atomic_write_leaves_no_temp_file(self):
+        path = self.tmp / "audit_log.json"
+        _compile._write_json_atomic(path, {"entries": [1]})
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"entries": [1]})
+        self.assertEqual([p.name for p in self.tmp.iterdir()], ["audit_log.json"])
+
+    def test_governance_events_become_audit_rows(self):
+        state = self.tmp / "governance-state.json"
+        state.write_text(json.dumps({"schema_version": 1, "events": [
+            {"event_id": "e1", "item_id": "sodium", "event_type": "vote_surge",
+             "status": "pending", "detected_at": "2026-11-01T00:00:00+00:00",
+             "affected_reactions": [1, 2, 3]},
+            {"event_id": "e2", "item_id": "iris"},
+        ]}), encoding="utf-8")
+        rows = _compile._governance_event_audit_rows(state)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], "2026-11-01T00:00:00+00:00")
+        self.assertEqual(rows[0][1], "vote_surge")
+        self.assertIn("sodium: pending, 3 reaction(s)", rows[0][2])
+        self.assertEqual(_compile._governance_event_audit_rows(None), [])
 
 
 if __name__ == "__main__":

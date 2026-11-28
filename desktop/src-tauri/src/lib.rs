@@ -1,10 +1,11 @@
 pub mod auth;
 pub mod commands;
-pub mod crash_diagnostics;
 pub mod crash_export;
-pub mod crash_investigator;
 pub mod dependency_ops;
-pub use agora_core::{download, error, loader_manifests, models};
+pub mod downloads;
+pub mod games;
+pub use agora_core::{download, error, models};
+pub use agora_game_minecraft::loader_manifests;
 
 pub mod governance;
 pub mod instances;
@@ -13,13 +14,14 @@ pub mod mod_install;
 pub mod modrinth_raw;
 pub mod mojang;
 pub mod providers;
-pub use agora_core::override_sanitizer;
+pub use agora_game_minecraft::override_sanitizer;
 pub mod mcp;
+pub mod parity;
 pub mod paths;
 pub mod plugins;
 pub mod registry;
 pub mod registry_sync;
-pub use agora_core::state;
+pub use agora_game_minecraft::state;
 pub mod technic;
 pub mod version_cache;
 
@@ -28,6 +30,16 @@ use tauri::Manager;
 
 /// Shared type alias for the managed core context.
 type ManagedCoreContext = std::sync::Arc<std::sync::Mutex<agora_core::ctx::CoreContext>>;
+
+/// The games this build supports. A refused compiled package is a build bug,
+/// not user input. Skyrim is not compiled in: it arrives through the installed
+/// official plugin.
+fn build_game_registry() -> agora_core::game_registry::GameRegistryBuilder {
+    let mut builder = agora_core::game_registry::GameRegistry::builder();
+    agora_game_minecraft::register_into(&mut builder)
+        .expect("build bug: the Minecraft package was refused");
+    builder
+}
 
 /// Return a clone of the initialized core context for adapter commands.
 pub fn core_context<R: tauri::Runtime>(
@@ -48,7 +60,9 @@ pub fn core_context<R: tauri::Runtime>(
             message: error.to_string(),
         }
     })?;
-    agora_core::ctx::CoreContext::initialize(paths).map(|(ctx, _)| plugins::with_events(app, ctx))
+    let games = build_game_registry();
+    agora_core::ctx::CoreContext::initialize(paths, games)
+        .map(|(ctx, _)| plugins::with_events(app, ctx))
 }
 
 /// Pull the instance id out of a `--launch <id>` / `--launch=<id>` argv.
@@ -111,8 +125,156 @@ fn watch_external_changes(app: tauri::AppHandle, locks_root: std::path::PathBuf)
     }
 }
 
+/// Initialize core, asking before the two overrides the local database safety
+/// net requires: starting fresh over a database from a newer Agora, and
+/// migrating without a pre-migration backup.
+fn initialize_core_with_choices(
+    paths: agora_core::app_paths::AppPaths,
+) -> agora_core::error::LauncherResult<(
+    agora_core::ctx::CoreContext,
+    Vec<String>,
+    agora_core::db::LocalStateStartupReport,
+)> {
+    let mut options = agora_core::db::LocalStateOpenOptions::default();
+    loop {
+        match agora_core::ctx::CoreContext::initialize_with_local_state_options(
+            paths.clone(),
+            build_game_registry(),
+            agora_core::plugins::official::RegistryTrust::production(),
+            &options,
+        ) {
+            Ok(result) => return Ok(result),
+            Err(error) => {
+                let code = error.code();
+                if code == agora_core::db::ERR_LOCAL_STATE_NEWER {
+                    let accepted = rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Warning)
+                        .set_title("Agora's database is from a newer version")
+                        .set_description(format!(
+                            "{error}\n\nStart with a fresh database? The newer file is kept, \
+                             never deleted."
+                        ))
+                        .set_buttons(rfd::MessageButtons::YesNo)
+                        .show();
+                    if !matches!(accepted, rfd::MessageDialogResult::Yes) {
+                        return Err(error);
+                    }
+                    options.accept_newer_schema = true;
+                } else if code == agora_core::db::ERR_LOCAL_STATE_BACKUP_FAILED {
+                    let accepted = rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Warning)
+                        .set_title("Agora could not back up its database")
+                        .set_description(format!(
+                            "{error}\n\nMigrate without a backup? The database may not be \
+                             recoverable if the migration fails."
+                        ))
+                        .set_buttons(rfd::MessageButtons::YesNo)
+                        .show();
+                    if !matches!(accepted, rfd::MessageDialogResult::Yes) {
+                        return Err(error);
+                    }
+                    options.accept_missing_backup = true;
+                } else {
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
+/// Tell the player, once, what startup did to the local database.
+fn show_startup_notices(report: &agora_core::db::LocalStateStartupReport) {
+    if let Some(recovery) = &report.recovered_corrupt {
+        let description = match &recovery.restored_from {
+            Some(backup) => format!(
+                "Agora found the local database damaged and restored the newest good backup.\n\n\
+                 The damaged file was kept at:\n{}\n\nThe backup restored was:\n{}",
+                recovery.kept_at.display(),
+                backup.display()
+            ),
+            None => format!(
+                "Agora found the local database damaged and no good backup was available, so it \
+                 started with a fresh database.\n\nThe damaged file was kept at:\n{}",
+                recovery.kept_at.display()
+            ),
+        };
+        rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title("Agora recovered the local database")
+            .set_description(description)
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show();
+    }
+    if let Some(newer) = &report.newer_schema_kept {
+        rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title("Agora started with a fresh database")
+            .set_description(format!(
+                "The local database (schema version {}) was written by a newer Agora. It was \
+                 kept at:\n{}",
+                newer.found,
+                newer.kept_at.display()
+            ))
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show();
+    }
+}
+
+/// The text of the startup recovery notice: every action and warning on its own line, or `None`
+/// when the pass found nothing to do or report.
+fn recovery_notice_text(
+    report: &agora_core::startup_recovery::StartupRecoveryReport,
+) -> Option<String> {
+    if report.is_empty() {
+        return None;
+    }
+    let mut lines: Vec<&str> = report.actions.iter().map(String::as_str).collect();
+    lines.extend(report.warnings.iter().map(String::as_str));
+    Some(lines.join("\n"))
+}
+
+/// Tell the player, once, what startup recovery did or could not do — the same way the local
+/// database notices above are shown. A recovery that needs a hand is surfaced here, not only
+/// logged.
+fn show_recovery_notice(report: &agora_core::startup_recovery::StartupRecoveryReport) {
+    let Some(text) = recovery_notice_text(report) else {
+        return;
+    };
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Warning)
+        .set_title("Agora recovered interrupted work at startup")
+        .set_description(text)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+}
+
+/// What the player reads when startup cannot continue.
+///
+/// The whole chain, not its outermost line: a refused migration reports what it refused — the
+/// row, the id, both names — in the step that failed, and the outer messages only say that the
+/// step failed. A release build has no console, and the `setup` callback returning an error closes
+/// the window that was about to open, so this dialog is the only thing the player sees.
+fn fatal_startup_message(error: &dyn std::fmt::Display) -> String {
+    format!(
+        "Agora could not start because its local data could not be opened.\n\n{error:#}\n\n\
+         The message above names what needs attention; the log file has the rest."
+    )
+}
+
+/// Show a startup failure the player can read. Blocking: startup is over either way.
+fn show_fatal_startup_error(message: &str) {
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("Agora could not start")
+        .set_description(message)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+}
+
 pub fn run() {
     agora_core::lock_manager::set_program_name("Agora app");
+    // Minecraft is a game package; register it with core before any context
+    // is built (idempotent, so the helper below may repeat it).
     // Log startup so the user can verify from the log file that they are
     // actually running the freshly-compiled binary (not a stale one). When
     // diagnosing OAuth issues, the absence of this line means the running
@@ -144,6 +306,7 @@ pub fn run() {
         .manage(LauncherState::default())
         .manage(mcp::McpServerManager::default())
         .manage(plugins::ManagedPlugins::default())
+        .manage(downloads::DownloadsWatcher::default())
         .manage(pending_cli_launch)
         .plugin(tauri_plugin_shell::init())
         // Deliberately no `tauri_plugin_sql` or `tauri_plugin_store`. Every
@@ -180,7 +343,9 @@ pub fn run() {
             }
         }))
         .invoke_handler(tauri::generate_handler![
-            plugins::plugins_enabled,
+            plugins::plugins_emergency_stop,
+            plugins::set_plugins_emergency_stop,
+            plugins::set_plugin_scripts_allowed,
             plugins::start_plugins,
             plugins::list_plugins,
             plugins::list_plugin_contributions,
@@ -189,6 +354,10 @@ pub fn run() {
             plugins::install_plugin_package,
             plugins::plugin_check_update,
             plugins::plugin_apply_update,
+            plugins::list_official_plugins,
+            plugins::install_official_plugin,
+            plugins::update_official_plugin,
+            plugins::rollback_official_plugin,
             plugins::plugin_surfaces,
             plugins::plugin_set_surface,
             plugins::restore_plugin_data,
@@ -280,7 +449,9 @@ pub fn run() {
             commands::step_back_bisect,
             commands::cancel_bisect,
             commands::export_backup,
+            commands::game_backup_bytes,
             commands::import_backup,
+            commands::preview_backup_import,
             commands::apply_backup_retention,
             commands::get_mod_groups,
             commands::set_mod_group,
@@ -314,6 +485,11 @@ pub fn run() {
             commands::list_snapshot_versions,
             commands::export_crash_report,
             commands::get_setting,
+            downloads::downloads_list,
+            downloads::downloads_scan,
+            downloads::downloads_ignore,
+            downloads::downloads_add,
+            downloads::downloads_default_folder,
             commands::set_setting,
             commands::evaluate_controlify_offer,
             commands::decline_controlify_offer,
@@ -324,12 +500,13 @@ pub fn run() {
             commands::github_logout,
             commands::get_auth_status,
             commands::get_github_profile,
-            commands::check_instance_crash,
-            commands::triage_crash_report,
-            commands::list_crash_reports_cmd,
-            commands::read_crash_log_cmd,
+            games::crash_answers::get_crash_answer,
+            games::crash_answers::list_crash_answers,
+            games::crash_answers::analyze_crash_text,
+            games::crash_answers::analyze_crash_file,
+            games::crash_answers::read_crash_artifact,
+            games::crash_answers::reveal_crash_artifact,
             commands::investigate_instance_evidence,
-            commands::pick_and_investigate_crash_evidence,
             commands::list_mod_versions,
             commands::list_mod_versions_load_more,
             commands::check_mod_compat,
@@ -362,18 +539,26 @@ pub fn run() {
             commands::list_mod_reviews,
             commands::get_governance_config,
             commands::get_governance_summary,
+            parity::local_state_report,
+            parity::registry_under_review,
+            parity::registry_audit_log,
+            parity::registry_resolutions,
             commands::get_item_vote,
             commands::set_item_vote,
             commands::list_governance_events,
             commands::run_governance_diagnostics,
             commands::list_instance_content,
             commands::enrich_instance_content,
+            commands::get_content_sharing,
+            commands::preview_content_sharing_conversion,
+            commands::set_content_sharing,
             commands::investigate_crash,
-            commands::investigate_manual,
+            commands::resolve_crash_suspect_file,
             commands::disable_mod_for_test,
             commands::enable_mod_for_test,
             commands::disable_instance_mod,
             commands::enable_instance_mod,
+            commands::minecraft_add_stored_content,
             commands::set_datapack_worlds,
             commands::sync_instance_datapacks,
             commands::list_instance_worlds,
@@ -428,6 +613,8 @@ pub fn run() {
             commands::msa_complete_login,
             commands::msa_cancel_login,
             commands::msa_get_status,
+            commands::msa_account_store_status,
+            commands::msa_repair_accounts,
             commands::credential_storage_status,
             commands::msa_refresh,
             commands::msa_logout,
@@ -469,6 +656,115 @@ pub fn run() {
             commands::reveal_path,
             commands::restart_app,
             commands::open_external_url,
+            games::discovery::games_list,
+            games::icons::games_icon,
+            games::instance_icons::games_instance_set_icon,
+            games::instance_icons::games_instance_icon,
+            games::discovery::games_discover,
+            games::discovery::games_add_folder,
+            games::discovery::games_remove_folder,
+            games::bases::games_base_list,
+            games::bases::games_base_build,
+            games::bases::games_base_verify,
+            games::bases::games_base_remove,
+            games::bases::games_base_repair_framework,
+            games::instances::games_instance_list,
+            games::instances::games_instance_get,
+            games::instances::games_instance_create,
+            games::instances::games_instance_delete,
+            games::instances::games_instance_rename,
+            games::instances::games_instance_clone,
+            games::instances::games_instance_stop,
+            games::instances::games_instance_deleted_list,
+            games::instances::games_instance_restore_deleted,
+            games::instances::games_instance_purge_deleted,
+            games::instances::games_instance_check,
+            games::instances::games_instance_set_deployment,
+            games::instances::games_instance_launch,
+            games::instances::games_instance_steam_status,
+            games::content::games_content_list,
+            games::content::games_content_add,
+            games::content::games_content_verify,
+            games::content::games_content_remove,
+            games::content::games_instance_content_list,
+            games::content::games_instance_content_add,
+            games::content::games_instance_content_remove,
+            games::content::games_instance_content_set_enabled,
+            games::content::games_instance_content_move,
+            games::library::games_library_list,
+            games::library::games_library_fill_details,
+            games::library::games_library_unused,
+            games::library::games_library_instances,
+            games::library::games_library_icon,
+            games::library::games_library_cache_icon,
+            games::fomod::games_fomod_show,
+            games::fomod::games_fomod_install,
+            games::plugins::games_plugins_lists,
+            games::plugins::games_plugins_list,
+            games::plugins::games_plugins_sorter_notes,
+            games::plugins::games_plugins_set_active,
+            games::plugins::games_plugins_set_locked,
+            games::plugins::games_plugins_move,
+            games::plugins::games_plugins_sort,
+            games::plugins::games_plugins_update_masterlist,
+            games::plugins::games_plugins_check,
+            games::plugins::games_plugins_conflicts,
+            games::plugins::games_plugins_rules,
+            games::plugins::games_plugins_rule_add,
+            games::plugins::games_plugins_rule_remove,
+            games::plugins::games_plugins_conflict_action,
+            games::ini_saves::games_ini_get,
+            games::ini_saves::games_ini_set,
+            games::ini_saves::games_mod_inis_list,
+            games::ini_saves::games_mod_ini_get,
+            games::ini_saves::games_mod_ini_set,
+            games::ini_saves::games_mod_ini_reset,
+            games::ini_saves::games_mod_ini_keep_game_version,
+            games::ini_saves::games_mod_ini_restore_mine,
+            games::ini_saves::games_saves_get,
+            games::ini_saves::games_saves_set,
+            games::ini_saves::games_saves_backup,
+            games::ini_saves::games_saves_backup_for_session,
+            games::ini_saves::games_saves_backups,
+            games::ini_saves::games_saves_restore,
+            games::tools::games_tools_list,
+            games::tools::games_tools_save_inputs,
+            games::tools::games_tools_run,
+            games::tools::games_tools_rollback,
+            games::tools::games_tools_remove,
+            games::tools::games_tools_diff,
+            games::tools::games_tools_swap_costs,
+            games::tools::games_tools_swap_status,
+            games::parity::games_instance_is_default,
+            games::parity::games_instance_set_default,
+            games::parity::games_instance_deploy,
+            games::parity::games_instance_undeploy,
+            games::parity::games_instance_content_set_own_copy,
+            games::parity::games_tools_swap_remove_copy,
+            games::tools::games_tools_swap_restore,
+            games::tools::games_user_tools_list,
+            games::tools::games_user_tools_add,
+            games::tools::games_user_tools_remove,
+            games::tools::games_user_tools_find,
+            games::tools::games_user_tools_run,
+            games::tools::games_user_tools_outputs,
+            games::tools::games_user_tools_use_output,
+            games::tools::games_tools_outputs,
+            games::tools::games_tools_use_output,
+            games::import::games_import_mo2_scan,
+            games::import::games_import_mo2,
+            games::import::games_import_vortex_scan,
+            games::import::games_import_vortex_multi,
+            games::import::games_import_vortex_suggest,
+            games::import::games_import_mo2_suggest,
+            games::import::games_import_mo2_multi,
+            games::import::games_import_vortex,
+            games::catalog::games_catalog_list,
+            games::catalog::games_catalog_install,
+            games::user_files::games_user_files_status,
+            games::user_files::games_user_files_restore,
+            games::support::games_support_list,
+            games::support::games_support_set_enabled,
         ])
         .setup(|app| {
             #[cfg(target_os = "windows")]
@@ -491,27 +787,52 @@ pub fn run() {
             // Keep one clone for startup maintenance after the managed state is
             // installed; maintenance is optional and must never delay setup.
             let startup_maintenance_ctx = match crate::paths::app_paths(app.handle()) {
-                Ok(paths) => match agora_core::ctx::CoreContext::initialize(paths) {
-                    Ok((ctx, warnings)) => {
+                Ok(paths) => match initialize_core_with_choices(paths) {
+                    Ok((ctx, warnings, report)) => {
                         for w in &warnings {
                             eprintln!("[core] {w}");
                         }
+                        show_startup_notices(&report);
+                        // One startup recovery pass over every crash journal, the same one the
+                        // CLI and the MCP listener run (MASTER_SPEC §32.11). A journal that
+                        // belongs to a live operation in another process is left alone and
+                        // reported, never recovered underneath it.
+                        let recovery_report = agora_core::startup_recovery::run_at_startup(&ctx);
+                        for line in recovery_report.actions.iter().chain(&recovery_report.warnings)
+                        {
+                            eprintln!("[core] {line}");
+                        }
+                        show_recovery_notice(&recovery_report);
                         let maintenance_ctx = ctx.clone();
                         watch_external_changes(
                             app.handle().clone(),
                             ctx.lock_manager.locks_root().to_path_buf(),
                         );
+                        let downloads_ctx = ctx.clone();
                         app.manage(ManagedCoreContext::new(std::sync::Mutex::new(ctx)));
+                        let watcher = app
+                            .state::<downloads::DownloadsWatcher>()
+                            .inner()
+                            .clone();
+                        downloads::watch_downloads(
+                            app.handle().clone(),
+                            downloads_ctx,
+                            watcher,
+                        );
                         Some(maintenance_ctx)
                     }
                     Err(e) => {
-                        eprintln!("Failed to initialize core context: {e}");
-                        None
+                        let message = fatal_startup_message(&e);
+                        eprintln!("{message}");
+                        show_fatal_startup_error(&message);
+                        return Err(Box::new(e));
                     }
                 },
                 Err(e) => {
-                    eprintln!("Failed to resolve app data dir: {e}");
-                    None
+                    let message = fatal_startup_message(&format!("Failed to resolve app data dir: {e}"));
+                    eprintln!("{message}");
+                    show_fatal_startup_error(&message);
+                    return Err(format!("Failed to resolve app data dir: {e}").into());
                 }
             };
 
@@ -531,7 +852,7 @@ pub fn run() {
                     // Prewarm remains bounded and launch never depends on it (maintenance.rs:1).
                     let prewarm_ctx = ctx.clone();
                     tauri::async_runtime::spawn(async move {
-                        match agora_core::maintenance::prewarm_recent_instances(prewarm_ctx).await {
+                        match agora_game_minecraft::maintenance::prewarm_recent_instances(prewarm_ctx).await {
                             Ok(summary) if summary.warmed > 0 => eprintln!(
                                 "[core] warmed {} recent instance cache(s) ({} skipped, {} failed)",
                                 summary.warmed, summary.skipped, summary.failed
@@ -542,13 +863,16 @@ pub fn run() {
                             }
                         }
                     });
-                    // Recently deleted: entries past 30 days (or over the size
-                    // budget) go to the OS trash; failures leave them in place.
+                    // Recently deleted: entries past the player's window (the
+                    // setting every game shares) or over the size budget go to
+                    // the OS trash; failures leave them in place.
                     let cleanup_ctx = ctx.clone();
                     tauri::async_runtime::spawn(async move {
-                        match agora_core::maintenance::cleanup_recently_deleted(
+                        let days = agora_core::game_instance::trash::retention_days(&cleanup_ctx);
+                        match agora_game_minecraft::maintenance::cleanup_recently_deleted(
                             cleanup_ctx,
                             crate::instances::trash_adapter(),
+                            days,
                         )
                         .await
                         {
@@ -568,7 +892,7 @@ pub fn run() {
                     // NetworkPolicy (network.rs), never errors.
                     let sweep_ctx = ctx.clone();
                     tauri::async_runtime::spawn(async move {
-                        match agora_core::update_cache::sweep_all_updates(sweep_ctx).await {
+                        match agora_game_minecraft::update_cache::sweep_all_updates(sweep_ctx).await {
                             Ok(summary) if summary.updated > 0 => eprintln!(
                                 "[core] update sweep refreshed {} instance(s) ({} skipped, {} failed, offline={})",
                                 summary.updated, summary.skipped, summary.failed, summary.offline_skipped
@@ -583,26 +907,6 @@ pub fn run() {
                         }
                     });
                 }
-                let purge_handle = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if let Some(core_state) = purge_handle.try_state::<ManagedCoreContext>() {
-                            match core_state.lock() {
-                                Ok(ctx) => {
-                                    let svc =
-                                        agora_core::crash_service::CrashService::new(ctx.clone());
-                                    if let Err(e) = svc.purge_stale_telemetry() {
-                                        eprintln!("Failed to purge stale crash telemetry: {e}",);
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("Core context lock failed: {e}");
-                                }
-                            }
-                        }
-                    })
-                    .await;
-                });
                 // Start MCP server if enabled.
                 if let Some(core_state) = handle.try_state::<ManagedCoreContext>() {
                     match core_state.lock() {
@@ -652,4 +956,70 @@ pub fn run() {
         })
         .run(context)
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use agora_game_api::GameId;
+
+    /// Skyrim ships as an official plugin, so a build that registers it at
+    /// startup would be the old compiled package sneaking back in.
+    #[test]
+    fn the_shipped_registry_does_not_compile_in_skyrim() {
+        let registry = super::build_game_registry().build();
+        assert!(registry.game(&GameId::minecraft()).is_some());
+        assert!(
+            registry.game(&GameId::new("skyrim-se").unwrap()).is_none(),
+            "Skyrim must come from the official plugin, not the compiled registry"
+        );
+    }
+
+    /// The desktop surfaces startup recovery to the player exactly when the pass did something or
+    /// could not do something: an empty report shows no dialog.
+    #[test]
+    fn a_recovery_notice_is_shown_only_when_there_is_something_to_say() {
+        use agora_core::startup_recovery::StartupRecoveryReport;
+        assert_eq!(
+            super::recovery_notice_text(&StartupRecoveryReport::default()),
+            None
+        );
+        let report = StartupRecoveryReport {
+            actions: vec!["Put back the real Data folder of skyrim-se.".to_string()],
+            warnings: vec!["A tool swap was not put back: needs a hand.".to_string()],
+        };
+        let text = super::recovery_notice_text(&report).expect("a notice");
+        assert!(text.contains("Put back the real Data folder of skyrim-se."));
+        assert!(text.contains("A tool swap was not put back: needs a hand."));
+    }
+
+    /// A database the migration refuses stops startup, and the window that was about to open
+    /// closes with it: what the player reads is this dialog, so it has to carry the whole chain
+    /// the migration reported and not just "the step failed".
+    #[test]
+    fn the_startup_error_the_player_reads_names_the_rows_that_stopped_it() {
+        let error = anyhow::anyhow!(
+            "rows that would be given another game's instance when the instance tables are \
+             merged: instance_pack_gaps row 2 (instance 'skyrim-pack') has no user_instances row, \
+             and game_instances has an instance with that id ('Riften')"
+        )
+        .context(
+            "local_state.db migration v31 (one instance identity table) failed; version 30 is \
+             still recorded",
+        )
+        .context("Failed to initialize core context");
+
+        let message = super::fatal_startup_message(&error);
+        assert!(
+            message.contains("Agora could not start"),
+            "the dialog says what happened: {message}"
+        );
+        assert!(
+            message.contains("instance_pack_gaps row 2"),
+            "the dialog names the row: {message}"
+        );
+        assert!(
+            message.contains("Riften"),
+            "and the instance that would have taken it: {message}"
+        );
+    }
 }

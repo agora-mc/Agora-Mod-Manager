@@ -8,14 +8,15 @@ network requests and never modifies files; every finding is reported as
 
 Scope (current docs only; historical and generated content is excluded to
 avoid false positives):
-  * README.md, AGENTS.md, project README files, and top-level docs/*.md
-    (docs/architecture/ is excluded as a historical verification record)
+  * README.md, AGENTS.md, project README files, top-level docs/*.md and
+    docs/plugins/*.md (docs/architecture/ is excluded as a historical
+    verification record)
   * CODE_OF_ENGAGEMENT.md and REGISTRY_CURATION_REFERENCE.md (link targets
     only)
   * web/src/**/*.tsx (internal href routes; prose checks cover web/src/app)
   * desktop/src/data/guideContent.ts and desktop/src/pages/Guide.tsx
 
-Excluded: .kilo/plans/*, BACKLOG.md, root scratch notes, registry data,
+Excluded: MASTER_SPEC.md, .kilo/plans/*, BACKLOG.md, root scratch notes, registry data,
 compiler fixtures, and generated/build directories (target/, node_modules/,
 dist/, .next/, tmp/, __pycache__/, .venv/).
 
@@ -53,12 +54,14 @@ from urllib.parse import unquote
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+PLUGIN_DOCS = sorted((REPO_ROOT / "docs" / "plugins").glob("*.md"))
+
 MARKDOWN_ROOT = [
     REPO_ROOT / "README.md",
     REPO_ROOT / "AGENTS.md",
     REPO_ROOT / "CODE_OF_ENGAGEMENT.md",
     REPO_ROOT / "REGISTRY_CURATION_REFERENCE.md",
-] + sorted((REPO_ROOT / "docs").glob("*.md")) + [
+] + sorted((REPO_ROOT / "docs").glob("*.md")) + PLUGIN_DOCS + [
     REPO_ROOT / "compiler" / "README.md",
     REPO_ROOT / "desktop" / "README.md",
     REPO_ROOT / "web" / "README.md",
@@ -67,7 +70,7 @@ MARKDOWN_ROOT = [
 PROSE_MARKDOWN = [
     REPO_ROOT / "README.md",
     REPO_ROOT / "AGENTS.md",
-] + sorted((REPO_ROOT / "docs").glob("*.md")) + [
+] + sorted((REPO_ROOT / "docs").glob("*.md")) + PLUGIN_DOCS + [
     REPO_ROOT / "compiler" / "README.md",
     REPO_ROOT / "desktop" / "README.md",
     REPO_ROOT / "web" / "README.md",
@@ -593,8 +596,8 @@ def main() -> int:
             "No network requests are made and no files are modified."
         ),
         epilog=(
-            "Scope: README.md, AGENTS.md, project README files, docs/*.md (docs/architecture/ excluded as a "
-            "historical record), CODE_OF_ENGAGEMENT.md and "
+            "Scope: README.md, AGENTS.md, project README files, docs/*.md and docs/plugins/*.md "
+            "(docs/architecture/ excluded as a historical record), CODE_OF_ENGAGEMENT.md and "
             "REGISTRY_CURATION_REFERENCE.md (links only), web/src/**/*.tsx "
             "(routes) and web/src/app/**/*.tsx (prose), "
             "desktop/src/data/guideContent.ts and desktop/src/pages/Guide.tsx. "

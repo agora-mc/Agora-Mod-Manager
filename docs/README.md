@@ -12,7 +12,7 @@ Every page is written for one audience. The website's sidebar is built around th
 | CLI users | [CLI reference](./CLI.md), [CLI troubleshooting](./TROUBLESHOOTING.md), [Data, logs, and support evidence](./SUPPORT.md) | Commands, flags, output, exit codes, diagnosis, and support evidence |
 | Contributors | [Developing Agora](./DEVELOPMENT.md), [Layer ownership](./architecture/layer-ownership.md) | Local builds, tests, validation gates, and which layer owns what |
 | Catalog curators and reviewers | [Catalog curation reference](../REGISTRY_CURATION_REFERENCE.md), [Code of Engagement](../CODE_OF_ENGAGEMENT.md) | Writing catalog entries and the rules for reviews |
-| Plugin authors | [Community plugins](./plugins/README.md), [Content providers](./plugins/providers.md), [Publishing](./plugins/publishing.md), [Implementation status](./plugins/implementation-status.md) | Writing, publishing, and updating plugins, and what the plugin host supports today |
+| Plugin authors | [Community plugins](./plugins/README.md), [Adding a game](./plugins/game-packages.md), [Content providers](./plugins/providers.md), [Publishing](./plugins/publishing.md), [Implementation status](./plugins/implementation-status.md) | Writing, publishing, and updating plugins, adding a game and its load order, and what the plugin host supports today |
 | Maintainers and operators | [Releasing Agora](./RELEASING.md), [Governance operations](./GOVERNANCE_OPERATIONS.md) | Releases, signing, the governance pipeline, and incident recovery |
 
 Desktop pages explain what a player sees and does. They don't describe how Agora works behind the scenes, and they don't ask players to use a terminal. CLI pages can assume a reader who is comfortable with a shell, logs, and Minecraft modding. Contributor pages can assume knowledge of the codebase.
@@ -66,7 +66,7 @@ A feature change isn't finished until its documentation has been checked.
 
 1. Update the in-app guide when a user-visible workflow, label, warning, or recovery action changes. This updates the website's Help & guide too.
 2. Update the desktop troubleshooting page and FAQ when a fix, label, or answer they mention changes.
-3. Update `docs/CLI.md` and the CLI help when a command, flag, output shape, or exit code changes.
+3. Update `docs/CLI.md` and the CLI help when a command, flag, output shape, or exit code changes. A test walks the command tree and fails when a leaf command is missing from `docs/CLI.md`.
 4. Update the hand-written pages in `web/src/app/docs/` when installation, first run, or the screenshot tour changes.
 5. Give any new markdown page a rule in `DOC_CATEGORIES`.
 6. Update operator documents when workflows, variables, signing, or governance state change.

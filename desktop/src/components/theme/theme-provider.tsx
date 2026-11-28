@@ -308,6 +308,21 @@ function hexToHsl(value: string): { h: number; s: number; l: number } | null {
   return { h: Math.round(hue), s: Math.round(saturation * 100), l: Math.round(lightness * 100) };
 }
 
+/**
+ * Secondary text derived from a custom body colour. The custom colour is used for body text and
+ * headings; reusing it for `--muted-foreground` makes every "muted" label read as body text. Keep
+ * the hue, soften the saturation and move the lightness away from the body colour so the
+ * distinction survives every custom theme.
+ */
+export function mutedTextHsl(
+  text: { h: number; s: number; l: number },
+  dark: boolean,
+): string {
+  const lightness = dark ? Math.max(42, text.l - 26) : Math.min(64, text.l + 24);
+  const saturation = Math.max(0, Math.round(text.s * 0.75));
+  return `${Math.round(text.h)} ${saturation}% ${Math.round(lightness)}%`;
+}
+
 function parseAccent(value: string | null): { h: number; s: number; l: number } | null {
   if (!value) return null;
   const hex = hexToHsl(value);
@@ -406,7 +421,7 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
       root.style.setProperty('--card-foreground', value);
       root.style.setProperty('--popover-foreground', value);
       root.style.setProperty('--secondary-foreground', value);
-      root.style.setProperty('--muted-foreground', value);
+      root.style.setProperty('--muted-foreground', mutedTextHsl(text, dark));
     } else {
       root.style.removeProperty('--foreground');
       root.style.removeProperty('--card-foreground');

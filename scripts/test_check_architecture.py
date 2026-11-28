@@ -1,0 +1,446 @@
+"""Hermetic fixtures for the game boundaries, even before Minecraft moves.
+
+Run: python -m unittest discover -s scripts -p test_check_architecture.py
+"""
+import contextlib
+import json
+import io
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import check_architecture as architecture
+
+
+class GameBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.core = self.root / "crates/agora-core/src"
+        self.core.mkdir(parents=True)
+        self.api = self.root / "crates/agora-game-api/Cargo.toml"
+        self.api.parent.mkdir(parents=True)
+        (self.root / "Cargo.toml").write_text(
+            '[workspace.dependencies]\nserde = "1"\n', encoding="utf-8")
+        (self.core.parent / "Cargo.toml").write_text('[dependencies]\n', encoding="utf-8")
+        self.api.write_text('[dependencies]\nserde = { workspace = true }\nsemver = "1"\nthiserror = "1"\n', encoding="utf-8")
+        for name, value in {
+            "REPO_ROOT": self.root, "CORE_SRC": self.core,
+            "CORE_CARGO": self.core.parent / "Cargo.toml", "GAME_API_CARGO": self.api,
+            "EXIT_CODE": 0,
+        }.items():
+            patcher = patch.object(architecture, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def check(self, function):
+        architecture.EXIT_CODE = 0
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            function()
+        return architecture.EXIT_CODE
+
+    def test_raw_manifest_rule_matches_the_minecraft_type_only(self):
+        for name in ["DESKTOP_SRC", "CLI_SRC", "MC_SRC"]:
+            patcher = patch.object(architecture, name, self.root / name.lower())
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        source = self.core / "instances.rs"
+        source.write_text(
+            "let m: GameInstanceManifest = serde_json::from_str(&text)?;\n", encoding="utf-8")
+        self.assertEqual(self.check(architecture.check_instance_manifest_raw), 0)
+        source.write_text(
+            "let m: InstanceManifest =\n    serde_json::from_str(&text)?;\n", encoding="utf-8")
+        self.assertEqual(self.check(architecture.check_instance_manifest_raw), 1)
+
+    def test_allowed_contract_and_absent_minecraft_package(self):
+        (self.core / "lib.rs").write_text('pub mod minecraft_runtime;\n', encoding="utf-8")
+        self.assertEqual(self.check(architecture.check_game_api_dependencies), 0)
+        self.assertEqual(self.check(architecture.check_core_no_minecraft_package), 0)
+
+    def test_dependency_sections_aliases_and_workspace_resolution(self):
+        for section in ["dependencies", "dev-dependencies", "build-dependencies", "target.'cfg(windows)'.dependencies"]:
+            for dependency in ['tokio = "1"', 'alias = { package = "agora-core", path = "../agora-core" }']:
+                with self.subTest(section=section, dependency=dependency):
+                    self.api.write_text(f'[{section}]\n{dependency}\n', encoding="utf-8")
+                    self.assertEqual(self.check(architecture.check_game_api_dependencies), 1)
+        self.api.write_text('[dependencies]\nserde = { workspace = true }\n', encoding="utf-8")
+        (self.root / "Cargo.toml").write_text('[workspace.dependencies]\nserde = { package = "tokio", version = "1" }\n', encoding="utf-8")
+        self.assertEqual(self.check(architecture.check_game_api_dependencies), 1)
+
+    def test_path_disguised_as_allowed_dependency_is_rejected(self):
+        self.api.write_text('[dependencies]\nserde = { path = "../fake-serde" }\n', encoding="utf-8")
+        self.assertEqual(self.check(architecture.check_game_api_dependencies), 1)
+
+    def test_core_module_import_include_and_alias_dependency(self):
+        for source in [
+            'use agora_game_minecraft::launch;\n',
+            'use agora_game_minecraft\n ::launch;\n',
+            '#[path = "../../agora-game-minecraft/src/launch.rs"]\nmod launch;\n',
+            'include!("../../agora-game-minecraft/src/launch.rs");\n',
+            'extern crate agora_game_minecraft as minecraft;\n',
+        ]:
+            with self.subTest(source=source):
+                (self.core / "lib.rs").write_text(source, encoding="utf-8")
+                self.assertEqual(self.check(architecture.check_core_no_minecraft_package), 1)
+        (self.core / "lib.rs").write_text('// agora_game_minecraft::launch\n/* agora-game-minecraft */\n', encoding="utf-8")
+        self.assertEqual(self.check(architecture.check_core_no_minecraft_package), 0)
+        (self.core.parent / "Cargo.toml").write_text(
+            '[dependencies]\nmc = { package = "agora-game-minecraft", path = "../agora-game-minecraft" }\n', encoding="utf-8")
+        self.assertEqual(self.check(architecture.check_core_no_minecraft_package), 1)
+
+    def test_missing_and_invalid_contract_manifest_fail(self):
+        self.api.unlink()
+        self.assertEqual(self.check(architecture.check_game_api_dependencies), 1)
+        self.api.write_text('invalid toml [', encoding="utf-8")
+        self.assertEqual(self.check(architecture.check_game_api_dependencies), 1)
+
+    def test_core_build_scripts_and_integration_tests_cannot_include_package_modules(self):
+        for relative in ["build.rs", "tests/package_boundary.rs"]:
+            with self.subTest(source=relative):
+                source = self.core.parent / relative
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_text('use agora_game_minecraft::launch;\n', encoding="utf-8")
+                self.assertEqual(self.check(architecture.check_core_no_minecraft_package), 1)
+                source.unlink()
+
+    def test_core_cannot_reference_creation_or_other_game_packages(self):
+        for pkg in ["agora_game_creation", "agora_game_skyrim"]:
+            with self.subTest(pkg=pkg):
+                (self.core / "lib.rs").write_text(f"use {pkg}::game_package;\n", encoding="utf-8")
+                self.assertEqual(self.check(architecture.check_core_no_game_packages), 1)
+        (self.core / "lib.rs").write_text("use agora_game_api::GamePackage;\n", encoding="utf-8")
+        self.assertEqual(self.check(architecture.check_core_no_game_packages), 0)
+        (self.core.parent / "Cargo.toml").write_text(
+            '[dependencies]\ncreation = { package = "agora-game-creation", path = "../agora-game-creation" }\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(self.check(architecture.check_core_no_game_packages), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class GamePackageCoreBudgetTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.crates = self.root / "crates"
+        self.package = self.crates / "agora-game-test"
+        (self.package / "src").mkdir(parents=True)
+        (self.root / "Cargo.toml").write_text("[workspace.dependencies]\n", encoding="utf-8")
+        self.budget = self.root / "scripts" / "game_package_core_budget.json"
+        self.budget.parent.mkdir()
+        for name, value in {
+            "REPO_ROOT": self.root, "CRATES_DIR": self.crates,
+            "GAME_PACKAGE_CORE_BUDGET": self.budget, "EXIT_CODE": 0,
+        }.items():
+            patcher = patch.object(architecture, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def write(self, uses: int, depends: bool = True, budget=None):
+        dependency = 'agora-core = { path = "../agora-core" }\n' if depends else ""
+        (self.package / "Cargo.toml").write_text(f"[dependencies]\n{dependency}", encoding="utf-8")
+        (self.package / "src" / "lib.rs").write_text(
+            "// agora_core in a comment does not count\n/* nor agora_core here */\n"
+            + "use agora_core::x;\n" * uses,
+            encoding="utf-8",
+        )
+        if budget is None:
+            self.budget.unlink(missing_ok=True)
+        else:
+            self.budget.write_text(json.dumps(budget), encoding="utf-8")
+
+    def check(self):
+        architecture.EXIT_CODE = 0
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            architecture.check_game_package_core_budget()
+        return architecture.EXIT_CODE
+
+    def test_comments_do_not_count(self):
+        self.write(2, budget={"agora-game-test": 2})
+        self.assertEqual(architecture.count_core_references(self.package), 2)
+
+    def test_package_on_core_without_a_budget_entry_fails(self):
+        self.write(3)
+        self.assertEqual(self.check(), 1)
+
+    def test_package_off_core_needs_no_entry(self):
+        self.write(0, depends=False)
+        self.assertEqual(self.check(), 0)
+
+    def test_at_budget_passes(self):
+        self.write(3, budget={"agora-game-test": 3})
+        self.assertEqual(self.check(), 0)
+
+    def test_over_budget_fails(self):
+        self.write(4, budget={"agora-game-test": 3})
+        self.assertEqual(self.check(), 1)
+
+    def test_under_budget_fails_until_lowered(self):
+        self.write(2, budget={"agora-game-test": 3})
+        self.assertEqual(self.check(), 1)
+
+    def test_zero_references_with_the_dependency_still_declared_fails(self):
+        self.write(0, depends=True, budget={"agora-game-test": 0})
+        self.assertEqual(self.check(), 1)
+
+    def test_entry_for_a_missing_package_fails(self):
+        self.write(1, budget={"agora-game-test": 1, "agora-game-gone": 5})
+        self.assertEqual(self.check(), 1)
+
+
+class TestOnlyModuleFileTests(unittest.TestCase):
+    """A file its parent declares `#[cfg(test)] mod name;` is test code in full."""
+
+    def test_a_test_only_module_file_is_recognised_and_a_production_one_is_not(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "store"
+            root.mkdir()
+            (root / "mod.rs").write_text(
+                "#[cfg(test)]\nmod bench;\npub mod place;\n// #[cfg(test)] mod place;\n",
+                encoding="utf-8",
+            )
+            (root / "bench.rs").write_text('fn f() { std::env::var("X").ok(); }\n', encoding="utf-8")
+            (root / "place.rs").write_text("fn g() {}\n", encoding="utf-8")
+            self.assertTrue(architecture.is_test_only_module_file(root / "bench.rs"))
+            # A commented-out declaration does not make a production module test-only.
+            self.assertFalse(architecture.is_test_only_module_file(root / "place.rs"))
+            self.assertFalse(architecture.is_test_only_module_file(root / "mod.rs"))
+
+
+class FailClosedReadBudgetTests(unittest.TestCase):
+    """MASTER_SPEC §32.13: error-read-as-absent sites are counted and may only go down."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        (self.root / "crates/agora-core/src").mkdir(parents=True)
+        self.budget = self.root / "scripts" / "fail_closed_read_budget.json"
+        self.budget.parent.mkdir()
+        for name, value in {
+            "REPO_ROOT": self.root,
+            "FAIL_CLOSED_READ_BUDGET": self.budget,
+            "EXIT_CODE": 0,
+        }.items():
+            patcher = patch.object(architecture, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def write(self, relative: str, source: str) -> Path:
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source, encoding="utf-8")
+        return path
+
+    def budget_of(self, files=None, directories=None) -> None:
+        self.budget.write_text(
+            json.dumps({"files": files or {}, "directories": directories or {}}),
+            encoding="utf-8",
+        )
+
+    def check(self) -> int:
+        architecture.EXIT_CODE = 0
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            architecture.check_fail_closed_reads()
+        return architecture.EXIT_CODE
+
+    def test_comments_and_test_modules_do_not_count(self):
+        source = (
+            "fn a(p: &Path) -> bool { p.exists() }\n"
+            "// p.exists() in a line comment does not count\n"
+            "/* nor do these: p.exists() .ok() */\n"
+            "fn b(text: &str) -> u32 { text.parse().ok().unwrap_or_default() }\n"
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            "    fn t(p: &Path) { assert!(p.exists()); }\n"
+            "}\n"
+        )
+        self.assertEqual(architecture.count_fail_closed_reads(source), 3)
+
+    def test_a_test_module_declaration_does_not_hide_the_code_after_it(self):
+        # content_store/mod.rs declares `#[cfg(test)] mod import_bench;` early, then keeps going.
+        source = (
+            "mod convert;\n"
+            "#[cfg(test)]\n"
+            "mod import_bench;\n"
+            "pub fn place(p: &Path) -> bool { p.exists() }\n"
+        )
+        self.assertEqual(architecture.count_fail_closed_reads(source), 1)
+
+    def test_string_literals_do_not_count(self):
+        source = (
+            'fn a() -> &\'static str { "p.exists() and text.parse().ok()" }\n'
+            'const B: &str = r#"a raw string mentioning .exists() and .unwrap_or_default()"#;\n'
+            "fn b() -> char { '(' }\n"
+        )
+        self.assertEqual(architecture.count_fail_closed_reads(source), 0)
+
+    def test_an_inline_test_module_is_skipped_but_the_code_after_it_is_not(self):
+        source = (
+            "fn a(p: &Path) -> bool { p.exists() }\n"
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            "    fn t(p: &Path) { assert!(p.exists()); let _ = \"}\".parse::<u8>().ok(); }\n"
+            "}\n"
+            "fn b(p: &Path) -> bool { p.exists() }\n"
+        )
+        self.assertEqual(architecture.count_fail_closed_reads(source), 2)
+
+    def test_a_test_only_helper_function_is_skipped(self):
+        source = (
+            "#[cfg(test)]\n"
+            "fn helper(p: &Path) -> bool { p.exists() }\n"
+            "fn production(p: &Path) -> bool { p.exists() }\n"
+        )
+        self.assertEqual(architecture.count_fail_closed_reads(source), 1)
+
+    def test_an_attribute_on_a_parameter_does_not_hide_the_function_body(self):
+        # The attribute applies to `_c` alone; the body is production code and still counted.
+        source = "fn present(#[cfg(test)] _c: usize, p: &Path) -> bool { p.exists() }\n"
+        self.assertEqual(architecture.count_fail_closed_reads(source), 1)
+
+    def test_whitespace_inside_the_call_is_counted(self):
+        source = "fn a(p: &Path) -> bool { p.exists () } fn b(t: &str) { t.parse::<u8>().ok ( ) ; }\n"
+        self.assertEqual(architecture.count_fail_closed_reads(source), 2)
+
+    def test_a_nested_file_in_a_counted_directory_needs_its_own_number(self):
+        self.write("crates/agora-core/src/content_store/mod.rs", "fn a() {}\n")
+        self.write(
+            "crates/agora-core/src/content_store/recovery/inner.rs",
+            "fn a(p: &Path) -> bool { p.exists() }\n",
+        )
+        self.budget_of(
+            directories={"crates/agora-core/src/content_store": {"mod.rs": 0}}
+        )
+        self.assertEqual(self.check(), 1)
+        self.budget_of(
+            directories={
+                "crates/agora-core/src/content_store": {
+                    "mod.rs": 0,
+                    "recovery/inner.rs": 1,
+                }
+            }
+        )
+        self.assertEqual(self.check(), 0)
+
+    def test_at_budget_passes(self):
+        self.write("crates/agora-core/src/lkg.rs", "fn a(p: &Path) -> bool { p.exists() }\n")
+        self.budget_of(files={"crates/agora-core/src/lkg.rs": 1})
+        self.assertEqual(self.check(), 0)
+
+    def test_one_more_site_than_the_budget_fails(self):
+        self.write(
+            "crates/agora-core/src/lkg.rs",
+            "fn a(p: &Path) -> bool { p.exists() }\nfn b(p: &Path) -> bool { p.exists() }\n",
+        )
+        self.budget_of(files={"crates/agora-core/src/lkg.rs": 1})
+        self.assertEqual(self.check(), 1)
+
+    def test_a_fix_below_the_budget_fails_until_the_number_is_written_back(self):
+        self.write("crates/agora-core/src/lkg.rs", "fn a(p: &Path) -> bool { p.exists() }\n")
+        self.budget_of(files={"crates/agora-core/src/lkg.rs": 3})
+        self.assertEqual(self.check(), 1)
+
+    def test_a_budgeted_file_that_is_gone_fails(self):
+        self.budget_of(files={"crates/agora-core/src/gone.rs": 0})
+        self.assertEqual(self.check(), 1)
+
+    def test_a_missing_budget_file_fails(self):
+        self.assertEqual(self.check(), 1)
+
+    def test_every_file_in_a_counted_directory_needs_its_own_number(self):
+        self.write("crates/agora-core/src/content_store/mod.rs", "fn a() {}\n")
+        self.write(
+            "crates/agora-core/src/content_store/place.rs",
+            "fn a(p: &Path) -> bool { p.exists() }\n",
+        )
+        budget = {"crates/agora-core/src/content_store": {"mod.rs": 0}}
+        self.budget_of(directories=budget)
+        self.assertEqual(self.check(), 1)
+        budget["crates/agora-core/src/content_store"]["place.rs"] = 1
+        self.budget_of(directories=budget)
+        self.assertEqual(self.check(), 0)
+
+
+class DirectInstanceWriteBudgetTests(unittest.TestCase):
+    """MASTER_SPEC 32.4: direct file writes in the Minecraft package are counted and only go down."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.src = self.root / "crates/agora-game-minecraft/src"
+        self.src.mkdir(parents=True)
+        self.budget = self.root / "scripts" / "instance_write_budget.json"
+        self.budget.parent.mkdir()
+        for name, value in {
+            "REPO_ROOT": self.root,
+            "INSTANCE_WRITE_BUDGET": self.budget,
+            "INSTANCE_WRITE_ROOT": self.src,
+            "EXIT_CODE": 0,
+        }.items():
+            patcher = patch.object(architecture, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def write(self, name: str, source: str) -> None:
+        (self.src / name).write_text(source, encoding="utf-8")
+
+    def budget_of(self, writes) -> None:
+        self.budget.write_text(json.dumps({"writes": writes}), encoding="utf-8")
+
+    def check(self) -> int:
+        architecture.EXIT_CODE = 0
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            architecture.check_direct_instance_writes()
+        return architecture.EXIT_CODE
+
+    def test_each_kind_of_direct_write_counts_and_tests_and_comments_do_not(self):
+        source = (
+            'fn a(p: &Path) { std::fs::write(p, b"x").unwrap(); fs::copy(p, p).unwrap(); }\n'
+            "fn b(p: &Path) { fs::rename(p, p).unwrap(); std::fs::remove_file(p).unwrap(); }\n"
+            "fn c(p: &Path) { fs::remove_dir_all(p).unwrap(); helpers::atomic_write_manifest(p, m); }\n"
+            "fn d(p: &Path) { fs::create_dir_all(p).unwrap(); } // fs::write(p) in a comment\n"
+            "#[cfg(test)]\n"
+            'mod tests { fn t(p: &Path) { std::fs::write(p, b"x").unwrap(); } }\n'
+        )
+        self.assertEqual(architecture.count_direct_instance_writes(source), 6)
+
+    def test_a_file_with_writes_and_no_budget_entry_fails(self):
+        self.write("new_writer.rs", 'fn a(p: &Path) { std::fs::write(p, b"x").unwrap(); }\n')
+        self.budget_of({})
+        self.assertEqual(self.check(), 1)
+
+    def test_at_budget_passes_and_one_more_write_fails(self):
+        self.write("writer.rs", 'fn a(p: &Path) { std::fs::write(p, b"x").unwrap(); }\n')
+        self.budget_of({"crates/agora-game-minecraft/src/writer.rs": 1})
+        self.assertEqual(self.check(), 0)
+        self.write(
+            "writer.rs",
+            'fn a(p: &Path) { std::fs::write(p, b"x").unwrap(); fs::copy(p, p).unwrap(); }\n',
+        )
+        self.assertEqual(self.check(), 1)
+
+    def test_a_writer_moved_onto_staged_apply_must_lower_its_number(self):
+        self.write("writer.rs", "fn a(stage: &mut Stage) { stage.write(p, b, e); }\n")
+        self.budget_of({"crates/agora-game-minecraft/src/writer.rs": 2})
+        self.assertEqual(self.check(), 1)
+        self.budget_of({})
+        self.assertEqual(self.check(), 0)
+
+    def test_a_missing_budget_file_fails(self):
+        self.assertEqual(self.check(), 1)
+
+    def test_test_folders_and_test_files_do_not_count(self):
+        (self.src / "pipeline" / "tests").mkdir(parents=True)
+        line = 'fn t(p: &Path) { std::fs::write(p, b"x").unwrap(); }' + chr(10)
+        (self.src / "pipeline" / "tests" / "store.rs").write_text(line, encoding="utf-8")
+        self.write("thing_tests.rs", line)
+        self.budget_of({})
+        self.assertEqual(self.check(), 0)

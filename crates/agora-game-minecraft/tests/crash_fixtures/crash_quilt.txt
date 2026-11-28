@@ -1,0 +1,24 @@
+---- Minecraft Crash Report ----
+// A test crash, invented for these fixtures.
+
+Time: 2026-02-03 04:05:06
+Description: Ticking an example block
+
+java.lang.Error: Watchdog
+	at net.minecraft.class_3513.method_15230(class_3513.java:113)
+
+A detailed walkthrough of the error, its code path and all known details is as follows:
+---------------------------------------------------------------------------------------
+-- System Details --
+Details:
+	Minecraft Version: 1.20.4
+	Operating System: Linux (amd64) version 6.1.0
+	Java Version: 22, Example Vendor
+	Java VM Version: OpenJDK 64-Bit Server VM (mixed mode), Example Vendor
+	Memory: 100000000 bytes (95 MiB) / 2000000000 bytes (1907 MiB) up to 4000000000 bytes (3814 MiB)
+	Launched Version: quilt-loader-0.27.0-1.20.4
+	Quilt Mods: 
+		| Index | Mod | ID | Version | Type | hash |
+		|------:|-----|----|---------|------|------|
+		|     1 | Example Mod | examplemod | 1.2.3 | Fabric | aabbccdd |
+		|     2 | Example Library | examplelib | 4.5.6 | Quilt | eeff0011 |

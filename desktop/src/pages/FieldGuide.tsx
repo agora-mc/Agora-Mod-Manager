@@ -164,7 +164,7 @@ export function FieldGuide() {
           <h3 className="text-lg font-bold">Discoveries</h3>
           <p className="text-xs text-muted-foreground">Saved locally — they stay as long as your config does.</p>
         </div>
-        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+        <div className="grid gap-2 grid-cols-[repeat(auto-fill,minmax(min(100%,calc(10rem*var(--font-scale))),1fr))]">
           {ACHIEVEMENTS.map((a) => {
             const isEarned = earned.has(a.key);
             return (
@@ -173,11 +173,11 @@ export function FieldGuide() {
                 data-testid={`achievement-${a.key}`}
                 className={`flex items-center gap-3 rounded-xl border px-3 py-3 ${isEarned ? 'border-primary/50 bg-primary/10' : 'border-border bg-muted/40 opacity-70'}`}
               >
-                <span className={`grid h-10 w-10 place-items-center rounded-lg text-xl ${isEarned ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'}`} aria-hidden="true">
+                <span className={`grid h-10 w-10 shrink-0 place-items-center rounded-lg text-xl ${isEarned ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'}`} aria-hidden="true">
                   {isEarned ? a.icon : '🔒'}
                 </span>
-                <div>
-                  <div className="text-sm font-bold">{a.name}</div>
+                <div className="min-w-0">
+                  <div className="text-sm font-bold wrap-break-word">{a.name}</div>
                   <div className="text-xs text-muted-foreground">{isEarned ? 'Earned' : 'Locked'}</div>
                 </div>
               </div>
@@ -194,7 +194,7 @@ export function FieldGuide() {
           <h3 className="text-lg font-bold">Workbench moments</h3>
           <p className="text-xs text-muted-foreground">Earned once in the High Interaction instance view — {interactionCount}/{INTERACTION_ACHIEVEMENTS.length}.</p>
         </div>
-        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+        <div className="grid gap-2 grid-cols-[repeat(auto-fill,minmax(min(100%,calc(11rem*var(--font-scale))),1fr))]">
           {INTERACTION_ACHIEVEMENTS.map((a) => {
             const isEarned = interactionEarned.has(a.key);
             return (
@@ -203,11 +203,11 @@ export function FieldGuide() {
                 data-testid={`interaction-achievement-${a.key}`}
                 className={`flex items-center gap-3 rounded-xl border px-3 py-2.5 ${isEarned ? 'border-primary/50 bg-primary/10' : 'border-border bg-muted/40 opacity-70'}`}
               >
-                <span className={`grid h-9 w-9 place-items-center rounded-lg text-lg ${isEarned ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'}`} aria-hidden="true">
+                <span className={`grid h-9 w-9 shrink-0 place-items-center rounded-lg text-lg ${isEarned ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'}`} aria-hidden="true">
                   {isEarned ? a.icon : '🔒'}
                 </span>
-                <div>
-                  <div className="text-sm font-bold">{a.name}</div>
+                <div className="min-w-0">
+                  <div className="text-sm font-bold wrap-break-word">{a.name}</div>
                   <div className="text-xs text-muted-foreground">{a.detail}</div>
                 </div>
               </div>

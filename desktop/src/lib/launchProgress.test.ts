@@ -43,6 +43,21 @@ describe('applyLaunchProgressEvent', () => {
     expect(applyLaunchProgressEvent(p, ev('resolving-complete'), 2)).toBe(p);
     expect(applyLaunchProgressEvent(p, ev('mystery'), 2)).toBe(p);
   });
+
+  it('records the offline note and keeps it through later stages', () => {
+    const notice =
+      'Playing offline: online servers and Realms will not accept this session. Lockdown Mode is on, so Agora is using no network.';
+    const afterOffline = applyLaunchProgressEvent(
+      STARTING_PROGRESS(1),
+      ev('offline', { message: notice }),
+      2,
+    );
+    expect(afterOffline?.notice).toBe(notice);
+
+    const afterRunning = applyLaunchProgressEvent(afterOffline, ev('running'), 3);
+    expect(afterRunning?.stage).toBe('loading');
+    expect(afterRunning?.notice).toBe(notice);
+  });
 });
 
 describe('file progress helpers', () => {

@@ -91,7 +91,10 @@ beforeEach(() => {
       case 'get_dependency_graph':
       case 'list_loadout_profiles':
         return command === 'list_loadout_profiles'
-          ? [{ name: 'Fast', enabled_mods: [], created_at: '2026-01-01T00:00:00Z' }]
+          ? {
+              profiles: [{ name: 'Fast', enabled_mods: [], created_at: '2026-01-01T00:00:00Z' }],
+              damaged: [],
+            }
           : [];
       case 'list_instance_templates': return [template];
       case 'list_snapshots':
@@ -104,7 +107,10 @@ beforeEach(() => {
         return { jvm_applied: true, files_applied: 0, files_missing: 0, undo_snapshot_id: null };
       case 'restore_snapshot':
         current = detail({ minecraft_version: '26.1.2' });
-        return undefined;
+        // The command answers with what the restore did, which the editor shows.
+        return {
+          snapshotId: 'snap-1', coverage: 'exact', restoredRoots: [], preservedRoots: [],
+        };
       case 'apply_loadout_profile':
         return undefined;
       case 'list_loadout_unlisted_mods':
@@ -117,29 +123,35 @@ beforeEach(() => {
 
 async function openEditor() {
   render(<PackInstallProvider><InstanceEditor instanceId="alpha" onBack={() => undefined} /></PackInstallProvider>);
-  await screen.findByRole('button', { name: 'Java & Args' });
+  await screen.findByRole('button', { name: 'Content' });
+}
+
+/** Open a panel through its top tab, the way a user reaches it now. */
+async function openPanel(top: string, panel: string) {
+  fireEvent.click(await screen.findByRole('button', { name: top }));
+  fireEvent.click(await screen.findByRole('button', { name: panel }));
 }
 
 describe('InstanceEditor reload after mutations', () => {
   it('shows applied template Java settings on the Java & Args tab', async () => {
     await openEditor();
-    fireEvent.click(screen.getByRole('button', { name: 'Java & Args' }));
+    await openPanel('Java & Logs', 'Java & Args');
     const before = await screen.findByLabelText('Pre-touch allocated memory');
-    expect((before as HTMLInputElement).checked).toBe(true);
+    expect(before).toHaveAttribute('aria-checked', 'true');
 
-    fireEvent.click(screen.getByRole('button', { name: 'Templates' }));
+    await openPanel('Backups & Versions', 'Templates');
     fireEvent.click(await screen.findByRole('button', { name: 'Apply' }));
     await screen.findByText(/Applied Java settings/);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Java & Args' }));
+    await openPanel('Java & Logs', 'Java & Args');
     const after = await screen.findByLabelText('Pre-touch allocated memory');
-    await waitFor(() => expect((after as HTMLInputElement).checked).toBe(false));
+    await waitFor(() => expect(after).toHaveAttribute('aria-checked', 'false'));
   });
 
   it('shows the restored state after a snapshot restore', async () => {
     await openEditor();
     expect(screen.getAllByText(/26\.2/).length).toBeGreaterThan(0);
-    fireEvent.click(screen.getByRole('button', { name: 'Snapshots' }));
+    await openPanel('Backups & Versions', 'Snapshots');
     fireEvent.click(await screen.findByRole('button', { name: 'Restore' }));
     await screen.findByText('Snapshot restored.');
     await waitFor(() => expect(screen.getAllByText(/26\.1\.2/).length).toBeGreaterThan(0));
@@ -148,7 +160,7 @@ describe('InstanceEditor reload after mutations', () => {
 
   it('re-reads installed content after applying a loadout profile', async () => {
     await openEditor();
-    fireEvent.click(screen.getByRole('button', { name: 'Loadout Profiles' }));
+    await openPanel('Backups & Versions', 'Loadout Profiles');
     const contentBefore = calls('list_instance_content');
     fireEvent.click(await screen.findByRole('button', { name: 'Apply' }));
     await screen.findByText(/Profile "Fast" applied\./);

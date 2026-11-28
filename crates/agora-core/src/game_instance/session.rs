@@ -1,0 +1,461 @@
+//! Ending a generic game session: the normal exit, and "Stop" for a game that will not close.
+//!
+//! A launch journals the game's OS identity in the user-files session. A normal exit restores
+//! those files. A stop does the same end, but first ends the recorded process and the children it
+//! started — and only those. A process the journal does not name is never touched, so a copy the
+//! player started themselves survives.
+
+use std::time::{Duration, Instant};
+
+use agora_game_api::{GameDefinition, StoreId};
+
+use crate::ctx::Ctx;
+use crate::game_instance::{self, InstanceError};
+use crate::game_user_files;
+use crate::process_identity::{self, ProcessCheck, ProcessIdentity};
+use crate::process_job;
+
+/// How long a stop waits for the processes it ended to actually go.
+const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What ending a session did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEnd {
+    pub instance_id: String,
+    /// The instance's total play time after this session.
+    pub play_time_ms: i64,
+}
+
+/// What a stop did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopOutcome {
+    pub instance_id: String,
+    /// The processes ended (the game and the children it started).
+    pub processes_ended: usize,
+    pub play_time_ms: i64,
+}
+
+/// Wait for a launched game to close and record how it ended in the session ledger.
+///
+/// The game is the process named by the definition's `session.processes` (else the recipe's own
+/// executable), which is not the launched program when a framework loader starts the game and
+/// exits. `session_id` is [`LaunchedInstance::session_id`](super::LaunchedInstance). Recording is
+/// best effort: the report comes back whether or not it could be written.
+#[allow(clippy::too_many_arguments)]
+pub fn watch_session(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    session_id: Option<&str>,
+    running_from: &std::path::Path,
+    launched: &mut crate::game_launch::LaunchedGame,
+    poll: Duration,
+    grace: Duration,
+) -> crate::game_launch::SessionExitReport {
+    let started = Instant::now();
+    let images = crate::game_launch::session_images(definition, &launched.program);
+    let report =
+        crate::game_launch::wait_for_exit_watching(running_from, launched, &images, poll, grace);
+    if let Some(session_id) = session_id {
+        let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+        let verdict =
+            crate::session_ledger::record_end(ctx, session_id, definition, &report, duration_ms);
+        // Promote this launch's recovery point only when the session is a success. The verdict is
+        // the ledger's; without one Agora cannot tell how the game ended, and does not promote.
+        let runtime_ms = report
+            .game_runtime_ms
+            .unwrap_or_else(|| u64::try_from(duration_ms).unwrap_or(0));
+        let _ = crate::game_snapshot::finish_launch_session(
+            ctx,
+            instance_id,
+            session_id,
+            verdict,
+            runtime_ms,
+        );
+    }
+    report
+}
+
+/// End the game's session the way a normal exit does: put the player's files back and add the
+/// session to the instance's play time. No session means nothing to end (`Ok(None)`), so a stop
+/// and the exit watcher can both call this and only one records the time.
+///
+/// If the session is tracked in the session ledger, closing it there records playtime once for the
+/// whole session. The user-files journal is one participant in that lifecycle.
+pub fn end_session(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    store: &StoreId,
+) -> Result<Option<SessionEnd>, InstanceError> {
+    let Some(details) = game_user_files::details(ctx, &definition.id, store)? else {
+        return Ok(None);
+    };
+    let started_at = chrono::DateTime::parse_from_rfc3339(&details.created_at)
+        .map(|at| at.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()));
+    match game_user_files::restore(ctx, definition, store) {
+        Ok(_) => {}
+        Err(game_user_files::UserFilesError::NoSession { .. }) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let play_time_ms = finish_session_playtime(ctx, &details.instance, definition, started_at)?;
+    Ok(Some(SessionEnd {
+        instance_id: details.instance,
+        play_time_ms,
+    }))
+}
+
+fn finish_session_playtime(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    started_at: chrono::DateTime<chrono::Utc>,
+) -> Result<i64, InstanceError> {
+    let now = chrono::DateTime::<chrono::Utc>::from(ctx.clock.now());
+    let duration_ms = (now - started_at).num_milliseconds().max(0);
+    if let Ok(conn) = crate::db::local_state_connection(&ctx.paths.local_state_db()) {
+        if let Ok(open) = crate::session_ledger::open_sessions_for_instance(&conn, instance_id) {
+            if let Some(session) = open.into_iter().next() {
+                drop(conn);
+                let report = crate::game_launch::SessionExitReport {
+                    processes: Vec::new(),
+                    relaunched_outside: false,
+                    exit: agora_game_api::crash::ExitObservation::unavailable(
+                        "the session ended and its user files were restored",
+                    ),
+                    game_runtime_ms: Some(u64::try_from(duration_ms).unwrap_or(0)),
+                };
+                let _ = crate::session_ledger::record_end(
+                    ctx,
+                    &session.session_id,
+                    definition,
+                    &report,
+                    duration_ms,
+                );
+                return Ok(game_instance::play_stats(ctx, instance_id)?.total_play_ms);
+            }
+        }
+
+        let ledger_tracked: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM launch_history
+                      WHERE instance_id = ?1 AND session_id IS NOT NULL
+                 )",
+                [instance_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        drop(conn);
+        if ledger_tracked {
+            return Ok(game_instance::play_stats(ctx, instance_id)?.total_play_ms);
+        }
+    }
+    Ok(game_instance::record_play_time(ctx, instance_id, started_at)?.total_play_ms)
+}
+
+/// End the game Agora started for this instance, then run the normal session end.
+///
+/// Prefers the platform-independent session ledger (Linux overlay/wrap sessions, ledger-only
+/// launches), then falls back to the user-files journal.
+pub fn stop(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+) -> Result<StopOutcome, InstanceError> {
+    let conn = crate::db::local_state_connection(&ctx.paths.local_state_db())
+        .map_err(|error| InstanceError::Other(error.to_string()))?;
+    let open = crate::session_ledger::open_sessions_for_instance(&conn, instance_id)
+        .map_err(|error| InstanceError::Other(error.to_string()))?;
+    drop(conn);
+
+    let journal_running =
+        has_running_journal_session(ctx, instance_id, definition).unwrap_or(false);
+    if !journal_running {
+        for session in &open {
+            if let Some(outcome) = stop_ledger_session(ctx, instance_id, definition, session)? {
+                return Ok(outcome);
+            }
+        }
+    }
+
+    match stop_journal_session(ctx, instance_id, definition) {
+        Ok(outcome) => Ok(outcome),
+        Err(InstanceError::NothingRunning(_)) if !journal_running => {
+            for session in &open {
+                if let Some(outcome) = stop_ledger_session(ctx, instance_id, definition, session)? {
+                    return Ok(outcome);
+                }
+            }
+            Err(InstanceError::NothingRunning(instance_id.to_string()))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn has_running_journal_session(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+) -> Result<bool, InstanceError> {
+    let record = game_instance::get(ctx, instance_id)?
+        .ok_or_else(|| InstanceError::NotFound(instance_id.to_string()))?;
+    let manifest = game_instance::get_manifest(ctx, instance_id)?;
+    let Some(store) = game_instance::session_store(&record.base, &manifest) else {
+        return Ok(false);
+    };
+    let Some(details) = game_user_files::details(ctx, &definition.id, &store)? else {
+        return Ok(false);
+    };
+    Ok(details.instance == instance_id && details.running)
+}
+
+fn stop_ledger_session(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    session: &crate::session_ledger::OpenSession,
+) -> Result<Option<StopOutcome>, InstanceError> {
+    let Some(identity) = &session.game_process else {
+        return Ok(None);
+    };
+    if ctx.process_check(identity) == ProcessCheck::Gone {
+        return Ok(None);
+    }
+    let jobs: Vec<&str> = identity.job.as_deref().into_iter().collect();
+    let mut processes_ended = 0;
+    for job in &jobs {
+        processes_ended += process_job::terminate(job).map_err(InstanceError::Other)?;
+    }
+    let roots = [identity];
+    processes_ended += process_identity::terminate_tree(&roots);
+    if processes_ended == 0 {
+        return Err(InstanceError::NotStartedByAgora(instance_id.to_string()));
+    }
+    crate::session_ledger::record_stop(ctx, instance_id);
+    wait_until_gone(&roots, &jobs, STOP_TIMEOUT)?;
+    let ended = end_session_if_journal(ctx, instance_id, definition)?;
+    let play_time_ms = if let Some(end) = ended {
+        end.play_time_ms
+    } else {
+        finish_ledger_session_playtime(
+            ctx,
+            instance_id,
+            definition,
+            &session.session_id,
+            &session.started_at,
+        )?
+    };
+    Ok(Some(StopOutcome {
+        instance_id: instance_id.to_string(),
+        processes_ended,
+        play_time_ms,
+    }))
+}
+
+fn end_session_if_journal(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+) -> Result<Option<SessionEnd>, InstanceError> {
+    let record = game_instance::get(ctx, instance_id)?
+        .ok_or_else(|| InstanceError::NotFound(instance_id.to_string()))?;
+    let manifest = game_instance::get_manifest(ctx, instance_id)?;
+    let Some(store) = game_instance::session_store(&record.base, &manifest) else {
+        return Ok(None);
+    };
+    let Some(details) = game_user_files::details(ctx, &definition.id, &store)? else {
+        return Ok(None);
+    };
+    if details.instance != instance_id || !details.running {
+        return Ok(None);
+    }
+    end_session_once_gone(STOP_TIMEOUT, || end_session(ctx, definition, &store))
+}
+
+fn finish_ledger_session_playtime(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    session_id: &str,
+    started_at: &str,
+) -> Result<i64, InstanceError> {
+    let now = chrono::DateTime::<chrono::Utc>::from(ctx.clock.now());
+    let duration_ms = chrono::DateTime::parse_from_rfc3339(started_at)
+        .map(|started| {
+            (now - started.with_timezone(&chrono::Utc))
+                .num_milliseconds()
+                .max(0)
+        })
+        .unwrap_or(0);
+    let report = crate::game_launch::SessionExitReport {
+        processes: Vec::new(),
+        relaunched_outside: false,
+        exit: agora_game_api::crash::ExitObservation::unavailable("the session was stopped"),
+        game_runtime_ms: Some(u64::try_from(duration_ms).unwrap_or(0)),
+    };
+    let _ = crate::session_ledger::record_end(ctx, session_id, definition, &report, duration_ms);
+    Ok(game_instance::play_stats(ctx, instance_id)?.total_play_ms)
+}
+
+fn stop_journal_session(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+) -> Result<StopOutcome, InstanceError> {
+    let record = game_instance::get(ctx, instance_id)?
+        .ok_or_else(|| InstanceError::NotFound(instance_id.to_string()))?;
+    let manifest = game_instance::get_manifest(ctx, instance_id)?;
+    let store = game_instance::session_store(&record.base, &manifest)
+        .ok_or_else(|| InstanceError::NothingRunning(instance_id.to_string()))?;
+
+    let details = game_user_files::details(ctx, &definition.id, &store)?
+        .ok_or_else(|| InstanceError::NothingRunning(instance_id.to_string()))?;
+    if details.instance != instance_id || !details.running {
+        return Err(InstanceError::NothingRunning(instance_id.to_string()));
+    }
+
+    let jobs: Vec<&str> = details
+        .processes
+        .iter()
+        .filter_map(|identity| identity.job.as_deref())
+        .collect();
+    let in_jobs: usize = jobs.iter().map(|job| process_job::active(job)).sum();
+    // A process whose liveness cannot be checked may still be running, so it counts here: the
+    // refusal this guards says "Agora did not start this", which a failed lookup cannot support.
+    let alive: Vec<&ProcessIdentity> = details
+        .processes
+        .iter()
+        .filter(|identity| !matches!(process_identity::check(identity), ProcessCheck::Gone))
+        .collect();
+    if in_jobs == 0 && alive.is_empty() {
+        return Err(InstanceError::NotStartedByAgora(instance_id.to_string()));
+    }
+
+    crate::session_ledger::record_stop(ctx, instance_id);
+
+    let mut processes_ended = 0;
+    for job in &jobs {
+        processes_ended += process_job::terminate(job).map_err(InstanceError::Other)?;
+    }
+    processes_ended += process_identity::terminate_tree(&alive);
+    wait_until_gone(&alive, &jobs, STOP_TIMEOUT)?;
+
+    let ended = end_session_once_gone(STOP_TIMEOUT, || end_session(ctx, definition, &store))?;
+    let play_time_ms = match ended {
+        Some(end) => {
+            if end.instance_id != instance_id {
+                return Err(InstanceError::Other(format!(
+                    "the session that ended belonged to '{}', not '{instance_id}'",
+                    end.instance_id
+                )));
+            }
+            end.play_time_ms
+        }
+        None => game_instance::play_stats(ctx, instance_id)?.total_play_ms,
+    };
+    Ok(StopOutcome {
+        instance_id: instance_id.to_string(),
+        processes_ended,
+        play_time_ms,
+    })
+}
+
+/// Run the session end, retrying while the ended game is still leaving the process table. A job
+/// counts as empty a moment before Windows stops listing its processes, and restoring refuses
+/// while any process runs from the game folder, so a successful Stop could otherwise report that
+/// it failed. A process that really stays still gets the refusal once the time is up.
+fn end_session_once_gone<T>(
+    timeout: Duration,
+    mut end: impl FnMut() -> Result<T, InstanceError>,
+) -> Result<T, InstanceError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match end() {
+            Err(InstanceError::UserFiles(
+                game_user_files::UserFilesError::CannotRestoreRunning { .. },
+            )) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            other => return other,
+        }
+    }
+}
+
+/// Wait until none of the given identities matches a live process, or the timeout expires.
+fn wait_until_gone(
+    roots: &[&ProcessIdentity],
+    jobs: &[&str],
+    timeout: Duration,
+) -> Result<(), InstanceError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        // Only a process proven gone counts as ended: one that cannot be checked may still be
+        // running, so the wait goes on until the deadline (and says so). The same holds for a job
+        // whose members could not be counted: a job query that failed is not an empty job.
+        if roots
+            .iter()
+            .all(|identity| process_identity::check(identity) == ProcessCheck::Gone)
+            && jobs.iter().all(|job| {
+                process_job::members(job)
+                    .map(|count| count == 0)
+                    .unwrap_or(false)
+            })
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(InstanceError::Other(
+                "The game did not close after being asked to stop. Close it yourself, then try again."
+                    .into(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+
+    fn still_running() -> InstanceError {
+        InstanceError::UserFiles(game_user_files::UserFilesError::CannotRestoreRunning {
+            instance: "test".into(),
+        })
+    }
+
+    #[test]
+    fn a_stop_waits_for_the_ended_game_to_leave_the_process_table() {
+        let mut attempts = 0;
+        let result = end_session_once_gone(Duration::from_secs(5), || {
+            attempts += 1;
+            if attempts < 3 {
+                Err(still_running())
+            } else {
+                Ok(attempts)
+            }
+        });
+        assert_eq!(result.unwrap(), 3);
+    }
+
+    #[test]
+    fn a_process_that_stays_still_gets_the_refusal() {
+        let result: Result<(), _> =
+            end_session_once_gone(Duration::from_millis(120), || Err(still_running()));
+        assert!(matches!(
+            result,
+            Err(InstanceError::UserFiles(
+                game_user_files::UserFilesError::CannotRestoreRunning { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn any_other_failure_is_not_retried() {
+        let mut attempts = 0;
+        let result: Result<(), _> = end_session_once_gone(Duration::from_secs(5), || {
+            attempts += 1;
+            Err(InstanceError::Other("broken".into()))
+        });
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
+    }
+}

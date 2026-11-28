@@ -40,11 +40,11 @@ pub enum LinkOutcome {
     MigratedThenLinked { moved: usize },
 }
 
-/// Whether `path` is already a link (junction, symlink, or other reparse point).
+/// Whether `path` is already a link (a junction, a symbolic link or a mount point), from the game
+/// contract's rule. A cloud placeholder or a deduplicated file is an ordinary file, so it is not
+/// already linked.
 pub fn is_link(path: &Path) -> bool {
-    fs::symlink_metadata(path)
-        .map(|metadata| metadata.file_type().is_symlink())
-        .unwrap_or(false)
+    agora_game_api::redirects_a_name(path)
 }
 
 #[cfg(windows)]

@@ -1,0 +1,47 @@
+
+# cargo-vet audits file
+
+[[audits.keyvalues-parser]]
+who = "Oliver Hamlet <git@ortham.net>"
+criteria = "safe-to-deploy"
+delta = "0.2.0 -> 0.2.1"
+
+[[audits.rust-ini]]
+who = "Oliver Hamlet <git@ortham.net>"
+criteria = "safe-to-deploy"
+delta = "0.21.1 -> 0.21.3"
+
+[[trusted.esplugin]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:Ortham/esplugin"
+start = "2025-09-29"
+end = "2027-01-19"
+notes = "This is my own crate, published from my own Git repo using Trusted Publishing."
+
+[[trusted.libc]]
+criteria = "safe-to-deploy"
+user-id = 55123 # rust-lang-owner
+start = "2024-08-15"
+end = "2026-09-28"
+notes = "rust-lang-owner is a bot run by the Rust Infrastructure Team, so libc is hopefully as trustworthy as the Rust toolchain."
+
+[[trusted.windows-link]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2024-07-17"
+end = "2026-09-28"
+notes = "kennykerr is on the Windows team at Microsoft."
+
+[[trusted.windows-result]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2024-02-02"
+end = "2026-09-28"
+notes = "kennykerr is on the Windows team at Microsoft."
+
+[[trusted.windows-sys]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2021-11-15"
+end = "2026-09-28"
+notes = "kennykerr is on the Windows team at Microsoft."

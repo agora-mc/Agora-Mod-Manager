@@ -84,10 +84,12 @@ impl PluginProvider {
     }
 
     fn plugin_error(&self, error: PluginError) -> LauncherError {
-        LauncherError::Generic {
-            code: format!("ERR_PROVIDER_{:?}", error.code).to_uppercase(),
-            message: format!("{}: {}", self.contribution.title, error.message),
-        }
+        // The code is a declared one per plugin error kind, so a provider's
+        // failure carries a code the UI and the registry both know.
+        LauncherError::generic(
+            crate::error_code::ErrorCode::for_provider_error(error.code),
+            format!("{}: {}", self.contribution.title, error.message),
+        )
     }
 
     fn checked(&self, result: agora_plugin_api::error::PluginResult<()>) -> LauncherResult<()> {

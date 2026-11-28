@@ -28,6 +28,7 @@ function datapackRow(worldSync: InstalledContentRow['world_sync']): InstalledCon
     loader_mod_id: null,
     size_bytes: 1024,
     file_present: true,
+    file_state: 'ok',
     resolved_path: '/datapacks/veinminer-1.3.4.zip',
     author: 'Author',
     categories: [],

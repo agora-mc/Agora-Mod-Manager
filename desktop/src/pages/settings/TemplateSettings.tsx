@@ -109,6 +109,7 @@ export function TemplateSettings() {
 
   return (
     <SettingsSection
+      card="template-settings"
       icon={FileStack}
       title="Instance templates"
       description="Saved config files and Java settings that new instances can start from. Capture one from an instance's Templates tab."

@@ -28,7 +28,8 @@ export type SortColumn =
   | 'enabled'
   | 'filename'
   | 'agora_score'
-  | 'modrinth_downloads';
+  | 'modrinth_downloads'
+  | 'load_order';
 
 export interface SortState {
   column: SortColumn;
@@ -55,6 +56,29 @@ export interface ContentFilters {
   enabled: 'all' | 'enabled' | 'disabled' | 'missing';
 }
 
+/**
+ * Optional load-order mode. Minecraft does not use it; a game instance's Content tab does. The
+ * panel shows each row's true position and asks the caller to perform a move through the same
+ * core call the old Move up / Move down buttons used.
+ */
+export interface LoadOrderConfig {
+  /** The row's true 1-based load-order position (1 is the first row and lowest priority). */
+  positionForRow: (row: InstalledContentRow) => number;
+  /** Move the row to a 1-based position. Rejecting shows the error and keeps the true order. */
+  onMove: (row: InstalledContentRow, position: number) => Promise<boolean | void>;
+}
+
+/** Which of the panel's controls a caller's data can actually answer. */
+export interface ContentPanelFeatures {
+  categories?: boolean;
+  curation?: boolean;
+  source?: boolean;
+  enabled?: boolean;
+  /** Whether the enabled filter can offer "Missing file". Defaults to true. */
+  missingFiles?: boolean;
+  group?: boolean;
+}
+
 export interface InstalledContentPanelProps {
   contentType: InstalledContentType;
   rows: InstalledContentRow[];
@@ -65,8 +89,39 @@ export interface InstalledContentPanelProps {
    * "unlock the instance".
    */
   lockedReason?: string | null;
-  onAdd: () => void;
-  addLabel: string;
+  onAdd?: () => void;
+  addLabel?: string;
+  /** Columns the caller's data can fill. Defaults to every Minecraft column. */
+  availableColumns?: ContentColumn[];
+  /** Column heading overrides, when the Minecraft label names something else. */
+  columnLabels?: Partial<Record<ContentColumn, string>>;
+  /** Columns selected when the user has no saved preference for this panel. */
+  defaultColumns?: ContentColumn[];
+  /** Filters the caller's data can answer. Every filter is on by default. */
+  availableFilters?: ContentPanelFeatures;
+  /** localStorage key for this panel's column and sort preferences. */
+  preferencesKey?: string;
+  /** Heading and description shown above the table, when the Minecraft wording is wrong. */
+  title?: string;
+  description?: string;
+  /** The noun used in counts and empty states ("mods", "content"). */
+  contentLabel?: string;
+  /** Replaces the built-in empty state. */
+  emptyState?: React.ReactNode;
+  /** A line under the row name, used when the row has no filename to show. */
+  rowSubtitle?: (row: InstalledContentRow) => string | null;
+  /** Label for the row action that reveals a row, when it is not a file. */
+  revealLabel?: string;
+  /** Whether a row can be revealed. Defaults to "when it has a resolved path". */
+  canRevealFile?: (row: InstalledContentRow) => boolean;
+  /** The row menu's Copy filename item. On by default. */
+  showCopyFilename?: boolean;
+  /** The test id for each content row. */
+  rowTestId?: string;
+  /** Load-order mode: positions, Move up/down and drag-and-drop. */
+  loadOrder?: LoadOrderConfig;
+  /** Extra items for a row's More actions menu, such as running a tool on that item. */
+  extraRowMenuItems?: (row: InstalledContentRow) => React.ReactNode;
   onToggle: (row: InstalledContentRow) => Promise<boolean | void>;
   onBulkToggle: (rows: InstalledContentRow[], enabled: boolean) => Promise<boolean>;
   /**

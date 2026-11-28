@@ -66,7 +66,7 @@ beforeEach(() => {
       case 'list_snapshots':
       case 'list_capturable_template_files':
         return [];
-      case 'list_loadout_profiles': return profiles;
+      case 'list_loadout_profiles': return { profiles, damaged: [] };
       case 'create_loadout_profile': return undefined;
       case 'apply_loadout_profile': return undefined;
       case 'list_loadout_unlisted_mods':
@@ -82,6 +82,7 @@ beforeEach(() => {
 
 async function openLoadoutTab() {
   render(<PackInstallProvider><InstanceEditor instanceId="alpha" onBack={() => undefined} /></PackInstallProvider>);
+  fireEvent.click(await screen.findByRole('button', { name: 'Backups & Versions' }));
   fireEvent.click(await screen.findByRole('button', { name: 'Loadout Profiles' }));
   await screen.findByRole('button', { name: 'Create Profile' });
 }

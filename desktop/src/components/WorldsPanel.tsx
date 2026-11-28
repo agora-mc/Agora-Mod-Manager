@@ -20,6 +20,7 @@ import {
   type WorldInfo,
 } from '@/lib/tauri';
 import { useConfirm } from '@/components/ui/confirm';
+import { Switch } from '@/components/ui/switch';
 import { formatBytes } from '@/components/installed-content/contentTableState';
 import { formatDateTime } from '@/lib/utils';
 
@@ -155,16 +156,24 @@ export function WorldsPanel({
             takes it back when the game closes. The first instance switched on provides the shared copy; later ones take it on
             at their next launch.
           </p>
-          <label className="flex items-center gap-2 text-sm">
-            <input type="checkbox" className="h-4 w-4 accent-primary" disabled={busy || running} checked={sharing.options}
-              onChange={(e) => void run(() => onSetSharing(e.target.checked, sharing.servers))} />
-            Game settings: video, sound, controls and key bindings (options.txt; resource packs stay per instance)
-          </label>
-          <label className="flex items-center gap-2 text-sm">
-            <input type="checkbox" className="h-4 w-4 accent-primary" disabled={busy || running} checked={sharing.servers}
-              onChange={(e) => void run(() => onSetSharing(sharing.options, e.target.checked))} />
-            Server list
-          </label>
+          <div className="flex items-center justify-between gap-3 text-sm">
+            <span>Game settings: video, sound, controls and key bindings (options.txt; resource packs stay per instance)</span>
+            <Switch
+              aria-label="Share game settings"
+              disabled={busy || running}
+              checked={sharing.options}
+              onCheckedChange={(checked) => void run(() => onSetSharing(checked, sharing.servers))}
+            />
+          </div>
+          <div className="flex items-center justify-between gap-3 text-sm">
+            <span>Server list</span>
+            <Switch
+              aria-label="Server list"
+              disabled={busy || running}
+              checked={sharing.servers}
+              onCheckedChange={(checked) => void run(() => onSetSharing(sharing.options, checked))}
+            />
+          </div>
         </section>
       )}
       <section aria-labelledby="worlds-heading" className="space-y-3">

@@ -10,28 +10,35 @@ Reference for which code belongs where.
 
 ## Ownership Rules
 
-### Core Layer (`agora-core`) — owns everything below
+### Core and game packages — own everything below
+
+`agora-core` is game-agnostic. Minecraft's behaviour lives in the `agora-game-minecraft` package,
+which core never references; the adapter registers it into the context's `GameRegistry` at startup
+(MASTER_SPEC §26.12). Where a row below names the Minecraft package, a second game supplies its own
+equivalent.
 
 | Domain | Owner | Notes |
 |---|---|---|
 | AppPaths / data layout | `agora-core` | Path derivation for runtimes, instances, cache, receipts |
 | Database access (all SQLite) | `agora-core` | Both `registry.db` (the catalog) and `local_state.db`; parameterized queries only |
-| Catalogs (runtime, modrinth, etc.) | `agora-core` | Typed catalog sources; search, version resolution |
-| LaunchService (spawn + orchestrate) | `agora-core` | Includes process spawning, process identity verification, exit classification, PID tracking. The adapter provides only the raw `std::process::Command` or equivalent handle — core owns the lifecycle |
-| InstallService (resolve + stage + apply) | `agora-core` | The full install pipeline: `InstallIntent` → `ResolvedInstallPlan` → verified staging → atomic apply → health rollback |
-| Dependency resolution | `agora-core` | Required/optional/incompatible resolution; alias matching across sources |
-| Import / export / snapshot / clone | `agora-core` | mrpack, Prism, directory import; zip snapshots; instance clone |
-| Health / pre-launch checks | `agora-core` | JAR metadata parsing, version matching, incompatibility classification |
+| Catalogs (runtime, modrinth, etc.) | Signed registry: `agora-core`; Java runtime, loader and Modrinth catalogs: `agora-game-minecraft` | Typed catalog sources; search, version resolution |
+| LaunchService (spawn + orchestrate) | `agora-game-minecraft` | Includes process spawning, process identity verification, exit classification, PID tracking. The adapter provides only the raw `std::process::Command` or equivalent handle — core owns the lifecycle |
+| InstallService (resolve + stage + apply) | `agora-game-minecraft` | The full install pipeline: `InstallIntent` → `ResolvedInstallPlan` → verified staging → atomic apply → health rollback |
+| Dependency resolution | `agora-game-minecraft` (alias and version-range types in `agora-core`) | Required/optional/incompatible resolution; alias matching across sources |
+| Import / export / clone | `agora-game-minecraft`; snapshots in `agora-core` | mrpack, Prism, directory import; zip snapshots; instance clone |
+| Health / pre-launch checks | `agora-game-minecraft` | JAR metadata parsing, version matching, incompatibility classification |
 | Crash diagnostics | `agora-core` | Regex signature matching, scoring algorithm, telemetry recording |
-| Authentication (MSA + GitHub OAuth) | `agora-core` | Full device-flow chains; token storage via keyring or encrypted fallback |
+| Authentication (MSA + GitHub OAuth) | MSA: `agora-game-minecraft`; GitHub OAuth and the secret store: `agora-core` | Full device-flow chains; token storage via keyring or encrypted fallback |
 | Network policy / security policy | `agora-core` | Host allowlists, redirect validation, hash verification, rate limiting |
-| Java runtime operations | `agora-core` | Managed runtime catalog, download, extraction, validation, promotion |
-| Loader operations | `agora-core` | Loader manifest resolution, installer execution, profile adoption |
-| MCP dispatcher | `agora-core` | Tool routing, argument deserialization, approval policy, system context generation. Adapter provides only transport framing |
+| Java runtime operations | `agora-game-minecraft` | Managed runtime catalog, download, extraction, validation, promotion |
+| Loader operations | `agora-game-minecraft` | Loader manifest resolution, installer execution, profile adoption |
+| MCP dispatcher | `agora-game-minecraft` | Tool routing, argument deserialization, approval policy, system context generation. Adapter provides only transport framing |
 | Locks / operation state | `agora-core` | Per-instance mutex, catalog read-writer lock, operation state machine |
+| Startup crash recovery | `agora-core` (`startup_recovery::run_at_startup`) | The one pass over every crash journal (tool swaps, user-files sessions, Recently deleted, game packages via the registry hook). Every adapter calls it once at startup and only reports the result its own way; journals whose lock another live process holds are left alone and reported, never recovered underneath it |
+| One recovery decision | `agora-core` (`recovery`) | `decide` is the only way a journal becomes permission to act: it takes the journal's lock with no wait, reads and validates the envelope under it, checks the recorded writer's liveness, verifies what each owned path proves, and hands out a capability scoped to those paths. The capability re-checks each path's marker and OS identity (volume + file id, device + inode) immediately before it acts, so a folder swapped after the decision is refused, and its `restore` moves what it replaces to a named sibling instead of deleting it. A handler that acts on a journal without a capability is a bug; the plugin install is the first journal on it, the rest move over one at a time (MASTER_SPEC §32.11). The same questions are answered read-only through `decide_readonly` and `recovery_report`, which is how `agora doctor` explains an unresolved journal without taking its lock, writing anything or getting anything to act with |
 | Process identity verification | `agora-core` | PID → executable path → start-time verification; os-identifier abstraction behind a core trait |
-| Controller support policy | `agora-core` | Whether to offer Controlify for an instance, which loaders it supports, and which instances the user declined. Gamepad *detection* is the Web Gamepad API and belongs to React — core never asks whether a pad is plugged in, only what to do about an instance |
-| Content providers | `agora-core` | Which providers exist (`providers::ProviderRegistry`), Browse orchestration across them (`providers::browse`), whether a provider's install plan is permitted (`providers::authorize_plan`), and installing it. Modrinth and Technic implement the same `ContentProvider` trait as plugin providers. Adapters build the registry and move data; React renders descriptors and never decides which providers exist |
+| Controller support policy | `agora-game-minecraft` | Whether to offer Controlify for an instance, which loaders it supports, and which instances the user declined. Gamepad *detection* is the Web Gamepad API and belongs to React — core never asks whether a pad is plugged in, only what to do about an instance |
+| Content providers | `agora-core` (registry, authorization); `agora-game-minecraft` (Modrinth, Technic, browse, install) | Which providers exist (`providers::ProviderRegistry`) and whether a provider's install plan is permitted (`providers::authorize_plan`) are core's; browsing them alongside the curated catalog and installing a plan are Minecraft's (`agora_game_minecraft::providers`). Modrinth and Technic implement the same `ContentProvider` trait as plugin providers and are registered as compiled-in providers. Adapters build the registry and move data; React renders descriptors and never decides which providers exist |
 | Plugin policy | `agora-core` | What is installed, what is enabled, which capabilities were granted, what order plugins activate in, which host method each call maps to, and what happens when a plugin misbehaves. Core does **not** own the script engine — see below |
 
 ### Plugin Layer — `agora-plugin-api` / `agora-plugin-host`
@@ -81,8 +88,21 @@ This ensures the core owns the **interface and policy** while the adapter provid
 | MCP HTTP from browser | **FORBIDDEN** | React must NOT call `localhost:39741` directly. All MCP operations go through the core dispatcher via Tauri IPC |
 | Rendering plugin views | React | A plugin returns a `ViewModel` — data, never markup — and React draws it with Agora's own components. There is deliberately no HTML string to hand to `dangerouslySetInnerHTML` |
 | Plugin themes | React | Applies the semantic tokens a theme declares. A theme names a token, never arbitrary CSS |
+| Asking whether a path is there | `agora-game-api` (`probe`) | `Present(kind)` / `Absent` / `CantTell`, never `exists()`. Only "not found" is absent; a link is reported as a link, and a probe result is never permission to write — mutations resolve their destination and keep its identity (MASTER_SPEC §32.13) |
+| May this process change an instance? | `agora-core` (`instance_runtime::may_mutate`) | One typed answer: `Yes(guard)`, `Busy` (the game, or another Agora operation holding the lock) or `CantTell` (an unreadable lease, session or store, an indeterminate launch, or a lock that could not be taken at all — `LockManager` says `Held` or `Unavailable`, so no caller infers "busy" from an error code). `InstanceGuard::for_mutation*` keep their codes for the UI. The override is `may_mutate_while_running`, which still takes the lock |
 
 ## Dependency Direction
+
+The game contract is in `agora-game-api`, below core and game packages. Core must not reference
+`agora-game-minecraft`; packages register into each context's `GameRegistry` through the contract. Until
+Phase 5, `agora-game-minecraft` may still use `agora-core` within a budget that only shrinks
+(`scripts/game_package_core_budget.json`). See [game API and manifest v3](game-api.md).
+
+Error-read-as-absent sites (`.exists()`, `.ok()`, `unwrap_or_default()` on a read) in recovery,
+trust, lease, garbage-collection and staging code are counted the same way, per file, in
+`scripts/fail_closed_read_budget.json`; adding one there fails the architecture check until the
+number is lowered somewhere else, and fixing one fails it until the lower number is written back
+(MASTER_SPEC §32.13).
 
 ```
 agora-plugin-api  ←  agora-core
@@ -108,7 +128,7 @@ agora-core        ←  MCP dispatcher (future agora serve or desktop adapter)
 ### ✅ Allowed — Core owns LaunchService including spawn
 
 ```rust
-// agora-core/src/launch_service.rs
+// agora-game-minecraft/src/launch_service.rs
 pub struct LaunchService {
     planner: LaunchPlanner,
     process_factory: Box<dyn ProcessFactory>,
@@ -266,7 +286,7 @@ MCP client (e.g., Claude Desktop)
                              │    LaunchService,     │
                              │    InstallService,    │
                              │    health, registry,  │
-                             │    crash_diagnostics  │
+                             │    crash engine       │
                              └──────────────────────┘
 ```
 

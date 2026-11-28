@@ -382,6 +382,11 @@ export interface InstalledMod {
   source_url?: string | null;
   version: string | null;
   sha256: string;
+  /**
+   * False when the source published no checksum, so Agora could not verify
+   * this file. Absent on records from before the field existed (those are true).
+   */
+  hash_verified?: boolean;
   installed_at: string;
   mod_jar_id?: string | null;
   enabled: boolean;
@@ -391,6 +396,10 @@ export interface InstalledMod {
   update_pinned?: boolean;
   /** True when Agora installed this only to satisfy another mod's dependency. */
   installed_as_dependency?: boolean;
+  /** The shared content store item this file was placed from. */
+  content_item_id?: string | null;
+  /** The SHA-256 of the stored object the file was placed from. */
+  object_sha256?: string | null;
 }
 
 export interface InstanceManifest {
@@ -451,6 +460,8 @@ export interface InstalledContentRow {
   loader_mod_id: string | null;
   size_bytes: number | null;
   file_present: boolean;
+  /** How the file compares with its manifest entry, or that Agora did not install it. */
+  file_state: 'ok' | 'missing' | 'modified' | 'unreadable' | 'untracked';
   resolved_path: string | null;
   author: string | null;
   categories: string[];
@@ -499,6 +510,15 @@ export interface LoaderVersionSummary {
 export interface DownloadSource {
   strategy: string;
   identifier: string;
+  /** Curator pins for exact release files of a github_release source. */
+  pins?: SourcePin[];
+}
+
+/** A curator's expected SHA-256 for one release file (`github_release` only). */
+export interface SourcePin {
+  tag: string;
+  asset: string;
+  sha256: string;
 }
 
 export interface RegistryItem {
@@ -509,7 +529,8 @@ export interface RegistryItem {
   /// prefer `downloadSourcesOf(item)` when the fallbacks matter.
   download_strategy: string;
   source_identifier: string;
-  sha256: string;
+  /** The manifest's sha256 when the entry states one; null otherwise. */
+  sha256: string | null;
   upvotes: number;
   downvotes: number;
   net_score: number;
@@ -601,13 +622,23 @@ export interface RegistryStatus {
   latest_tag: string | null;
   update_available: boolean;
   checked: boolean;
+  stale: boolean;
+  expires_at: string | null;
   message: string;
 }
 
 export interface ExtractionResult {
   extracted: string[];
   skipped: string[];
+  /** The same entries as `skipped`, each with the reason it was left out. */
+  left_out: LeftOutEntry[];
   total_bytes_written: number;
+}
+
+/** One entry a pack import did not write, and why. */
+export interface LeftOutEntry {
+  path: string;
+  reason: string;
 }
 
 export interface CreateInstanceRequest {
@@ -700,6 +731,47 @@ export const listInstanceContent = (instanceId: string, contentType?: string) =>
   });
 export const enrichInstanceContent = (instanceId: string) =>
   invoke<InstalledContentMetadata[]>('enrich_instance_content', { instanceId });
+
+/** How Minecraft content files are placed: shared hard links, or an owned copy per instance. */
+export type ContentPlacementMode = 'link' | 'copy';
+
+export interface ContentConversionSkip {
+  path: string;
+  reason: 'missing' | 'changed' | 'unsupported' | 'moved_aside';
+  movedTo?: string;
+}
+
+export interface ContentConversionSummary {
+  filesConverted: number;
+  filesAlready: number;
+  /** Space freed when turning sharing on, or additionally used when turning it off. */
+  bytes: number;
+  skipped: ContentConversionSkip[];
+}
+
+export interface ContentConversionPreview {
+  instances: number;
+  summary: ContentConversionSummary;
+  warnings: string[];
+}
+
+export interface ContentConversionFailure {
+  instanceId: string;
+  message: string;
+}
+
+export interface ContentConversionReport {
+  instances: number;
+  summary: ContentConversionSummary;
+  failures: ContentConversionFailure[];
+  warnings: string[];
+}
+
+export const getContentSharing = () => invoke<ContentPlacementMode>('get_content_sharing');
+export const previewContentSharingConversion = (share: boolean) =>
+  invoke<ContentConversionPreview>('preview_content_sharing_conversion', { share });
+export const setContentSharing = (share: boolean, convert: boolean) =>
+  invoke<ContentConversionReport | null>('set_content_sharing', { share, convert });
 export const createInstance = (request: CreateInstanceRequest) =>
   invoke<InstanceRow>('create_instance', { request });
 export const deleteInstance = (instanceId: string) =>
@@ -715,7 +787,9 @@ export interface RecentlyDeletedEntry {
   expires_at: string;
   size_bytes: number;
 }
-export interface RestoreOutcome {
+/** What restoring an instance from Recently deleted did: its row, and whether the name had to
+ *  change to avoid colliding with a live instance. */
+export interface RestoreDeletedInstanceOutcome {
   instance_id: string;
   original_instance_id: string;
   renamed: boolean;
@@ -723,7 +797,7 @@ export interface RestoreOutcome {
 export const listRecentlyDeleted = () =>
   invoke<RecentlyDeletedEntry[]>('list_recently_deleted');
 export const restoreDeletedInstance = (entryId: string) =>
-  invoke<RestoreOutcome>('restore_deleted_instance', { entryId });
+  invoke<RestoreDeletedInstanceOutcome>('restore_deleted_instance', { entryId });
 export const purgeDeletedInstance = (entryId: string) =>
   invoke<void>('purge_deleted_instance', { entryId });
 export const unlockInstance = (instanceId: string) =>
@@ -1201,8 +1275,24 @@ export interface ConnectivitySnapshot {
 }
 export const getConnectivityStatus = () =>
   invoke<ConnectivitySnapshot>('get_connectivity_status');
-export const extractOverrides = (zipPath: string, instanceId: string) =>
-  invoke<ExtractionResult>('extract_overrides', { zipPath, instanceId });
+/**
+ * Extract a pack's overrides into an instance.
+ *
+ * An entry whose name a disk cannot hold (a Windows reserved name, a trailing dot or space, a case
+ * collision) stops the extraction by default, and the error names each one. Pass
+ * `withoutUnwritableNames` to write the usable entries instead: the entries left out come back in
+ * `leftOut`, so the screen can list them and the person who asked knows what they gave up.
+ */
+export const extractOverrides = (
+  zipPath: string,
+  instanceId: string,
+  withoutUnwritableNames = false,
+) =>
+  invoke<ExtractionResult>('extract_overrides', {
+    zipPath,
+    instanceId,
+    withoutUnwritableNames,
+  });
 
 export type ControlifyOfferDecision =
   | 'offer'
@@ -1261,19 +1351,6 @@ export const getAuthStatus = () => invoke<boolean>('get_auth_status');
 export const getGithubProfile = () =>
   invoke<GithubProfile | null>('get_github_profile');
 
-export interface CrashReportInfo {
-  filename: string;
-  modified_at: string;
-  size_bytes: number;
-}
-
-export interface CrashTriageResult {
-  matched: boolean;
-  signature_name: string | null;
-  solution_markdown: string | null;
-  action_button_json: string | null;
-}
-
 export type EvidenceSourceKind =
   | 'CrashReport'
   | 'LatestLog'
@@ -1297,6 +1374,14 @@ export interface CrashEvidenceSource {
   text: string;
 }
 
+export type CrashInvestigationVerdict =
+  | { kind: 'crashed'; how?: string }
+  | { kind: 'failed_to_start' }
+  | { kind: 'froze' }
+  | { kind: 'stopped' }
+  | { kind: 'normal' }
+  | { kind: 'closed_unknown' };
+
 export interface CrashInvestigation {
   evidence: {
     sources: CrashEvidenceSource[];
@@ -1306,24 +1391,15 @@ export interface CrashInvestigation {
     any_stale: boolean;
     failure_category: 'CrashReport' | 'Oom' | 'JvmFatal' | 'NoEvidence';
   };
-  fingerprint: CrashFingerprint | null;
-  triage: CrashTriageResult;
   suspects: SuspectScore[];
   failure_category: 'CrashReport' | 'Oom' | 'JvmFatal' | 'NoEvidence';
+  /** The live verdict for the newest session. A crash the live path stored stays a crash here,
+   * even when its only evidence is a supplementary log (a JVM that refused to start, say). */
+  verdict?: CrashInvestigationVerdict | null;
 }
 
-export const checkInstanceCrash = (instanceId: string) =>
-  invoke<CrashReportInfo | null>('check_instance_crash', { instanceId });
-export const triageCrashReport = (instanceId: string, filename: string) =>
-  invoke<CrashTriageResult>('triage_crash_report', { instanceId, filename });
-export const listCrashReports = (instanceId: string) =>
-  invoke<CrashReportInfo[]>('list_crash_reports_cmd', { instanceId });
-export const readCrashLog = (instanceId: string, filename: string) =>
-  invoke<string>('read_crash_log_cmd', { instanceId, filename });
 export const investigateInstanceEvidence = (instanceId: string) =>
   invoke<CrashInvestigation>('investigate_instance_evidence', { instanceId });
-export const pickAndInvestigateCrashEvidence = (instanceId: string) =>
-  invoke<CrashInvestigation | null>('pick_and_investigate_crash_evidence', { instanceId });
 
 export interface ModVersionCandidate {
   version: string;
@@ -1366,6 +1442,9 @@ export const disableInstanceMod = (instanceId: string, filename: string) =>
   invoke<void>('disable_instance_mod', { instanceId, filename });
 export const enableInstanceMod = (instanceId: string, filename: string) =>
   invoke<void>('enable_instance_mod', { instanceId, filename });
+/** Add an item already in the shared content store to an instance, with no network. */
+export const minecraftAddStoredContent = (instanceId: string, itemId: string) =>
+  invoke<InstalledMod>('minecraft_add_stored_content', { instanceId, itemId });
 
 /** Choose which worlds a data pack goes to (`null` = all worlds) and sync now. */
 export const setDatapackWorlds = (instanceId: string, filename: string, worlds: string[] | null) =>
@@ -1657,13 +1736,17 @@ export interface AgoraPackEntry {
 }
 
 export type PackEntryStatus = 'installed' | 'failed' | 'needs_action';
-export type PackNeedsAction = 'enable_modrinth' | 'open_settings';
+export type PackNeedsAction = 'enable_modrinth' | 'open_settings' | 'confirm_hash';
 
 /** How one pack entry ended. Every entry gets exactly one. */
 export interface PackEntryOutcome {
   name: string;
   status: PackEntryStatus;
-  /** Installed only: the bytes matched the SHA-256 the pack pinned. */
+  /**
+   * Installed only: the bytes matched the SHA-256 the pack pinned. This is the
+   * pack vouching, not the source: when the source published no checksum the
+   * `reason` says the modpack's hash was the only check.
+   */
   verified_against_pack: boolean;
   /** Why it failed or what it needs; for an unverified install, the caveat. */
   reason: string | null;
@@ -1687,6 +1770,8 @@ export interface PackImportReport {
 export interface PackImportOutcome {
   instance_id: string;
   report: PackImportReport | null;
+  /** Non-fatal notes from the import itself. The import still succeeded. */
+  warnings: string[];
 }
 
 /** The instance block of an Agora pack file. */
@@ -1753,13 +1838,27 @@ export const importInstancePack = (
   reviewedSha256?: string | null,
   name?: string | null,
   skipUnfetchable = false,
+  installAnyway = false,
 ) =>
   invoke<PackImportOutcome>('import_instance_pack', {
     sourcePath,
     reviewedSha256: reviewedSha256 ?? null,
     name: name ?? null,
     skipUnfetchable,
+    installAnyway,
   });
+
+/** The code of the error a .mrpack import stops with when files fail the hashes the pack lists. */
+export const PACK_HASH_STOP_CODE = 'ERR_IMPORT_HASH_CONFIRMATION';
+
+/** The `code` of a Tauri error, when it has one. */
+export function errorCode(e: unknown): string | null {
+  if (e && typeof e === 'object') {
+    const code = (e as Record<string, unknown>).code;
+    if (typeof code === 'string') return code;
+  }
+  return null;
+}
 /** Drop the copy a .mrpack review staged (the review was cancelled). */
 export const discardPackReview = (sha256: string) =>
   invoke<void>('discard_pack_review', { sha256 });
@@ -1769,13 +1868,16 @@ export const planPackImport = (sourcePath: string) =>
 /**
  * Try needs-action entries again on the instance the import created.
  * `allowModrinthOnce` lets these entries use Modrinth without turning the
- * Modrinth setting on.
+ * Modrinth setting on. `installAnyway` installs the entries although they
+ * differ from the hash the modpack lists; only pass it for entries the user was
+ * shown a `confirm_hash` stop for. A hash the source published still applies.
  */
 export const retryPackImportEntries = (
   instanceId: string,
   entries: AgoraPackEntry[],
   allowModrinthOnce: boolean,
-) => invoke<PackImportReport>('retry_pack_import_entries', { instanceId, entries, allowModrinthOnce });
+  installAnyway: boolean,
+) => invoke<PackImportReport>('retry_pack_import_entries', { instanceId, entries, allowModrinthOnce, installAnyway });
 export const importModrinthPackByUrl = (downloadUrl: string, packIconUrl?: string | null) =>
   invoke<string>('import_modrinth_pack_by_url', {
     downloadUrl,
@@ -1952,8 +2054,11 @@ export const installTechnicZipPack = (
   loader: string,
   loaderVersion: string,
   instanceName?: string,
+  /** The user confirmed this unverified zip (see `withUnverifiedConsent`). */
+  allowUnverified = false,
 ) =>
   invoke<ImportResult>('install_technic_zip_pack', {
+    allowUnverified,
     name,
     downloadUrl,
     sha256,
@@ -2070,11 +2175,6 @@ export const listModReviews = (itemId: string) =>
 
 // --- Crash Investigation (guided isolation) ---
 
-export interface CrashFingerprint {
-  exception_class: string;
-  top_frames: string[];
-}
-
 export interface SuspectScore {
   mod_id: string;
   filename: string;
@@ -2087,22 +2187,16 @@ export interface SuspectScore {
 
 export type SuggestedAction =
   | { kind: 'GuidedDisable'; next_suspect: SuspectScore }
-  | { kind: 'ConfidenceAutoDisable'; mod_id: string; filename: string }
   | { kind: 'NoSuspects' };
 
 export interface InvestigationResult {
-  fingerprint: CrashFingerprint | null;
-  signature_name: string | null;
   suspects: SuspectScore[];
   suggested_action: SuggestedAction;
   ruled_out: string[];
 }
 
-export const investigateCrash = (instanceId: string, filename?: string) =>
-  invoke<InvestigationResult>('investigate_crash', { instanceId, filename });
-
-export const investigateManual = (instanceId: string, logText: string) =>
-  invoke<InvestigationResult>('investigate_manual', { instanceId, logText });
+export const investigateCrash = (instanceId: string) =>
+  invoke<InvestigationResult>('investigate_crash', { instanceId });
 
 export const disableModForTest = (instanceId: string, filename: string) =>
   invoke<void>('disable_mod_for_test', { instanceId, filename });
@@ -2110,21 +2204,20 @@ export const disableModForTest = (instanceId: string, filename: string) =>
 export const enableModForTest = (instanceId: string, filename: string) =>
   invoke<void>('enable_mod_for_test', { instanceId, filename });
 
-export const confirmCrashFix = (fingerprint: CrashFingerprint, modId: string) =>
-  invoke<void>('confirm_crash_fix', { fingerprint, modId });
+/** Record the user's confirmed fix under the crash bucket, so a later diagnosis of the same
+ * bucket gets boost-only local-memory evidence. */
+export const confirmCrashFix = (bucket: string, ownerKey: string) =>
+  invoke<void>('confirm_crash_fix', { bucket, ownerKey });
 
-export const reportStillCrashing = (
-  instanceId: string,
-  fingerprint: CrashFingerprint,
-  ruledOutModId: string,
-  crashLogText: string,
-) =>
+export const reportStillCrashing = (instanceId: string, ruledOutOwnerKey: string) =>
   invoke<InvestigationResult>('report_still_crashing', {
     instanceId,
-    fingerprint,
-    ruledOutModId,
-    crashLogText,
+    ruledOutOwnerKey,
   });
+
+/** The file an engine suspect provides, so the experiment flow can disable it. */
+export const resolveCrashSuspectFile = (instanceId: string, ownerKey: string) =>
+  invoke<string>('resolve_crash_suspect_file', { instanceId, ownerKey });
 
 // --- Dependency Plans (PREVIEW) ---
 
@@ -2262,7 +2355,8 @@ export const regenerateMCPToken = () => invoke<McpTokenData>('regenerate_mcp_tok
 export interface CrashReportContext {
   instance_id: string | null;
   crash_log: string | null;
-  crash_signatures: string | null;
+  /** The engine answer, rendered as text. */
+  answer: string | null;
   suspects: string | null;
 }
 
@@ -2385,6 +2479,30 @@ export const msaSwitchAccount = (uuid: string) =>
 export const msaRemoveAccount = (uuid: string) =>
   invoke<void>('msa_remove_account', { uuid });
 
+/** Whether the saved account list needs repair, and why. */
+export interface AccountStoreStatus {
+  needs_repair: boolean;
+  /** The corrupt file (or encrypted quarantine copy) that was kept. */
+  corrupt_file: string | null;
+  detected_at: string | null;
+  message: string | null;
+}
+export const msaAccountStoreStatus = () =>
+  invoke<AccountStoreStatus>('msa_account_store_status');
+
+/** What a repair recovered and what it could not. */
+export interface AccountRepairReport {
+  repaired: boolean;
+  accounts: MsaAccountSummary[];
+  /** Entries still listed but whose credential could not be read. */
+  unresolved: string[];
+  notes: string[];
+  /** Every corrupt file kept aside; repair never deletes them. */
+  corrupt_files: string[];
+}
+export const msaRepairAccounts = () =>
+  invoke<AccountRepairReport>('msa_repair_accounts');
+
 export const computeGcArgs = (
   javaVersion: number,
   requestedHeapMb: number,
@@ -2417,6 +2535,8 @@ export interface Snapshot {
   is_lkg: boolean;
   is_current_lkg: boolean;
   is_pre_restore: boolean;
+  /** Set when the snapshot was found on disk but its manifest cannot be read. */
+  unreadable?: string;
 }
 
 /** One item a profile records, with the on/off state it was saved in. */
@@ -2435,6 +2555,42 @@ export interface LoadoutCoverage {
   worlds: number;
 }
 
+export interface GameLoadoutContent {
+  item: string;
+  enabled: boolean;
+}
+
+export interface GameLoadoutPluginList {
+  list: string;
+  /** The instance copy's bytes; absent when the instance had none. */
+  contents?: number[] | null;
+}
+
+export interface GameLoadoutIni {
+  file: string;
+  /** The instance copy's bytes; absent when the instance used the shared file. */
+  contents?: number[] | null;
+}
+
+export interface GameLoadoutRule {
+  item: string;
+  after: string;
+}
+
+export interface GameLoadoutRules {
+  list: string;
+  rules: GameLoadoutRule[];
+}
+
+/** The part of a game instance's setup a loadout records. */
+export interface GameLoadout {
+  content: GameLoadoutContent[];
+  plugin_lists: GameLoadoutPluginList[];
+  inis: GameLoadoutIni[];
+  rules: GameLoadoutRules[];
+  saves: 'shared' | 'own';
+}
+
 export interface LoadoutProfile {
   name: string;
   enabled_mods: string[];
@@ -2443,6 +2599,8 @@ export interface LoadoutProfile {
   covers?: LoadoutCoverage | null;
   /** Every item the profile records, on and off. Null for profiles saved before this. */
   items?: LoadoutItem[] | null;
+  /** Present on a game instance's profile; null or absent on a Minecraft one. */
+  game?: GameLoadout | null;
 }
 
 export interface ImportResult {
@@ -2480,6 +2638,12 @@ export interface ExportResult {
   removed_client_only: string[];
   server_jar_downloaded: boolean;
   start_scripts_created: boolean;
+  loader_downloaded: boolean;
+  loader_artifact: string | null;
+  world: string | null;
+  java_major: number | null;
+  eula_file_written: boolean;
+  notes: string[];
 }
 
 export const listSnapshots = (instanceId: string) =>
@@ -2505,10 +2669,21 @@ export interface RestoreOutcome {
   preservedRoots: string[];
   cleanupWarning?: string;
   preservedRecoveryDir?: string;
+  undoSnapshotId?: string;
+  /**
+   * What the person restoring should know about what it did, in words they can read. A folder the
+   * snapshot captured but the game no longer declares is restored anyway and named here, so it is
+   * never restored quietly.
+   */
+  notices?: string[];
 }
 
-export const restoreSnapshot = (instanceId: string, snapshotId: string) =>
-  invoke<RestoreOutcome>('restore_snapshot', { instanceId, snapshotId });
+export const restoreSnapshot = (
+  instanceId: string,
+  snapshotId: string,
+  force = false,
+) =>
+  invoke<RestoreOutcome>('restore_snapshot', { instanceId, snapshotId, force });
 
 /** One plain sentence describing what a restore covered, or null if it was a
  *  complete restore with nothing worth remarking on. */
@@ -2527,11 +2702,41 @@ export const describeRestoreCoverage = (outcome: RestoreOutcome): string | null 
   if (outcome.cleanupWarning) {
     notes.push(outcome.cleanupWarning);
   }
+  for (const notice of outcome.notices ?? []) {
+    notes.push(notice);
+  }
   return notes.length > 0 ? notes.join(' ') : null;
 };
 
+/**
+ * Serialized `content_store::collect::CollectOutcome` (MASTER_SPEC §32.8): what the collection a
+ * removal or a snapshot delete ran did with the objects nothing names any more.
+ */
+export interface CollectOutcome {
+  /** One line: what was reclaimed, or that nothing was and why. */
+  summary: string;
+  /** How many stored objects the collection freed. */
+  reclaimed: number;
+  /** Nothing at all was freed; `summary` says why. */
+  refused: boolean;
+}
+
+/**
+ * One sentence for a person from a collection's report: "Reclaimed 3 object(s).", or
+ * "Nothing was reclaimed: <why>." A report that is missing or blank says nothing at all rather than
+ * telling the person nothing happened.
+ */
+export const describeCollection = (
+  outcome: CollectOutcome | null | undefined,
+): string | null => {
+  const summary = outcome?.summary?.trim();
+  if (!summary) return null;
+  const sentence = summary.charAt(0).toUpperCase() + summary.slice(1);
+  return sentence.endsWith('.') ? sentence : `${sentence}.`;
+};
+
 export const deleteSnapshot = (instanceId: string, snapshotId: string) =>
-  invoke<void>('delete_snapshot', { instanceId, snapshotId });
+  invoke<CollectOutcome>('delete_snapshot', { instanceId, snapshotId });
 
 /** Serialized `template_service::TemplateJvm`. Every field is optional; `null`
  *  means "leave the instance's own value alone". */
@@ -2576,13 +2781,36 @@ export interface CapturableFile {
  * Point it at a folder Dropbox or OneDrive already syncs and backups go offsite
  * with no service behind them.
  */
-export const exportBackup = (instanceId: string, snapshotId: string, exportDir: string) =>
-  invoke<string>('export_backup', { instanceId, snapshotId, exportDir });
+export const exportBackup = (
+  instanceId: string,
+  snapshotId: string,
+  exportDir: string,
+  withBytes = false,
+) => invoke<string>('export_backup', { instanceId, snapshotId, exportDir, withBytes });
+
+/** The bytes a game backup's mod objects would add, so the cost is shown first. */
+export const gameBackupBytes = (instanceId: string, snapshotId: string) =>
+  invoke<number>('game_backup_bytes', { instanceId, snapshotId });
 
 /** Read a backup artifact back into an instance. Fully validated before it
  *  touches the instance directory — the file is untrusted input. */
-export const importBackup = (instanceId: string, artifactPath: string) =>
-  invoke<Snapshot>('import_backup', { instanceId, artifactPath });
+export const importBackup = (
+  instanceId: string,
+  artifactPath: string,
+  fetchMissing = false,
+) => invoke<Snapshot>('import_backup', { instanceId, artifactPath, fetchMissing });
+
+export interface BackupImportPreview {
+  snapshotId: string;
+  missingItems: string[];
+  missingObjects: number;
+  missingBytes: number;
+  totalItems: number;
+}
+
+/** The content a backup needs before it can be applied, read without downloading. */
+export const previewBackupImport = (instanceId: string, artifactPath: string) =>
+  invoke<BackupImportPreview>('preview_backup_import', { instanceId, artifactPath });
 
 /** Apply a retention policy; resolves to the snapshot ids that were removed. */
 export const applyBackupRetention = (
@@ -3024,8 +3252,15 @@ export interface TemplateApplyOutcome {
 export const applyInstanceTemplate = (instanceId: string, templateId: string) =>
   invoke<TemplateApplyOutcome>('apply_instance_template', { instanceId, templateId });
 
+/** The loadouts an instance has, and the records that could not be read. */
+export interface LoadoutListing {
+  profiles: LoadoutProfile[];
+  /** One line per record that could not be read, naming the file and what is wrong with it. */
+  damaged: string[];
+}
+
 export const listLoadoutProfiles = (instanceId: string) =>
-  invoke<LoadoutProfile[]>('list_loadout_profiles', { instanceId });
+  invoke<LoadoutListing>('list_loadout_profiles', { instanceId });
 
 export const createLoadoutProfile = (instanceId: string, name: string) =>
   invoke<LoadoutProfile>('create_loadout_profile', { instanceId, name });
@@ -3092,8 +3327,18 @@ export const detectLaunchers = () =>
 export const cloneInstance = (instanceId: string, newName: string, prefs: ClonePrefs) =>
   invoke<string>('clone_instance_cmd', { instanceId, newName, prefs });
 
-export const exportServerEnvironment = (instanceId: string, destPath: string) =>
-  invoke<ExportResult>('export_server_environment', { instanceId, destPath });
+export const exportServerEnvironment = (
+  instanceId: string,
+  destPath: string,
+  world: string | null = null,
+  allowUnverifiedLoader = false,
+) =>
+  invoke<ExportResult>('export_server_environment', {
+    instanceId,
+    destPath,
+    world,
+    allowUnverifiedLoader,
+  });
 
 // ---------------------------------------------------------------------------
 // Phase 8: Pack install
@@ -3327,7 +3572,7 @@ export interface ProviderPlanPreview {
   fileCount: number;
   /** Reduced assurance (undeclared host, plain HTTP, MD5/SHA-1): warn, may continue. */
   warnings: ProviderSecurityNote[];
-  /** No integrity information at all: installs only with low security downloads on. */
+  /** No integrity information at all: installs after the user confirms, or always with low security downloads on. */
   lowSecurity: ProviderSecurityNote[];
   lowSecurityAllowed: boolean;
   /** Pack files outside the usual content folders: install only with reduced security mode on. */
@@ -3395,16 +3640,36 @@ export const providerInstallPreview = (
     loader: loader ?? null,
   });
 
-export const providerInstallPack = (itemId: string, versionId?: string, instanceName?: string) =>
-  invoke<ImportResult>('provider_install_pack', { itemId, versionId: versionId ?? null, instanceName: instanceName ?? null });
+export const providerInstallPack = (
+  itemId: string,
+  versionId?: string,
+  instanceName?: string,
+  allowUnverified = false,
+) =>
+  invoke<ImportResult>('provider_install_pack', {
+    itemId,
+    versionId: versionId ?? null,
+    instanceName: instanceName ?? null,
+    allowUnverified,
+  });
 
 /**
  * Install a catalog entry that pins one version of a provider's pack.
  * Fails with `ERR_PROVIDER_PACK_CHANGED` when the source now serves something
  * other than what was reviewed; `acceptChanged` is the user's answer to that.
  */
-export const installCatalogProviderPack = (itemId: string, acceptChanged: boolean, instanceName?: string) =>
-  invoke<ImportResult>('install_catalog_provider_pack', { itemId, acceptChanged, instanceName: instanceName ?? null });
+export const installCatalogProviderPack = (
+  itemId: string,
+  acceptChanged: boolean,
+  instanceName?: string,
+  allowUnverified = false,
+) =>
+  invoke<ImportResult>('install_catalog_provider_pack', {
+    itemId,
+    acceptChanged,
+    instanceName: instanceName ?? null,
+    allowUnverified,
+  });
 
 // --- Repair loader ---
 
@@ -3677,3 +3942,50 @@ export const setInstanceGroup = (instanceId: string, group: string | null) =>
 /** Set this instance's window size; null clears it so the global default applies. */
 export const setInstanceWindowSize = (instanceId: string, size: WindowSize | null) =>
   invoke<void>('set_instance_window_size', { instanceId, width: size?.width ?? null, height: size?.height ?? null });
+
+// ---------------------------------------------------------------------------
+// Views the CLI had first: `agora doctor`, `agora registry under-review|audit-log|resolutions`
+// ---------------------------------------------------------------------------
+
+/** The local database's health, as `agora doctor` reports it. */
+export interface LocalStateReport {
+  path: string;
+  integrity: 'ok' | 'corrupt' | 'missing' | 'unreadable';
+  integrityDetail: string;
+  schemaVersion: number | null;
+  supportedVersion: number;
+  databaseIsNewer: boolean;
+  /** Pre-migration backups, newest first. */
+  backups: string[];
+  backupsError: string | null;
+  backupsKept: number;
+  /** Files a recovery moved aside. */
+  keptAside: string[];
+  keptAsideError: string | null;
+  problems: boolean;
+}
+
+export const localStateReport = () => invoke<LocalStateReport>('local_state_report');
+
+/** A catalog item the community is reviewing. */
+export interface UnderReviewItem {
+  id: string;
+  name: string;
+  content_type: string;
+  icon_url: string | null;
+  net_score: number;
+}
+
+/** One catalog audit log entry: a compile run or a governance event. */
+export interface AuditLogEntry {
+  id: number;
+  timestamp: string;
+  action: string;
+  details: string | null;
+}
+
+export const registryUnderReview = () => invoke<UnderReviewItem[]>('registry_under_review');
+export const registryAuditLog = (limit?: number) =>
+  invoke<AuditLogEntry[]>('registry_audit_log', { limit: limit ?? null });
+export const registryResolutions = (limit?: number) =>
+  invoke<AuditLogEntry[]>('registry_resolutions', { limit: limit ?? null });

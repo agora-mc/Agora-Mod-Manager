@@ -20,7 +20,7 @@ foreach ($variable in @('AGORA_SIGNTOOL_PATH', 'AGORA_SIGNING_DLIB', 'AGORA_SIGN
 # Array arguments preserve paths with spaces and shell metacharacters. Tauri calls
 # this hook for the application and installers before producing updater signatures.
 & $env:AGORA_SIGNTOOL_PATH sign /v /fd SHA256 /td SHA256 `
-    /tr 'http://timestamp.acs.microsoft.com' /d 'Agora Launcher' `
+    /tr 'http://timestamp.acs.microsoft.com' /d 'Agora Mod Manager' `
     /dlib $env:AGORA_SIGNING_DLIB /dmdf $env:AGORA_SIGNING_METADATA $file.FullName
 if ($LASTEXITCODE -ne 0) { throw "Authenticode signing failed for $($file.Name) (exit $LASTEXITCODE)." }
 

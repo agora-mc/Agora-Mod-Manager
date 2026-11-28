@@ -26,6 +26,7 @@ import { InstallFlow } from '../components/InstallFlow';
 import { showToast } from '../components/Toast';
 import { useConfirm } from '@/components/ui/confirm';
 import { choosePackInstanceName } from '@/lib/packInstanceName';
+import { askUnverifiedInstall, withUnverifiedConsent } from '@/lib/unverifiedConsent';
 
 /**
  * Detail page for a project from any content provider that is not one of the
@@ -55,11 +56,25 @@ const https = (url: string | null | undefined) =>
 const outsideFolders = (preview: ProviderPlanPreview | null) =>
   preview?.outsideContentFolders ?? [];
 
-/** Whether this plan can be installed with the user's current settings. */
+/**
+ * Whether this plan cannot be installed with the user's current settings.
+ * Files with no integrity information do not block: installing them asks first.
+ */
 const blockedByLowSecurity = (preview: ProviderPlanPreview | null) =>
-  !!preview &&
-  ((preview.lowSecurity.length > 0 && !preview.lowSecurityAllowed) ||
-    (outsideFolders(preview).length > 0 && !preview.reducedSecurityEnabled));
+  !!preview && outsideFolders(preview).length > 0 && !preview.reducedSecurityEnabled;
+
+/** Whether installing this plan needs the user to confirm unverified files. */
+const needsUnverifiedConsent = (preview: ProviderPlanPreview | null) =>
+  !!preview && preview.lowSecurity.length > 0 && !preview.lowSecurityAllowed;
+
+/** The prompt's text: what is being accepted, file by file. */
+const unverifiedDetail = (preview: ProviderPlanPreview) =>
+  [
+    `${preview.lowSecurity.length === 1 ? 'One file has' : `${preview.lowSecurity.length} files have`} no integrity information, so Agora cannot tell whether ${preview.lowSecurity.length === 1 ? 'it was' : 'they were'} changed on the way. Install anyway only if you trust the source.`,
+    ...preview.lowSecurity
+      .slice(0, 5)
+      .map((note) => `• ${note.urlHost || 'unknown host'}: ${note.reason}`),
+  ].join('\n');
 
 function NoteList({ notes }: { notes: ProviderSecurityNote[] }) {
   return (
@@ -76,7 +91,8 @@ function NoteList({ notes }: { notes: ProviderSecurityNote[] }) {
 /**
  * What the user is agreeing to, in the same tiers Technic has always used:
  * reduced assurance is a warning they can continue past; no integrity
- * information at all needs *Allow low security downloads*.
+ * information at all asks for confirmation (or not, with *Allow low security
+ * downloads* on).
  */
 function IntegrityNote({ preview }: { preview: ProviderPlanPreview }) {
   const hosts = Object.entries(preview.hosts);
@@ -105,7 +121,8 @@ function IntegrityNote({ preview }: { preview: ProviderPlanPreview }) {
           <NoteList notes={preview.lowSecurity} />
           {!preview.lowSecurityAllowed && (
             <p className="mt-1 text-xs text-muted-foreground">
-              Turn on Allow low security downloads in Settings → Content sources to install it.
+              Agora will ask you to confirm before installing. Allow low security downloads in
+              Settings → Content sources stops it asking.
             </p>
           )}
         </div>
@@ -275,7 +292,11 @@ export function ProviderDetail({
 
   const installIntoInstance = async () => {
     if (!instance) return;
-    const warnings = warningBody(preview);
+    const allowUnverified = needsUnverifiedConsent(preview);
+    if (allowUnverified && preview && !await askUnverifiedInstall(confirm, unverifiedDetail(preview))) {
+      return;
+    }
+    const warnings = allowUnverified ? null : warningBody(preview);
     if (warnings && !await confirm({
       title: 'Install with reduced security?',
       body: warnings,
@@ -294,6 +315,7 @@ export function ProviderDetail({
       overrides: {
         allowReplace: false,
         skipHealthScan: false,
+        allowUnverified,
         forceConflictResolution: {},
       },
     });
@@ -302,7 +324,10 @@ export function ProviderDetail({
   const installPack = async () => {
     if (!detail || busy) return;
     const title = descriptor?.title ?? 'this provider';
-    const ok = await confirm({
+    const askedUnverified = needsUnverifiedConsent(preview);
+    const ok = askedUnverified && preview
+      ? await askUnverifiedInstall(confirm, unverifiedDetail(preview))
+      : await confirm({
       title: `Create a new instance from ${detail.project.title}?`,
       body: preview
         ? `${preview.fileCount} files from ${title}. ${
@@ -318,7 +343,15 @@ export function ProviderDetail({
     try {
       const instanceName = await choosePackInstanceName(prompt, detail.project.title);
       if (instanceName === null) return;
-      const result = await providerInstallPack(itemId, versionId || undefined, instanceName);
+      const result = await withUnverifiedConsent(confirm, (allowUnverified) =>
+        providerInstallPack(
+          itemId,
+          versionId || undefined,
+          instanceName,
+          allowUnverified || askedUnverified,
+        ),
+      );
+      if (!result) return;
       showToast(`Created ${result.name}.`, 'success');
       onOpenInstanceEditor?.(result.instance_id);
     } catch (e) {

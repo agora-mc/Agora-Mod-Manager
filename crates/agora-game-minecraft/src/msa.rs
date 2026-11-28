@@ -1,0 +1,3720 @@
+//! Microsoft Account (MSA) authentication for direct Minecraft launching.
+//!
+//! Agora authenticates through **its own Entra public-client application** using
+//! the OAuth 2.0 device authorization grant (RFC 8628) against the `consumers`
+//! authority, which is the tenant Microsoft requires for the `XboxLive.signin`
+//! scope. There is no client secret: a public client must not ship one, and the
+//! device-code grant does not need one.
+//!
+//! The flow (see `docs/architecture/layer-ownership.md` for who owns what):
+//!   1. Request a device code (`/devicecode`) — user code + verification URI.
+//!   2. Poll `/token` until the user approves, declines, or the code expires.
+//!   3. Xbox Live user token   (`user.auth.xboxlive.com`, `RpsTicket: d=<token>`)
+//!   4. XSTS token            (relying party `rp://api.minecraftservices.com/`)
+//!   5. Minecraft token       (`/authentication/login_with_xbox`, `identityToken`)
+//!   6. Entitlements          (`/entitlements/mcstore`, response body validated)
+//!   7. Java profile          (`/minecraft/profile`)
+//!
+//! This is a security-critical module. NO device code, token, or raw
+//! authentication response body is ever logged, returned across an adapter
+//! boundary, or persisted outside the OS keyring (+ aes-gcm fallback).
+//!
+//! Microsoft, Xbox and Minecraft tokens are deliberately kept distinct: only the
+//! *Minecraft* access token (with the expiry Minecraft itself returned) is
+//! handed to the game, and only the *Microsoft* refresh token is persisted for
+//! renewal.
+
+use agora_core::auth;
+use agora_core::db;
+use agora_core::error::{LauncherError, LauncherResult};
+use agora_core::http_client::{self, ClientCategory, HttpClients};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
+
+/// Check a network enable setting from the local state DB.
+///
+/// `db_path` is the path to `local_state.db`. The caller is responsible for
+/// providing the correct path (e.g. resolved from a Tauri `AppHandle` in the
+/// desktop app, or from `dirs::data_local_dir()` in the CLI).
+fn check_network_enabled(
+    db_path: &Path,
+    setting_key: &str,
+    disabled_msg: &str,
+) -> LauncherResult<()> {
+    if !db_path.exists() {
+        // DB hasn't been initialised yet — feature is enabled by default.
+        return Ok(());
+    }
+    let conn = db::local_state_connection(db_path).map_err(|e| LauncherError::Generic {
+        code: "ERR_DB".into(),
+        message: e.to_string(),
+    })?;
+    if !db::is_network_enabled(&conn, setting_key) {
+        return Err(LauncherError::Generic {
+            code: "ERR_NETWORK_DISABLED".into(),
+            message: disabled_msg.into(),
+        });
+    }
+    Ok(())
+}
+
+fn check_msa_network_enabled(db_path: &Path) -> LauncherResult<()> {
+    check_network_enabled(
+        db_path,
+        "network_msa_enabled",
+        "Microsoft account login is disabled in Privacy settings.",
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Agora's own Entra (Azure AD) public-client application ID.
+///
+/// Public by design — a public client has no secret, and the ID appears in every
+/// device-code request. There is deliberately no fallback to the official
+/// Minecraft launcher's client ID.
+pub const AGORA_MSA_CLIENT_ID: &str = "2dbd8051-d5dd-4611-bcae-b38400c1dc30";
+
+/// Version of the authentication flow that issued a stored credential.
+///
+/// Bumped when the client ID or the token chain changes in a way that makes
+/// previously stored refresh tokens unusable. Version 1 was the launcher-ID
+/// SISU/device-signing flow; version 2 is Agora's own device-code application.
+pub const MSA_AUTH_VERSION: u32 = 2;
+
+/// Xbox sign-in plus a refresh token for silent renewal.
+const MSA_SCOPE: &str = "XboxLive.signin offline_access";
+
+// The `consumers` authority: personal Microsoft accounts. `common` and tenant
+// authorities reject the XboxLive.signin scope.
+const DEVICE_CODE_URL: &str = "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode";
+const TOKEN_URL: &str = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token";
+const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+
+const XBL_AUTH_URL: &str = "https://user.auth.xboxlive.com/user/authenticate";
+const XSTS_AUTHORIZE_URL: &str = "https://xsts.auth.xboxlive.com/xsts/authorize";
+const MC_LOGIN_URL: &str = "https://api.minecraftservices.com/authentication/login_with_xbox";
+const MC_ENTITLEMENTS_URL: &str = "https://api.minecraftservices.com/entitlements/mcstore";
+const MC_PROFILE_URL: &str = "https://api.minecraftservices.com/minecraft/profile";
+
+const USER_AGENT: &str = "Agora Mod Manager";
+
+/// RFC 8628 default when the server omits `interval`.
+const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
+/// RFC 8628 says a `slow_down` adds 5 seconds to the interval.
+const SLOW_DOWN_INCREMENT_SECS: u64 = 5;
+/// Never poll faster than this, whatever the server says.
+const MIN_POLL_INTERVAL_SECS: u64 = 1;
+/// Upper bound so a hostile or broken `interval` cannot stall the flow forever.
+const MAX_POLL_INTERVAL_SECS: u64 = 60;
+
+/// Fallback when Minecraft omits `expires_in` (it normally returns 86400).
+const DEFAULT_MC_TOKEN_LIFETIME_SECS: u64 = 86_400;
+/// Upper bound on a Minecraft token lifetime we are willing to trust.
+const MAX_MC_TOKEN_LIFETIME_SECS: u64 = 7 * 86_400;
+
+/// Entitlement names that grant Minecraft: Java Edition.
+///
+/// `product_minecraft` + `game_minecraft` is a normal purchase; the Game Pass
+/// products cover subscription access. Bedrock-only entitlements
+/// (`*_minecraft_bedrock`) deliberately do not appear here.
+const JAVA_ENTITLEMENTS: &[&str] = &[
+    "product_minecraft",
+    "game_minecraft",
+    "product_game_pass_pc",
+    "product_game_pass_ultimate",
+];
+
+// Keyring storage
+const KEYRING_SERVICE: &str = "com.agoramc";
+const KEYRING_ACCOUNT: &str = "msa-credentials";
+const CREDENTIALS_FALLBACK_FILE: &str = "msa-credentials.enc";
+const CREDENTIALS_KEY_CONTEXT: &[u8] = b"agora-msa-credentials-fallback";
+
+/// Message shown when a credential from the pre-migration flow is found.
+pub const LEGACY_CREDENTIALS_MESSAGE: &str =
+    "Agora now signs in with its own Microsoft application, so your previous \
+     session cannot be renewed. Sign in once more to continue using direct \
+     launch — your instances and other accounts are untouched.";
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+/// Persisted Minecraft credentials stored in the OS keyring.
+///
+/// `access_token` is the **Minecraft** token (used to launch the game, expiring
+/// at `expires`); `refresh_token` is the **Microsoft** refresh token used to
+/// re-run the whole chain. The two are never interchanged.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct MsaCredentials {
+    pub username: String,
+    pub uuid: String,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires: DateTime<Utc>,
+    /// Entra application that issued `refresh_token`. Empty for pre-migration
+    /// credentials, which no other client ID can refresh.
+    #[serde(default)]
+    pub client_id: String,
+    /// Flow version that produced this credential; 0 for pre-migration.
+    #[serde(default)]
+    pub auth_version: u32,
+}
+
+impl std::fmt::Debug for MsaCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MsaCredentials")
+            .field("username", &self.username)
+            .field("uuid", &self.uuid)
+            .field("access_token", &"[REDACTED]")
+            .field("refresh_token", &"[REDACTED]")
+            .field("expires", &self.expires)
+            .field("client_id", &self.client_id)
+            .field("auth_version", &self.auth_version)
+            .finish()
+    }
+}
+
+impl MsaCredentials {
+    pub fn is_expired(&self) -> bool {
+        Utc::now() >= self.expires
+    }
+
+    pub fn needs_refresh(&self) -> bool {
+        // 5-minute margin
+        Utc::now() + chrono::Duration::minutes(5) >= self.expires
+    }
+
+    /// Whether this credential was issued by a different application than the
+    /// one Agora now authenticates with.
+    ///
+    /// Such a refresh token is only valid for the client that obtained it, so
+    /// attempting to renew it under the new application would fail with an
+    /// opaque `invalid_grant`. It requires an interactive sign-in instead.
+    pub fn needs_reauth(&self) -> bool {
+        self.auth_version < MSA_AUTH_VERSION || self.client_id != AGORA_MSA_CLIENT_ID
+    }
+}
+
+/// A pending device-code login.
+///
+/// The caller shows `user_code` and `verification_uri` to the user and polls
+/// with [`poll_login`]. The `device_code` itself stays private to this module —
+/// it is a bearer credential and never crosses an adapter boundary.
+#[derive(Clone)]
+pub struct MsaDeviceCodeFlow {
+    device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub expires_at: DateTime<Utc>,
+    pub interval_secs: u64,
+}
+
+impl std::fmt::Debug for MsaDeviceCodeFlow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MsaDeviceCodeFlow")
+            .field("device_code", &"[REDACTED]")
+            .field("user_code", &"[REDACTED]")
+            .field("verification_uri", &self.verification_uri)
+            .field("expires_at", &self.expires_at)
+            .field("interval_secs", &self.interval_secs)
+            .finish()
+    }
+}
+
+/// Cooperative cancellation for an in-flight [`poll_login`].
+#[derive(Clone, Debug, Default)]
+pub struct MsaLoginCancel(Arc<AtomicBool>);
+
+impl MsaLoginCancel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask the polling loop to stop. Takes effect within a second.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// Whether both handles control the same login.
+    ///
+    /// Lets an adapter tell "my sign-in finished" from "a newer sign-in
+    /// replaced mine", so a superseded attempt cannot clear the state of the
+    /// one that replaced it.
+    pub fn is_same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Error constructors — one place per user-visible authentication outcome
+// ---------------------------------------------------------------------------
+
+fn err(code: &str, message: impl Into<String>) -> LauncherError {
+    LauncherError::Generic {
+        code: code.into(),
+        message: message.into(),
+    }
+}
+
+fn login_cancelled() -> LauncherError {
+    err(
+        "ERR_MSA_LOGIN_CANCELLED",
+        "Microsoft sign-in was cancelled before it completed.",
+    )
+}
+
+fn login_expired() -> LauncherError {
+    err(
+        "ERR_MSA_LOGIN_EXPIRED",
+        "The sign-in code expired before it was entered. Start the sign-in again to get a new code.",
+    )
+}
+
+fn login_declined() -> LauncherError {
+    err(
+        "ERR_MSA_LOGIN_DECLINED",
+        "The sign-in request was declined in the browser.",
+    )
+}
+
+fn app_access_denied() -> LauncherError {
+    err(
+        "ERR_MSA_APP_ACCESS_DENIED",
+        "Microsoft refused this application's sign-in request. Agora's Microsoft \
+         application may not yet be approved for the Minecraft API.",
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Step 1: request a device code
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct DeviceCodeResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    expires_in: u64,
+    #[serde(default)]
+    interval: Option<u64>,
+}
+
+fn clamp_interval(interval: u64) -> u64 {
+    interval.clamp(MIN_POLL_INTERVAL_SECS, MAX_POLL_INTERVAL_SECS)
+}
+
+/// Begin the device-code login. Returns the user code and verification URI to
+/// display; nothing secret is included in the public fields.
+///
+/// `db_path` is the path to `local_state.db` — the caller must provide the
+/// correct path for the running binary (desktop app vs CLI).
+pub async fn begin_login(
+    clients: &HttpClients,
+    db_path: &Path,
+) -> LauncherResult<MsaDeviceCodeFlow> {
+    check_msa_network_enabled(db_path)?;
+
+    let response = http_client::checked_post_form(
+        clients,
+        ClientCategory::Microsoft,
+        DEVICE_CODE_URL,
+        &[("client_id", AGORA_MSA_CLIENT_ID), ("scope", MSA_SCOPE)],
+        &[("Accept".into(), "application/json".into())],
+    )
+    .await?;
+
+    let status = response.status();
+    let body = http_client::checked_response_text(response, ClientCategory::Microsoft)
+        .await
+        .unwrap_or_default();
+
+    if !status.is_success() {
+        if let Some(oauth_error) = oauth_error_code(&body) {
+            if is_app_access_error(&oauth_error) {
+                return Err(app_access_denied());
+            }
+        }
+        return Err(err(
+            "ERR_MSA_DEVICE_CODE_HTTP",
+            format!("Microsoft rejected the sign-in request (HTTP {status})."),
+        ));
+    }
+
+    let parsed: DeviceCodeResponse = serde_json::from_str(&body).map_err(|_| {
+        err(
+            "ERR_MSA_DEVICE_CODE_PARSE",
+            "Could not read Microsoft's sign-in response.",
+        )
+    })?;
+
+    Ok(MsaDeviceCodeFlow {
+        device_code: parsed.device_code,
+        user_code: parsed.user_code,
+        verification_uri: parsed.verification_uri,
+        expires_at: Utc::now() + chrono::Duration::seconds(parsed.expires_in as i64),
+        interval_secs: clamp_interval(parsed.interval.unwrap_or(DEFAULT_POLL_INTERVAL_SECS)),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Step 2: poll for the token
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub(crate) struct OAuthToken {
+    pub(crate) access_token: String,
+    pub(crate) refresh_token: String,
+}
+
+impl std::fmt::Debug for OAuthToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthToken")
+            .field("access_token", &"[REDACTED]")
+            .field("refresh_token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// One poll result, already classified. Carries no response body.
+#[derive(Debug)]
+pub(crate) enum DevicePoll {
+    Complete(OAuthToken),
+    /// User has not finished signing in yet.
+    Pending,
+    /// Server asked us to back off; the interval grows before the next attempt.
+    SlowDown,
+    Declined,
+    Expired,
+    /// Terminal failure; polling must stop.
+    Fatal(LauncherError),
+}
+
+/// Extract only the OAuth `error` slug. `error_description` is deliberately
+/// discarded: it is a raw authentication response field and can echo account
+/// details into logs and UI.
+fn oauth_error_code(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("error")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Errors that mean "this application may not sign this user in", as opposed to
+/// a problem with the user's own credentials.
+fn is_app_access_error(code: &str) -> bool {
+    matches!(
+        code,
+        "unauthorized_client" | "invalid_client" | "invalid_scope" | "access_denied"
+    )
+}
+
+/// Classify a `/token` response without retaining any of its body.
+pub(crate) fn classify_device_poll(status: reqwest::StatusCode, body: &str) -> DevicePoll {
+    if status.is_success() {
+        return match serde_json::from_str::<OAuthToken>(body) {
+            Ok(token) => DevicePoll::Complete(token),
+            Err(_) => DevicePoll::Fatal(err(
+                "ERR_MSA_TOKEN_PARSE",
+                "Could not read Microsoft's sign-in response.",
+            )),
+        };
+    }
+
+    match oauth_error_code(body).as_deref() {
+        Some("authorization_pending") => DevicePoll::Pending,
+        Some("slow_down") => DevicePoll::SlowDown,
+        Some("authorization_declined") => DevicePoll::Declined,
+        // `access_denied` on the device-code grant is the user declining in the
+        // browser; the application-access variants are reported at /devicecode.
+        Some("access_denied") => DevicePoll::Declined,
+        Some("expired_token") | Some("code_expired") => DevicePoll::Expired,
+        Some("bad_verification_code") => DevicePoll::Fatal(err(
+            "ERR_MSA_DEVICE_CODE_INVALID",
+            "Microsoft rejected this sign-in code. Start the sign-in again.",
+        )),
+        Some(code) if is_app_access_error(code) => DevicePoll::Fatal(app_access_denied()),
+        Some(code) => DevicePoll::Fatal(err(
+            "ERR_MSA_TOKEN_HTTP",
+            format!("Microsoft sign-in failed ({code})."),
+        )),
+        None if status.is_server_error() => DevicePoll::Pending,
+        None => DevicePoll::Fatal(err(
+            "ERR_MSA_TOKEN_HTTP",
+            format!("Microsoft sign-in failed (HTTP {status})."),
+        )),
+    }
+}
+
+/// Injectable seam for the polling loop so timing and outcomes are testable
+/// without a network or real clock.
+#[async_trait::async_trait]
+pub(crate) trait DeviceTokenPoller: Send + Sync {
+    async fn poll_once(&self) -> LauncherResult<DevicePoll>;
+    async fn sleep(&self, secs: u64);
+    fn now(&self) -> DateTime<Utc>;
+}
+
+/// A network error worth retrying while the device code is still alive.
+///
+/// Everything else — lockdown, a disabled endpoint, a missing gate, an HTTP
+/// policy refusal — is a decision, not a blip, so polling stops immediately
+/// rather than hammering an endpoint the user has switched off.
+fn is_transient_poll_error(error: &LauncherError) -> bool {
+    match error {
+        LauncherError::NetworkOffline | LauncherError::NetworkUnavailable { .. } => true,
+        LauncherError::Generic { code, .. } => code == "ERR_NETWORK",
+        _ => false,
+    }
+}
+
+/// The polling loop: respects the server interval, backs off on `slow_down`,
+/// stops on cancellation, expiry, denial, and terminal errors.
+pub(crate) async fn run_device_poll(
+    poller: &dyn DeviceTokenPoller,
+    interval_secs: u64,
+    expires_at: DateTime<Utc>,
+    cancel: &MsaLoginCancel,
+) -> LauncherResult<OAuthToken> {
+    let mut interval = clamp_interval(interval_secs);
+
+    loop {
+        if cancel.is_cancelled() {
+            return Err(login_cancelled());
+        }
+        if poller.now() >= expires_at {
+            return Err(login_expired());
+        }
+
+        match poller.poll_once().await {
+            Ok(DevicePoll::Complete(token)) => return Ok(token),
+            Ok(DevicePoll::Pending) => {}
+            Ok(DevicePoll::SlowDown) => {
+                interval = clamp_interval(interval.saturating_add(SLOW_DOWN_INCREMENT_SECS));
+            }
+            Ok(DevicePoll::Declined) => return Err(login_declined()),
+            Ok(DevicePoll::Expired) => return Err(login_expired()),
+            Ok(DevicePoll::Fatal(error)) => return Err(error),
+            Err(error) if is_transient_poll_error(&error) => {}
+            Err(error) => return Err(error),
+        }
+
+        // Wait out the interval a second at a time so cancellation is prompt
+        // and an expired code is noticed without an extra request.
+        for _ in 0..interval {
+            if cancel.is_cancelled() {
+                return Err(login_cancelled());
+            }
+            if poller.now() >= expires_at {
+                return Err(login_expired());
+            }
+            poller.sleep(1).await;
+        }
+    }
+}
+
+/// Production poller: one checked HTTP request per attempt, re-checking the
+/// Microsoft-authentication preference every time so switching it off mid-flow
+/// stops the polling.
+struct LiveDeviceTokenPoller<'a> {
+    clients: &'a HttpClients,
+    db_path: &'a Path,
+    device_code: &'a str,
+}
+
+#[async_trait::async_trait]
+impl DeviceTokenPoller for LiveDeviceTokenPoller<'_> {
+    async fn poll_once(&self) -> LauncherResult<DevicePoll> {
+        check_msa_network_enabled(self.db_path)?;
+        let response = http_client::checked_post_form(
+            self.clients,
+            ClientCategory::Microsoft,
+            TOKEN_URL,
+            &[
+                ("client_id", AGORA_MSA_CLIENT_ID),
+                ("grant_type", DEVICE_CODE_GRANT),
+                ("device_code", self.device_code),
+            ],
+            &[("Accept".into(), "application/json".into())],
+        )
+        .await?;
+
+        let status = response.status();
+        let body = http_client::checked_response_text(response, ClientCategory::Microsoft)
+            .await
+            .unwrap_or_default();
+        Ok(classify_device_poll(status, &body))
+    }
+
+    async fn sleep(&self, secs: u64) {
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+    }
+
+    fn now(&self) -> DateTime<Utc> {
+        Utc::now()
+    }
+}
+
+/// Poll until the user completes sign-in, then run the Minecraft chain and
+/// persist the credentials.
+///
+/// Blocks for as long as the device code is valid; callers run it on a
+/// background task and use `cancel` to stop it.
+pub async fn poll_login(
+    clients: &HttpClients,
+    flow: &MsaDeviceCodeFlow,
+    db_path: &Path,
+    cancel: &MsaLoginCancel,
+) -> LauncherResult<MsaCredentials> {
+    check_msa_network_enabled(db_path)?;
+
+    let poller = LiveDeviceTokenPoller {
+        clients,
+        db_path,
+        device_code: &flow.device_code,
+    };
+    let oauth = run_device_poll(&poller, flow.interval_secs, flow.expires_at, cancel).await?;
+
+    let credentials = run_minecraft_chain(clients, &oauth, true).await?;
+    store_signed_in_account(&credentials)?;
+    Ok(credentials)
+}
+
+// ---------------------------------------------------------------------------
+// Refresh
+// ---------------------------------------------------------------------------
+
+async fn refresh_oauth_token(
+    clients: &HttpClients,
+    refresh_token: &str,
+) -> LauncherResult<OAuthToken> {
+    let response = http_client::checked_post_form(
+        clients,
+        ClientCategory::Microsoft,
+        TOKEN_URL,
+        &[
+            ("client_id", AGORA_MSA_CLIENT_ID),
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("scope", MSA_SCOPE),
+        ],
+        &[("Accept".into(), "application/json".into())],
+    )
+    .await?;
+
+    let status = response.status();
+    let body = http_client::checked_response_text(response, ClientCategory::Microsoft)
+        .await
+        .unwrap_or_default();
+
+    if !status.is_success() {
+        return Err(refresh_http_failure(status, &body));
+    }
+
+    serde_json::from_str::<OAuthToken>(&body).map_err(|_| {
+        err(
+            "ERR_MSA_OAUTH_REFRESH_PARSE",
+            "Could not read Microsoft's session renewal response.",
+        )
+    })
+}
+
+/// Returns `true` when the OAuth error body signals a permanent failure
+/// (`invalid_grant` or `expired_token`) that should clear stored credentials.
+fn is_msa_permanent_refresh_error(body: &str) -> bool {
+    matches!(
+        oauth_error_code(body).as_deref(),
+        Some("invalid_grant") | Some("expired_token")
+    )
+}
+
+/// A 5xx from any step of the sign-in chain is the server being unavailable,
+/// which is the same situation as having no connection for the purpose of
+/// offline play.
+const ERR_MSA_SERVER_UNAVAILABLE: &str = "ERR_MSA_SERVER_UNAVAILABLE";
+
+fn server_unavailable(step: &str, status: reqwest::StatusCode) -> LauncherError {
+    err(
+        ERR_MSA_SERVER_UNAVAILABLE,
+        format!("{step} failed because Microsoft's servers are unavailable (HTTP {status})."),
+    )
+}
+
+/// Classify a failed `/token` response. Kept separate from the request so the
+/// permanent/transient split is testable without a server.
+fn refresh_http_failure(status: reqwest::StatusCode, body: &str) -> LauncherError {
+    if is_msa_permanent_refresh_error(body) {
+        return LauncherError::MsaAuthRequired;
+    }
+    if let Some(code) = oauth_error_code(body) {
+        if is_app_access_error(&code) {
+            return app_access_denied();
+        }
+    }
+    if status.is_server_error() {
+        return server_unavailable("Renewing the Microsoft session", status);
+    }
+    err(
+        "ERR_MSA_OAUTH_REFRESH_HTTP",
+        format!("Microsoft could not renew the session (HTTP {status})."),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Steps 3-4: Xbox Live user token → XSTS
+// ---------------------------------------------------------------------------
+
+/// Response shapes (PascalCase = Xbox Live convention)
+mod xbox_types {
+    use serde::Deserialize;
+    use std::collections::HashMap;
+
+    #[derive(Deserialize, Clone)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct XboxToken {
+        pub token: String,
+        pub display_claims: HashMap<String, serde_json::Value>,
+    }
+
+    impl std::fmt::Debug for XboxToken {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("XboxToken")
+                .field("token", &"[REDACTED]")
+                .field("display_claims", &"[PRESENT]")
+                .finish()
+        }
+    }
+
+    #[derive(Deserialize, Clone)]
+    pub struct MinecraftToken {
+        pub access_token: String,
+        #[serde(default)]
+        pub expires_in: Option<u64>,
+    }
+
+    impl std::fmt::Debug for MinecraftToken {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("MinecraftToken")
+                .field("access_token", &"[REDACTED]")
+                .field("expires_in", &self.expires_in)
+                .finish()
+        }
+    }
+
+    #[derive(Deserialize, Debug, Clone)]
+    pub struct MinecraftProfile {
+        pub id: String,
+        pub name: String,
+    }
+
+    #[derive(Deserialize, Debug, Clone, Default)]
+    pub struct EntitlementsResponse {
+        #[serde(default)]
+        pub items: Vec<EntitlementItem>,
+    }
+
+    #[derive(Deserialize, Debug, Clone)]
+    pub struct EntitlementItem {
+        #[serde(default)]
+        pub name: String,
+    }
+}
+
+impl xbox_types::XboxToken {
+    /// The user hash (`uhs`) that pairs with the token in `XBL3.0 x=<uhs>;<tok>`.
+    fn user_hash(&self) -> Option<String> {
+        self.display_claims
+            .get("xui")?
+            .get(0)?
+            .get("uhs")?
+            .as_str()
+            .map(str::to_owned)
+    }
+}
+
+/// Step 3: exchange the Microsoft access token for an Xbox Live user token.
+async fn xbl_authenticate(
+    clients: &HttpClients,
+    ms_access_token: &str,
+) -> LauncherResult<(String, String)> {
+    let body = serde_json::json!({
+        "Properties": {
+            "AuthMethod": "RPS",
+            "SiteName": "user.auth.xboxlive.com",
+            // `d=` is the ticket form for an Azure/Entra OAuth access token.
+            "RpsTicket": format!("d={ms_access_token}"),
+        },
+        "RelyingParty": "http://auth.xboxlive.com",
+        "TokenType": "JWT"
+    });
+
+    let response = http_client::checked_post_json(
+        clients,
+        ClientCategory::Microsoft,
+        XBL_AUTH_URL,
+        &body,
+        &[
+            ("Accept".into(), "application/json".into()),
+            ("User-Agent".into(), USER_AGENT.into()),
+        ],
+    )
+    .await?;
+
+    let status = response.status();
+    let raw = http_client::checked_response_bytes(response, ClientCategory::Microsoft)
+        .await
+        .unwrap_or_default();
+
+    if !status.is_success() {
+        if status.is_server_error() {
+            return Err(server_unavailable("Signing in to Xbox Live", status));
+        }
+        return Err(err(
+            "ERR_MSA_XBOX_AUTH_HTTP",
+            format!("Xbox Live rejected the sign-in (HTTP {status})."),
+        ));
+    }
+
+    let token: xbox_types::XboxToken = serde_json::from_slice(&raw).map_err(|_| {
+        err(
+            "ERR_MSA_XBOX_AUTH_PARSE",
+            "Could not read the Xbox Live sign-in response.",
+        )
+    })?;
+    let uhs = token.user_hash().ok_or_else(|| {
+        err(
+            "ERR_MSA_NO_UHS",
+            "The Xbox Live response did not contain a user hash.",
+        )
+    })?;
+    Ok((uhs, token.token))
+}
+
+/// Map a documented XSTS `XErr` code to an actionable message.
+pub(crate) fn xsts_error_for(xerr: u64) -> Option<LauncherError> {
+    let (code, message) = match xerr {
+        2148916227 => (
+            "ERR_MSA_XBOX_BANNED",
+            "This Xbox account has been banned from Xbox Live.",
+        ),
+        2148916233 => (
+            "ERR_MSA_XBOX_NO_ACCOUNT",
+            "This Microsoft account has no Xbox profile. Create one at xbox.com, then sign in again.",
+        ),
+        2148916235 => (
+            "ERR_MSA_XBOX_REGION",
+            "Xbox Live is not available in this account's country or region.",
+        ),
+        2148916236 | 2148916237 => (
+            "ERR_MSA_XBOX_ADULT_VERIFICATION",
+            "This account needs adult verification before it can use Xbox Live.",
+        ),
+        2148916238 => (
+            "ERR_MSA_XBOX_CHILD_ACCOUNT",
+            "This is a child account. An adult must add it to a Microsoft family group before it can sign in.",
+        ),
+        _ => return None,
+    };
+    Some(err(code, message))
+}
+
+fn parse_xerr(body: &str) -> Option<u64> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let xerr = value.get("XErr")?;
+    xerr.as_u64()
+        .or_else(|| xerr.as_str().and_then(|s| s.parse().ok()))
+}
+
+/// Step 4: exchange the Xbox user token for an XSTS token scoped to Minecraft.
+async fn xsts_authorize(
+    clients: &HttpClients,
+    xbl_token: &str,
+) -> LauncherResult<(String, String)> {
+    let body = serde_json::json!({
+        "Properties": {
+            "SandboxId": "RETAIL",
+            "UserTokens": [xbl_token],
+        },
+        "RelyingParty": "rp://api.minecraftservices.com/",
+        "TokenType": "JWT"
+    });
+
+    let response = http_client::checked_post_json(
+        clients,
+        ClientCategory::Microsoft,
+        XSTS_AUTHORIZE_URL,
+        &body,
+        &[
+            ("Accept".into(), "application/json".into()),
+            ("User-Agent".into(), USER_AGENT.into()),
+        ],
+    )
+    .await?;
+
+    let status = response.status();
+    let raw = http_client::checked_response_text(response, ClientCategory::Microsoft)
+        .await
+        .unwrap_or_default();
+
+    if !status.is_success() {
+        if let Some(specific) = parse_xerr(&raw).and_then(xsts_error_for) {
+            return Err(specific);
+        }
+        if status.is_server_error() {
+            return Err(server_unavailable(
+                "Authorizing the Xbox Live session",
+                status,
+            ));
+        }
+        return Err(err(
+            "ERR_MSA_XSTS_HTTP",
+            format!("Xbox Live authorization failed (HTTP {status})."),
+        ));
+    }
+
+    let token: xbox_types::XboxToken = serde_json::from_str(&raw).map_err(|_| {
+        err(
+            "ERR_MSA_XSTS_PARSE",
+            "Could not read the Xbox Live authorization response.",
+        )
+    })?;
+    let uhs = token.user_hash().ok_or_else(|| {
+        err(
+            "ERR_MSA_NO_UHS",
+            "The Xbox Live authorization response did not contain a user hash.",
+        )
+    })?;
+    Ok((uhs, token.token))
+}
+
+// ---------------------------------------------------------------------------
+// Steps 5-7: Minecraft token → entitlements → profile
+// ---------------------------------------------------------------------------
+
+/// Step 5: trade the XSTS token for a Minecraft access token and its lifetime.
+async fn minecraft_login(
+    clients: &HttpClients,
+    uhs: &str,
+    xsts_token: &str,
+) -> LauncherResult<(String, Option<u64>)> {
+    let body = serde_json::json!({
+        "identityToken": format!("XBL3.0 x={uhs};{xsts_token}"),
+    });
+
+    let response = http_client::checked_post_json(
+        clients,
+        ClientCategory::Microsoft,
+        MC_LOGIN_URL,
+        &body,
+        &[
+            ("Accept".into(), "application/json".into()),
+            ("User-Agent".into(), USER_AGENT.into()),
+        ],
+    )
+    .await?;
+
+    let status = response.status();
+    let raw = http_client::checked_response_bytes(response, ClientCategory::Microsoft)
+        .await
+        .unwrap_or_default();
+
+    if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::UNAUTHORIZED {
+        // Minecraft Services rejects tokens from applications it has not
+        // granted API access to, which is exactly what a pending approval
+        // looks like from here.
+        return Err(app_access_denied());
+    }
+    if !status.is_success() {
+        if status.is_server_error() {
+            return Err(server_unavailable("Signing in to Minecraft", status));
+        }
+        return Err(err(
+            "ERR_MSA_MC_TOKEN_HTTP",
+            format!("Minecraft sign-in failed (HTTP {status})."),
+        ));
+    }
+
+    let token: xbox_types::MinecraftToken = serde_json::from_slice(&raw).map_err(|_| {
+        err(
+            "ERR_MSA_MC_TOKEN_PARSE",
+            "Could not read the Minecraft sign-in response.",
+        )
+    })?;
+    Ok((token.access_token, token.expires_in))
+}
+
+/// Whether an entitlements payload actually grants Minecraft: Java Edition.
+///
+/// A 200 alone proves nothing: the endpoint answers successfully with an empty
+/// `items` array for an account that does not own the game.
+pub(crate) fn entitlements_grant_java(body: &str) -> bool {
+    let parsed: xbox_types::EntitlementsResponse = match serde_json::from_str(body) {
+        Ok(parsed) => parsed,
+        Err(_) => return false,
+    };
+    parsed
+        .items
+        .iter()
+        .any(|item| JAVA_ENTITLEMENTS.contains(&item.name.as_str()))
+}
+
+/// Step 6: confirm the account owns Minecraft: Java Edition.
+async fn check_entitlements(clients: &HttpClients, mc_access_token: &str) -> LauncherResult<()> {
+    let response = http_client::checked_request_with_headers(
+        clients,
+        ClientCategory::Microsoft,
+        MC_ENTITLEMENTS_URL,
+        vec![
+            ("Authorization".into(), format!("Bearer {mc_access_token}")),
+            ("Accept".into(), "application/json".into()),
+            ("User-Agent".into(), USER_AGENT.into()),
+        ],
+    )
+    .await?;
+
+    let status = response.status();
+    let raw = http_client::checked_response_text(response, ClientCategory::Microsoft)
+        .await
+        .unwrap_or_default();
+
+    if !status.is_success() {
+        if status.is_server_error() {
+            return Err(server_unavailable("Checking Minecraft ownership", status));
+        }
+        return Err(err(
+            "ERR_MSA_ENTITLEMENTS_HTTP",
+            format!("Could not check Minecraft ownership (HTTP {status})."),
+        ));
+    }
+
+    if !entitlements_grant_java(&raw) {
+        return Err(err(
+            "ERR_MSA_NO_ENTITLEMENT",
+            "This Microsoft account does not own Minecraft: Java Edition. \
+             Buy it at minecraft.net, or sign in with the account that owns it.",
+        ));
+    }
+    Ok(())
+}
+
+/// Step 7: fetch the Java profile (username + UUID).
+async fn minecraft_profile(
+    clients: &HttpClients,
+    mc_access_token: &str,
+) -> LauncherResult<(String, String)> {
+    let response = http_client::checked_request_with_headers(
+        clients,
+        ClientCategory::Microsoft,
+        MC_PROFILE_URL,
+        vec![
+            ("Authorization".into(), format!("Bearer {mc_access_token}")),
+            ("Accept".into(), "application/json".into()),
+            ("User-Agent".into(), USER_AGENT.into()),
+        ],
+    )
+    .await?;
+
+    let status = response.status();
+    let raw = http_client::checked_response_bytes(response, ClientCategory::Microsoft)
+        .await
+        .unwrap_or_default();
+
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err(err(
+            "ERR_MSA_NO_PROFILE",
+            "This account owns Minecraft: Java Edition but has no profile yet. \
+             Create a Minecraft username at minecraft.net, then sign in again.",
+        ));
+    }
+    if !status.is_success() {
+        if status.is_server_error() {
+            return Err(server_unavailable("Reading the Minecraft profile", status));
+        }
+        return Err(err(
+            "ERR_MSA_PROFILE_HTTP",
+            format!("Could not read the Minecraft profile (HTTP {status})."),
+        ));
+    }
+
+    let profile: xbox_types::MinecraftProfile = serde_json::from_slice(&raw).map_err(|_| {
+        err(
+            "ERR_MSA_PROFILE_PARSE",
+            "Could not read the Minecraft profile response.",
+        )
+    })?;
+    Ok((profile.name, profile.id))
+}
+
+/// Run Xbox Live → XSTS → Minecraft for a freshly issued Microsoft token.
+///
+/// The profile is always re-read, so a renamed account stays correct across a
+/// refresh as well as a fresh sign-in.
+async fn run_minecraft_chain(
+    clients: &HttpClients,
+    oauth: &OAuthToken,
+    verify_entitlements: bool,
+) -> LauncherResult<MsaCredentials> {
+    let (uhs, xbl_token) = xbl_authenticate(clients, &oauth.access_token).await?;
+    let (xsts_uhs, xsts_token) = xsts_authorize(clients, &xbl_token).await?;
+    // XSTS restates the user hash; prefer its copy and fall back to the Xbox one.
+    let uhs = if xsts_uhs.is_empty() { uhs } else { xsts_uhs };
+
+    let (mc_access_token, expires_in) = minecraft_login(clients, &uhs, &xsts_token).await?;
+
+    if verify_entitlements {
+        check_entitlements(clients, &mc_access_token).await?;
+    }
+
+    let (username, uuid) = minecraft_profile(clients, &mc_access_token).await?;
+
+    // Minecraft's own lifetime governs the token we launch the game with.
+    // Clamped so a nonsensical value cannot mask an expired token.
+    let lifetime = expires_in
+        .unwrap_or(DEFAULT_MC_TOKEN_LIFETIME_SECS)
+        .clamp(1, MAX_MC_TOKEN_LIFETIME_SECS) as i64;
+
+    Ok(MsaCredentials {
+        username,
+        uuid,
+        access_token: mc_access_token,
+        refresh_token: oauth.refresh_token.clone(),
+        expires: Utc::now() + chrono::Duration::seconds(lifetime),
+        client_id: AGORA_MSA_CLIENT_ID.to_string(),
+        auth_version: MSA_AUTH_VERSION,
+    })
+}
+
+/// Refresh credentials through Agora's application and repeat the Xbox and
+/// Minecraft exchanges.
+///
+/// Credentials issued by the pre-migration flow are refused rather than sent to
+/// the new application, whose refresh endpoint could only answer with an opaque
+/// `invalid_grant`.
+pub async fn refresh_credentials(
+    clients: &HttpClients,
+    creds: &MsaCredentials,
+    db_path: &Path,
+) -> LauncherResult<MsaCredentials> {
+    check_msa_network_enabled(db_path)?;
+    if creds.needs_reauth() {
+        return Err(err(
+            "ERR_MSA_LEGACY_CREDENTIALS",
+            LEGACY_CREDENTIALS_MESSAGE,
+        ));
+    }
+
+    let oauth = refresh_oauth_token(clients, &creds.refresh_token).await?;
+    let refreshed = run_minecraft_chain(clients, &oauth, false).await?;
+    commit_refreshed(&refreshed)?;
+    Ok(refreshed)
+}
+
+/// Persist a refresh without overwriting an account switch that happened while
+/// the network call was in flight.
+///
+/// If the refreshed account is still active, it becomes the stored active one.
+/// If it was switched away from, the new token goes into its parked entry. If it
+/// was signed out during the refresh, the result is dropped: a refresh must not
+/// resurrect an account the user removed.
+fn commit_refreshed(refreshed: &MsaCredentials) -> LauncherResult<()> {
+    let _guard = store_guard();
+    // Do not write over a store that is waiting for repair; the refreshed token
+    // in memory is still usable for this launch.
+    if repair_pending() {
+        return Ok(());
+    }
+    let mut store = read_store_unlocked()?;
+    if repair_pending() {
+        return Ok(());
+    }
+    if store
+        .active
+        .as_ref()
+        .is_some_and(|active| same_account(&active.uuid, &refreshed.uuid))
+    {
+        store.active = Some(refreshed.clone());
+    } else if let Some(position) = store.parked_position(&refreshed.uuid) {
+        store.parked[position].credentials = Some(refreshed.clone());
+    } else {
+        return Ok(());
+    }
+    write_store_unlocked(&store)
+}
+
+/// Forget the credential Microsoft says is no longer valid, wherever it sits.
+fn clear_account_credentials(uuid: &str) -> LauncherResult<()> {
+    let _guard = store_guard();
+    if repair_pending() {
+        return Ok(());
+    }
+    let mut store = read_store_unlocked()?;
+    if repair_pending() {
+        return Ok(());
+    }
+    if store
+        .active
+        .as_ref()
+        .is_some_and(|active| same_account(&active.uuid, uuid))
+    {
+        store.active = None;
+    }
+    if let Some(position) = store.parked_position(uuid) {
+        store.parked[position].credentials = None;
+    }
+    write_store_unlocked(&store)
+}
+
+// ---------------------------------------------------------------------------
+// Credential storage
+// ---------------------------------------------------------------------------
+
+/// Which backend holds the Microsoft credentials.
+///
+/// `CredentialBackend::EncryptedFile` means the OS keyring was unavailable and
+/// the credentials sit in a file guarded only by its permissions -- the state
+/// MASTER_SPEC 7.5.2 requires Settings to warn about.
+pub fn credentials_backend() -> auth::CredentialBackend {
+    let current =
+        auth::credential_backend(KEYRING_SERVICE, ACCOUNT_STORE_ACCOUNT, ACCOUNT_STORE_FILE);
+    if current != auth::CredentialBackend::None {
+        return current;
+    }
+    // Before the first read migrates them, the active account still lives in
+    // the old slot. Report that store so Settings does not lose its warning.
+    auth::credential_backend(KEYRING_SERVICE, KEYRING_ACCOUNT, CREDENTIALS_FALLBACK_FILE)
+}
+
+pub fn load_credentials() -> LauncherResult<Option<MsaCredentials>> {
+    #[cfg(all(feature = "test-support", debug_assertions))]
+    if let Some(json) = std::env::var_os("AGORA_TEST_MSA_CREDENTIALS_JSON") {
+        let json = json.into_string().map_err(|_| LauncherError::Generic {
+            code: "ERR_MSA_TEST_CREDENTIALS_PARSE".into(),
+            message: "Test credentials environment variable is not valid UTF-8.".into(),
+        })?;
+        let credentials = serde_json::from_str(&json).map_err(|error| LauncherError::Generic {
+            code: "ERR_MSA_TEST_CREDENTIALS_PARSE".into(),
+            message: format!("Failed to parse test credentials: {error}"),
+        })?;
+        return Ok(Some(credentials));
+    }
+
+    let _guard = store_guard();
+    Ok(read_store_unlocked()?.active)
+}
+
+/// Store credentials as the active account. The parked accounts are kept.
+pub fn store_credentials(creds: &MsaCredentials) -> LauncherResult<()> {
+    let _guard = store_guard();
+    ensure_accounts_writable()?;
+    let mut store = read_store_unlocked()?;
+    ensure_accounts_writable()?;
+    store.active = Some(creds.clone());
+    store.remove_parked(&creds.uuid);
+    write_store_unlocked(&store)
+}
+
+/// Clear the active account's stored credentials. Other signed-in accounts
+/// are untouched; [`sign_out_active`] is the user-facing sign-out.
+pub fn clear_credentials() -> LauncherResult<()> {
+    let _guard = store_guard();
+    ensure_accounts_writable()?;
+    let mut store = read_store_unlocked()?;
+    ensure_accounts_writable()?;
+    store.active = None;
+    write_store_unlocked(&store)
+}
+
+// ---------------------------------------------------------------------------
+// More than one account: one transactional store
+// ---------------------------------------------------------------------------
+//
+// The active account, every parked account and the list that names them live in
+// one JSON secret, replaced in one write. A single record is what makes the
+// update transactional: there is no order in which an index could name an
+// account whose credential was never written, and a crash leaves either the
+// previous complete store or the new one. The earlier layout used three kinds
+// of secret and no shared lock, so a refresh, a switch and a sign-out could
+// interleave and orphan tokens.
+//
+// One blob is only viable because Windows now writes the DPAPI-protected file
+// rather than Credential Manager (see `agora_core::auth`); its 2.5 KB cap was
+// why an account used to get a slot of its own. Other platforms' keyrings and
+// the encrypted-file fallback have no comparable limit.
+//
+// `read_store_unlocked` migrates the old layout on first read. A crash after the
+// new store is written but before the old secrets are removed is harmless: the
+// new store is found on the next read and the old copies are inert.
+const ACCOUNT_STORE_ACCOUNT: &str = "msa-accounts-store";
+const ACCOUNT_STORE_FILE: &str = "msa-accounts-store.enc";
+const ACCOUNT_STORE_KEY_CONTEXT: &[u8] = b"agora-msa-accounts-store";
+
+/// A recovery copy of the last committed store, so a corrupt primary cannot
+/// take the active account with it.
+const ACCOUNT_STORE_BACKUP_ACCOUNT: &str = "msa-accounts-store-backup";
+const ACCOUNT_STORE_BACKUP_FILE: &str = "msa-accounts-store-backup.enc";
+
+/// Non-secret marker that says the saved account list needs repair.
+const REPAIR_MARKER_FILE: &str = "msa-accounts-store.repair.json";
+
+/// The old layout, read only so an existing install keeps its accounts.
+const ACCOUNT_INDEX_ACCOUNT: &str = "msa-accounts";
+const ACCOUNT_INDEX_FILE: &str = "msa-accounts.enc";
+
+pub const ACCOUNT_STORE_NEEDS_REPAIR_CODE: &str = "ERR_MSA_ACCOUNTS_NEED_REPAIR";
+
+pub const ACCOUNT_STORE_REPAIR_MESSAGE: &str = "The saved account list could not be read. The active account still works, but accounts cannot be switched or added until it is repaired. Run `agora auth repair`.";
+
+/// Serializes every read-modify-write of the account store in this process.
+///
+/// The refresh path takes it around the load and the commit only, never across
+/// the network call, so a switch is never blocked on Microsoft. A poisoned lock
+/// still yields the guard: the store is the consistency boundary, and refusing
+/// to read it would be worse than carrying on.
+static MSA_STORE_MUTEX: LazyLock<std::sync::Mutex<()>> =
+    LazyLock::new(|| std::sync::Mutex::new(()));
+
+fn store_guard() -> std::sync::MutexGuard<'static, ()> {
+    MSA_STORE_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// True from the moment this process sees a corrupt account list until a
+/// repair clears the on-disk marker. Keeps mutations refused even if writing
+/// the marker itself failed.
+static REPAIR_NEEDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The one warning per process, so a corrupt list does not fill a launch log.
+static REPAIR_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn credential_dir() -> Option<std::path::PathBuf> {
+    auth::credential_storage_dir()
+}
+
+fn repair_marker_path() -> Option<std::path::PathBuf> {
+    credential_dir().map(|dir| dir.join(REPAIR_MARKER_FILE))
+}
+
+fn repair_marker_exists() -> bool {
+    repair_marker_path().is_some_and(|path| path.exists())
+}
+
+fn read_repair_marker() -> Option<RepairMarker> {
+    let path = repair_marker_path()?;
+    let bytes = std::fs::read(path).ok()?;
+    let marker = serde_json::from_slice::<RepairMarker>(&bytes).ok()?;
+    REPAIR_NEEDED.store(true, std::sync::atomic::Ordering::Relaxed);
+    Some(marker)
+}
+
+fn write_repair_marker(marker: &RepairMarker) -> LauncherResult<()> {
+    REPAIR_NEEDED.store(true, std::sync::atomic::Ordering::Relaxed);
+    let path = repair_marker_path().ok_or_else(|| {
+        err(
+            ACCOUNT_STORE_NEEDS_REPAIR_CODE,
+            "Could not determine where to record that the saved account list needs repair.",
+        )
+    })?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|_| {
+            err(
+                ACCOUNT_STORE_NEEDS_REPAIR_CODE,
+                "Could not create Agora's credential folder to record the repair marker.",
+            )
+        })?;
+    }
+    let bytes = serde_json::to_vec(marker).map_err(|_| {
+        err(
+            ACCOUNT_STORE_NEEDS_REPAIR_CODE,
+            "Could not record that the saved account list needs repair.",
+        )
+    })?;
+    std::fs::write(&path, bytes).map_err(|_| {
+        err(
+            ACCOUNT_STORE_NEEDS_REPAIR_CODE,
+            "Could not record that the saved account list needs repair.",
+        )
+    })
+}
+
+fn clear_repair_marker() -> LauncherResult<()> {
+    if let Some(path) = repair_marker_path() {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(err(
+                    "ERR_MSA_ACCOUNTS_REPAIR_MARKER",
+                    "The accounts were repaired, but Agora could not clear the repair notice.",
+                ))
+            }
+        }
+    }
+    REPAIR_NEEDED.store(false, std::sync::atomic::Ordering::Relaxed);
+    REPAIR_WARNED.store(false, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+fn warn_repair_once(marker: &RepairMarker) {
+    REPAIR_NEEDED.store(true, std::sync::atomic::Ordering::Relaxed);
+    if !REPAIR_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "[auth] {ACCOUNT_STORE_REPAIR_MESSAGE} The unreadable data was kept as {}.",
+            marker.corrupt_file
+        );
+    }
+}
+
+fn repair_pending() -> bool {
+    REPAIR_NEEDED.load(std::sync::atomic::Ordering::Relaxed) || repair_marker_exists()
+}
+
+fn ensure_accounts_writable() -> LauncherResult<()> {
+    if repair_pending() {
+        return Err(err(
+            ACCOUNT_STORE_NEEDS_REPAIR_CODE,
+            ACCOUNT_STORE_REPAIR_MESSAGE,
+        ));
+    }
+    Ok(())
+}
+
+fn repair_marker(corrupt_file: String) -> RepairMarker {
+    RepairMarker {
+        corrupt_file,
+        detected_at: Utc::now(),
+    }
+}
+
+fn quarantine_slug() -> String {
+    Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
+}
+
+/// Rename a corrupt credential file beside itself with a timestamp. Never
+/// deletes it: the player may need it to recover an account by hand.
+fn quarantine_file(path: &std::path::Path) -> Option<String> {
+    let parent = path.parent()?;
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    let stamp = quarantine_slug();
+    for attempt in 0..100u32 {
+        let suffix = if attempt == 0 {
+            String::new()
+        } else {
+            format!("-{attempt}")
+        };
+        let target = parent.join(format!("{name}.corrupt-{stamp}{suffix}"));
+        if target.exists() {
+            continue;
+        }
+        if std::fs::rename(path, &target).is_ok() {
+            return Some(target.to_string_lossy().into_owned());
+        }
+        // Rename can be refused even though the directory is writable (an open
+        // handle on Windows, for example). Keep a copy rather than lose the
+        // evidence when repair later replaces the original.
+        if std::fs::copy(path, &target).is_ok() {
+            return Some(target.to_string_lossy().into_owned());
+        }
+        return None;
+    }
+    None
+}
+
+/// Copy a corrupt value that lives in the OS keyring to an encrypted file so
+/// it is still kept when the original entry has to be replaced by a repair.
+fn quarantine_secret(raw: &str) -> Option<String> {
+    let stamp = quarantine_slug();
+    let account = format!("msa-accounts-store-quarantine-{stamp}");
+    let file = format!("{account}.enc");
+    auth::store_secret(
+        KEYRING_SERVICE,
+        &account,
+        &file,
+        CREDENTIALS_KEY_CONTEXT,
+        raw,
+    )
+    .ok()?;
+    Some(file)
+}
+
+fn quarantine_store(raw: Option<&str>, detail: &str) -> RepairMarker {
+    if let Some(path) = auth::credential_storage_dir().map(|dir| dir.join(ACCOUNT_STORE_FILE)) {
+        if path.exists() {
+            if let Some(kept) = quarantine_file(&path) {
+                return repair_marker(kept);
+            }
+        }
+    }
+    if let Some(raw) = raw {
+        if let Some(kept) = quarantine_secret(raw) {
+            return repair_marker(kept);
+        }
+    }
+    repair_marker(detail.to_string())
+}
+
+fn quarantine_legacy_index(raw: Option<&str>) -> RepairMarker {
+    if let Some(path) = auth::credential_storage_dir().map(|dir| dir.join(ACCOUNT_INDEX_FILE)) {
+        if path.exists() {
+            if let Some(kept) = quarantine_file(&path) {
+                return repair_marker(kept);
+            }
+        }
+    }
+    if let Some(raw) = raw {
+        if let Some(kept) = quarantine_secret(raw) {
+            return repair_marker(kept);
+        }
+    }
+    repair_marker("the saved account list".to_string())
+}
+
+pub fn account_store_status() -> AccountStoreStatus {
+    match read_repair_marker() {
+        Some(marker) => AccountStoreStatus {
+            needs_repair: true,
+            corrupt_file: Some(marker.corrupt_file),
+            detected_at: Some(marker.detected_at),
+            message: Some(ACCOUNT_STORE_REPAIR_MESSAGE.to_string()),
+        },
+        None if repair_marker_exists() => {
+            REPAIR_NEEDED.store(true, std::sync::atomic::Ordering::Relaxed);
+            AccountStoreStatus {
+                needs_repair: true,
+                corrupt_file: None,
+                detected_at: None,
+                message: Some(ACCOUNT_STORE_REPAIR_MESSAGE.to_string()),
+            }
+        }
+        None => AccountStoreStatus {
+            needs_repair: false,
+            corrupt_file: None,
+            detected_at: None,
+            message: None,
+        },
+    }
+}
+
+/// A backup of the last committed store, used when the primary cannot be read.
+fn load_backup_store() -> LauncherResult<Option<AccountStore>> {
+    let Some(json) = auth::load_secret(
+        KEYRING_SERVICE,
+        ACCOUNT_STORE_BACKUP_ACCOUNT,
+        ACCOUNT_STORE_BACKUP_FILE,
+        ACCOUNT_STORE_KEY_CONTEXT,
+    )?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_str(&json).map(Some).map_err(|error| {
+        err(
+            "ERR_MSA_ACCOUNT_STORE",
+            format!("Agora could not read its account recovery copy: {error}"),
+        )
+    })
+}
+
+/// Read-only recovery of the old layout, including parked tokens whose index
+/// is the thing that broke.
+fn recover_legacy_store() -> LauncherResult<AccountStore> {
+    let active = match auth::load_secret(
+        KEYRING_SERVICE,
+        KEYRING_ACCOUNT,
+        CREDENTIALS_FALLBACK_FILE,
+        CREDENTIALS_KEY_CONTEXT,
+    )? {
+        Some(json) => Some(parse_credentials(&json, "the active account")?),
+        None => None,
+    };
+
+    let entries = match auth::load_secret(
+        KEYRING_SERVICE,
+        ACCOUNT_INDEX_ACCOUNT,
+        ACCOUNT_INDEX_FILE,
+        CREDENTIALS_KEY_CONTEXT,
+    )? {
+        Some(json) => serde_json::from_str::<Vec<AccountIndexEntry>>(&json).ok(),
+        None => None,
+    };
+
+    let mut store = AccountStore {
+        active,
+        parked: Vec::new(),
+    };
+    if let Some(entries) = entries {
+        for entry in entries {
+            if store
+                .active
+                .as_ref()
+                .is_some_and(|active| same_account(&active.uuid, &entry.uuid))
+            {
+                continue;
+            }
+            let credentials = load_legacy_parked_credential(&entry.uuid)?;
+            store.parked.push(ParkedAccount {
+                uuid: entry.uuid,
+                username: entry.username,
+                credentials,
+            });
+        }
+    }
+    merge_scanned_legacy_parked(&mut store);
+    Ok(store)
+}
+
+fn load_legacy_parked_credential(uuid: &str) -> LauncherResult<Option<MsaCredentials>> {
+    let (account, file) = account_slot(uuid)?;
+    match auth::load_secret(KEYRING_SERVICE, &account, &file, CREDENTIALS_KEY_CONTEXT)? {
+        Some(json) => Ok(Some(parse_credentials(&json, "a saved account")?)),
+        None => Ok(None),
+    }
+}
+
+/// Add parked credentials found as files, whether or not the old index named
+/// them. Keyring entries cannot be enumerated, so that backend recovers only
+/// what a readable index named.
+fn merge_scanned_legacy_parked(store: &mut AccountStore) {
+    let Some(dir) = credential_dir() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        let Some(plain) = file
+            .strip_prefix("msa-credentials-")
+            .and_then(|rest| rest.strip_suffix(".enc"))
+        else {
+            continue;
+        };
+        if plain.is_empty() || !plain.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let account = format!("msa-credentials-{plain}");
+        let Ok(Some(json)) =
+            auth::load_secret(KEYRING_SERVICE, &account, &file, CREDENTIALS_KEY_CONTEXT)
+        else {
+            continue;
+        };
+        let Ok(creds) = serde_json::from_str::<MsaCredentials>(&json) else {
+            continue;
+        };
+        if store
+            .active
+            .as_ref()
+            .is_some_and(|active| same_account(&active.uuid, &creds.uuid))
+        {
+            continue;
+        }
+        if store.parked_position(&creds.uuid).is_none() {
+            store.parked.push(ParkedAccount {
+                uuid: creds.uuid.clone(),
+                username: creds.username.clone(),
+                credentials: Some(creds),
+            });
+        }
+    }
+}
+
+/// A signed-in account as the account switcher shows it. No tokens.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MsaAccountSummary {
+    pub uuid: String,
+    pub username: String,
+    /// The account launches use.
+    pub active: bool,
+    /// Signed in with an older Agora; needs one fresh sign-in.
+    pub needs_reauth: bool,
+}
+
+/// Whether the saved account list needs repair, and what to show the player.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountStoreStatus {
+    pub needs_repair: bool,
+    /// The file (or encrypted quarantine copy) the corrupt data was moved to.
+    pub corrupt_file: Option<String>,
+    pub detected_at: Option<DateTime<Utc>>,
+    pub message: Option<String>,
+}
+
+/// The result of [`repair_account_store`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountRepairReport {
+    /// False when there was nothing to repair.
+    pub repaired: bool,
+    /// The accounts the repaired index now lists.
+    pub accounts: Vec<MsaAccountSummary>,
+    /// Entries that were still in the index but whose credential could not be
+    /// read. They are kept as needing a fresh sign-in, never silently dropped.
+    pub unresolved: Vec<String>,
+    pub notes: Vec<String>,
+    /// Every corrupt file kept aside (never deleted by the repair).
+    pub corrupt_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RepairMarker {
+    corrupt_file: String,
+    detected_at: DateTime<Utc>,
+}
+
+/// The single secret that holds every account.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct AccountStore {
+    #[serde(default)]
+    active: Option<MsaCredentials>,
+    #[serde(default)]
+    parked: Vec<ParkedAccount>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ParkedAccount {
+    uuid: String,
+    username: String,
+    /// `None` when the index entry survived but its credential did not. It is
+    /// still shown, as needing sign-in, rather than silently dropped.
+    #[serde(default)]
+    credentials: Option<MsaCredentials>,
+}
+
+impl AccountStore {
+    fn parked_position(&self, uuid: &str) -> Option<usize> {
+        self.parked
+            .iter()
+            .position(|entry| same_account(&entry.uuid, uuid))
+    }
+
+    fn remove_parked(&mut self, uuid: &str) -> Option<ParkedAccount> {
+        let position = self.parked_position(uuid)?;
+        Some(self.parked.remove(position))
+    }
+
+    fn add_parked(&mut self, creds: &MsaCredentials) {
+        self.remove_parked(&creds.uuid);
+        self.parked.push(ParkedAccount {
+            uuid: creds.uuid.clone(),
+            username: creds.username.clone(),
+            credentials: Some(creds.clone()),
+        });
+    }
+
+    fn first_usable_parked(&self) -> Option<usize> {
+        self.parked
+            .iter()
+            .position(|entry| entry.credentials.is_some())
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct AccountIndexEntry {
+    uuid: String,
+    username: String,
+}
+
+fn account_slot(uuid: &str) -> LauncherResult<(String, String)> {
+    let plain = uuid.replace('-', "").to_ascii_lowercase();
+    if plain.is_empty() || !plain.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(err("ERR_MSA_ACCOUNT", "That account id is not valid."));
+    }
+    Ok((
+        format!("msa-credentials-{plain}"),
+        format!("msa-credentials-{plain}.enc"),
+    ))
+}
+
+fn same_account(a: &str, b: &str) -> bool {
+    a.replace('-', "").eq_ignore_ascii_case(&b.replace('-', ""))
+}
+
+fn parse_credentials(json: &str, what: &str) -> LauncherResult<MsaCredentials> {
+    serde_json::from_str(json).map_err(|error| {
+        err(
+            "ERR_MSA_ACCOUNT_STORE",
+            format!("Agora could not read {what} from its stored accounts: {error}"),
+        )
+    })
+}
+
+/// Read the one store, migrating the old layout on first use.
+///
+/// The caller holds [`MSA_STORE_MUTEX`]. A store that cannot be read is never
+/// treated as empty: the active account still loads from the recovery copy (or
+/// the old active slot), the corrupt bytes are kept aside, and mutations are
+/// refused until [`repair_account_store`] rebuilds the list.
+fn read_store_unlocked() -> LauncherResult<AccountStore> {
+    if let Some(marker) = read_repair_marker() {
+        warn_repair_once(&marker);
+        return recover_store_unlocked();
+    }
+
+    let primary = auth::load_secret(
+        KEYRING_SERVICE,
+        ACCOUNT_STORE_ACCOUNT,
+        ACCOUNT_STORE_FILE,
+        ACCOUNT_STORE_KEY_CONTEXT,
+    )?;
+    match primary {
+        Some(json) => match serde_json::from_str::<AccountStore>(&json) {
+            Ok(store) => Ok(store),
+            Err(error) => {
+                let marker =
+                    quarantine_store(Some(&json), &format!("the saved account list ({error})"));
+                let _ = write_repair_marker(&marker);
+                warn_repair_once(&marker);
+                recover_store_unlocked()
+            }
+        },
+        None if auth::fallback_secret_present(ACCOUNT_STORE_FILE) => {
+            let marker = quarantine_store(None, "the saved account list");
+            let _ = write_repair_marker(&marker);
+            warn_repair_once(&marker);
+            recover_store_unlocked()
+        }
+        None => {
+            // The primary may have been moved aside on an earlier run whose
+            // marker write failed. A recovery copy is still the saved list, but
+            // its history is incomplete, so treat it as needing repair.
+            if let Some(backup) = load_backup_store()? {
+                let marker = repair_marker("the saved account list (recovered copy)".into());
+                let _ = write_repair_marker(&marker);
+                warn_repair_once(&marker);
+                return Ok(backup);
+            }
+            if repair_marker_exists() {
+                if let Some(marker) = read_repair_marker() {
+                    warn_repair_once(&marker);
+                }
+                return recover_store_unlocked();
+            }
+            migrate_legacy_store()
+        }
+    }
+}
+
+/// Load whatever is still readable, preferring the newest committed copy.
+///
+/// The primary is tried first because a repair that was interrupted after its
+/// write leaves a readable primary and an older backup. The backup is what a
+/// corrupt primary falls back to.
+fn recover_store_unlocked() -> LauncherResult<AccountStore> {
+    if let Some(json) = auth::load_secret(
+        KEYRING_SERVICE,
+        ACCOUNT_STORE_ACCOUNT,
+        ACCOUNT_STORE_FILE,
+        ACCOUNT_STORE_KEY_CONTEXT,
+    )? {
+        if let Ok(store) = serde_json::from_str::<AccountStore>(&json) {
+            return Ok(store);
+        }
+    }
+    if let Some(store) = load_backup_store()? {
+        return Ok(store);
+    }
+    let store = recover_legacy_store()?;
+    if store.active.is_some() || !store.parked.is_empty() {
+        return Ok(store);
+    }
+    Err(err(
+        ACCOUNT_STORE_NEEDS_REPAIR_CODE,
+        format!("{ACCOUNT_STORE_REPAIR_MESSAGE} No readable account was found to recover."),
+    ))
+}
+
+fn write_store_unlocked(store: &AccountStore) -> LauncherResult<()> {
+    if store.active.is_none() && store.parked.is_empty() {
+        auth::clear_secret(KEYRING_SERVICE, ACCOUNT_STORE_ACCOUNT, ACCOUNT_STORE_FILE)?;
+        let _ = auth::clear_secret(
+            KEYRING_SERVICE,
+            ACCOUNT_STORE_BACKUP_ACCOUNT,
+            ACCOUNT_STORE_BACKUP_FILE,
+        );
+        return Ok(());
+    }
+    let json = serde_json::to_string(store).map_err(|error| {
+        err(
+            "ERR_MSA_ACCOUNT_STORE",
+            format!("Failed to serialize the saved accounts: {error}"),
+        )
+    })?;
+    auth::store_secret(
+        KEYRING_SERVICE,
+        ACCOUNT_STORE_ACCOUNT,
+        ACCOUNT_STORE_FILE,
+        ACCOUNT_STORE_KEY_CONTEXT,
+        &json,
+    )?;
+    // The recovery copy is the same committed state. If it cannot be written,
+    // the primary is still valid; a later corruption would lose that recovery
+    // path, so say so rather than pretending it exists.
+    if auth::store_secret(
+        KEYRING_SERVICE,
+        ACCOUNT_STORE_BACKUP_ACCOUNT,
+        ACCOUNT_STORE_BACKUP_FILE,
+        ACCOUNT_STORE_KEY_CONTEXT,
+        &json,
+    )
+    .is_err()
+    {
+        eprintln!("[auth] could not keep a recovery copy of the saved account list");
+    }
+    Ok(())
+}
+
+fn read_legacy_active() -> LauncherResult<Option<MsaCredentials>> {
+    match auth::load_secret(
+        KEYRING_SERVICE,
+        KEYRING_ACCOUNT,
+        CREDENTIALS_FALLBACK_FILE,
+        CREDENTIALS_KEY_CONTEXT,
+    )? {
+        Some(json) => Ok(Some(parse_credentials(&json, "the active account")?)),
+        None => Ok(None),
+    }
+}
+
+/// Read the old active/parked/index secrets into one store, then replace them.
+///
+/// A corrupt index does not stop the active account: the index is moved aside,
+/// a repair marker is recorded, and parked credentials still on disk are kept
+/// in the recovered list. The new store is only written once the list is
+/// trustworthy (a readable index, or a repair).
+fn migrate_legacy_store() -> LauncherResult<AccountStore> {
+    let active = read_legacy_active()?;
+
+    let (entries, corrupt_index_raw) = match auth::load_secret(
+        KEYRING_SERVICE,
+        ACCOUNT_INDEX_ACCOUNT,
+        ACCOUNT_INDEX_FILE,
+        CREDENTIALS_KEY_CONTEXT,
+    )? {
+        Some(json) => match serde_json::from_str::<Vec<AccountIndexEntry>>(&json) {
+            Ok(entries) => (Some(entries), None),
+            Err(_) => (None, Some(json)),
+        },
+        None if auth::fallback_secret_present(ACCOUNT_INDEX_FILE) => (None, None),
+        None => (Some(Vec::new()), None),
+    };
+
+    let mut store = AccountStore {
+        active,
+        parked: Vec::new(),
+    };
+    if let Some(entries) = &entries {
+        for entry in entries {
+            if store
+                .active
+                .as_ref()
+                .is_some_and(|creds| same_account(&creds.uuid, &entry.uuid))
+            {
+                continue;
+            }
+            let credentials = load_legacy_parked_credential(&entry.uuid).unwrap_or(None);
+            store.parked.push(ParkedAccount {
+                uuid: entry.uuid.clone(),
+                username: entry.username.clone(),
+                credentials,
+            });
+        }
+    }
+    merge_scanned_legacy_parked(&mut store);
+
+    if entries.is_none() {
+        let marker = quarantine_legacy_index(corrupt_index_raw.as_deref());
+        let _ = write_repair_marker(&marker);
+        warn_repair_once(&marker);
+        return Ok(store);
+    }
+
+    if store.active.is_some() || !store.parked.is_empty() {
+        write_store_unlocked(&store)?;
+        clear_legacy_store(&store);
+    }
+    Ok(store)
+}
+
+/// Best-effort removal of the old secrets after the new store is durable.
+///
+/// Failure here leaves inert copies behind, never a second source of truth:
+/// every read looks for the new store first.
+fn clear_legacy_store(store: &AccountStore) {
+    let _ = auth::clear_secret(KEYRING_SERVICE, KEYRING_ACCOUNT, CREDENTIALS_FALLBACK_FILE);
+    let _ = auth::clear_secret(KEYRING_SERVICE, ACCOUNT_INDEX_ACCOUNT, ACCOUNT_INDEX_FILE);
+    let mut uuids: Vec<&str> = store
+        .parked
+        .iter()
+        .map(|entry| entry.uuid.as_str())
+        .collect();
+    if let Some(active) = &store.active {
+        uuids.push(active.uuid.as_str());
+    }
+    for uuid in uuids {
+        if let Ok((account, file)) = account_slot(uuid) {
+            let _ = auth::clear_secret(KEYRING_SERVICE, &account, &file);
+        }
+    }
+}
+
+fn summaries(store: &AccountStore) -> Vec<MsaAccountSummary> {
+    let mut accounts = Vec::new();
+    if let Some(creds) = &store.active {
+        accounts.push(summary(creds, true));
+    }
+    for entry in &store.parked {
+        if store
+            .active
+            .as_ref()
+            .is_some_and(|creds| same_account(&creds.uuid, &entry.uuid))
+        {
+            continue;
+        }
+        let needs_reauth = entry
+            .credentials
+            .as_ref()
+            .map(|creds| creds.needs_reauth())
+            .unwrap_or(true);
+        accounts.push(MsaAccountSummary {
+            uuid: entry.uuid.clone(),
+            username: entry.username.clone(),
+            active: false,
+            needs_reauth,
+        });
+    }
+    accounts
+}
+
+fn unresolved_entries(store: &AccountStore) -> Vec<String> {
+    store
+        .parked
+        .iter()
+        .filter(|entry| entry.credentials.is_none())
+        .map(|entry| format!("{} ({})", entry.username, entry.uuid))
+        .collect()
+}
+
+/// Rebuild the saved account list from the accounts still readable.
+///
+/// The corrupt file is never deleted. Entries whose credential cannot be read
+/// are kept as needing a fresh sign-in and named in the report.
+pub fn repair_account_store() -> LauncherResult<AccountRepairReport> {
+    let _guard = store_guard();
+    let mut store = read_store_unlocked()?;
+    let marker = read_repair_marker();
+    if !REPAIR_NEEDED.load(std::sync::atomic::Ordering::Relaxed)
+        && marker.is_none()
+        && !repair_marker_exists()
+    {
+        return Ok(AccountRepairReport {
+            repaired: false,
+            accounts: summaries(&store),
+            unresolved: Vec::new(),
+            notes: vec!["The saved account list is readable; nothing needed repair.".into()],
+            corrupt_files: Vec::new(),
+        });
+    }
+
+    for entry in &mut store.parked {
+        if entry.credentials.is_none() {
+            if let Ok(Some(creds)) = load_legacy_parked_credential(&entry.uuid) {
+                entry.credentials = Some(creds);
+            }
+        }
+    }
+    merge_scanned_legacy_parked(&mut store);
+    if store.active.is_none() {
+        store.active = read_legacy_active()?;
+    }
+
+    let unresolved = unresolved_entries(&store);
+    let mut notes = Vec::new();
+    if !unresolved.is_empty() {
+        notes.push(
+            "Entries that were in the unreadable list but whose credential could not be read \
+             are kept as needing a fresh sign-in."
+                .into(),
+        );
+    }
+    notes.push(
+        "An account that existed only in the unreadable copy could not be recovered; sign in \
+         again to restore it."
+            .into(),
+    );
+    if marker.is_none() {
+        notes.push(
+            "The repair marker was unreadable, so the corrupt copy's exact name is unknown.".into(),
+        );
+    }
+    let corrupt_files = marker
+        .map(|marker| vec![marker.corrupt_file])
+        .unwrap_or_default();
+
+    write_store_unlocked(&store)?;
+    clear_legacy_store(&store);
+    clear_repair_marker()?;
+    Ok(AccountRepairReport {
+        repaired: true,
+        accounts: summaries(&store),
+        unresolved,
+        notes,
+        corrupt_files,
+    })
+}
+
+/// Store a freshly signed-in account as the active one. A different account
+/// that was active stays signed in, parked in the same store.
+fn store_signed_in_account(creds: &MsaCredentials) -> LauncherResult<()> {
+    let _guard = store_guard();
+    ensure_accounts_writable()?;
+    let mut store = read_store_unlocked()?;
+    ensure_accounts_writable()?;
+    if let Some(current) = store.active.clone() {
+        if !same_account(&current.uuid, &creds.uuid) {
+            store.add_parked(&current);
+        }
+    }
+    store.remove_parked(&creds.uuid);
+    store.active = Some(creds.clone());
+    write_store_unlocked(&store)
+}
+
+/// Every signed-in account, the active one first.
+pub fn list_accounts() -> LauncherResult<Vec<MsaAccountSummary>> {
+    let _guard = store_guard();
+    let store = read_store_unlocked()?;
+    Ok(summaries(&store))
+}
+
+/// Make another signed-in account the one launches use.
+///
+/// One write replaces the whole store, so an interruption leaves either the
+/// old active account or the new one, and every parked credential stays in
+/// place.
+pub fn switch_account(uuid: &str) -> LauncherResult<MsaAccountSummary> {
+    let _guard = store_guard();
+    ensure_accounts_writable()?;
+    let mut store = read_store_unlocked()?;
+    ensure_accounts_writable()?;
+    let target = store
+        .parked
+        .iter()
+        .find(|entry| same_account(&entry.uuid, uuid))
+        .and_then(|entry| entry.credentials.clone())
+        .ok_or_else(|| {
+            err(
+                "ERR_MSA_ACCOUNT",
+                "That account is not signed in to Agora any more.",
+            )
+        })?;
+
+    if let Some(current) = store.active.clone() {
+        if same_account(&current.uuid, uuid) {
+            store.remove_parked(uuid);
+            write_store_unlocked(&store)?;
+            return Ok(summary(&current, true));
+        }
+        store.add_parked(&current);
+    }
+    store.remove_parked(uuid);
+    store.active = Some(target.clone());
+    write_store_unlocked(&store)?;
+    Ok(summary(&target, true))
+}
+
+/// Forget one account. Removing the active account makes the next signed-in
+/// account active, so launching keeps working when there is one.
+pub fn remove_account(uuid: &str) -> LauncherResult<()> {
+    let _guard = store_guard();
+    ensure_accounts_writable()?;
+    let mut store = read_store_unlocked()?;
+    ensure_accounts_writable()?;
+    if store
+        .active
+        .as_ref()
+        .is_some_and(|current| same_account(&current.uuid, uuid))
+    {
+        store.active = None;
+        if let Some(position) = store.first_usable_parked() {
+            let next = store.parked.remove(position);
+            store.active = next.credentials;
+        }
+        return write_store_unlocked(&store);
+    }
+    store.remove_parked(uuid);
+    write_store_unlocked(&store)
+}
+
+/// Sign the active account out. Returns the account that became active in its
+/// place, if another one is signed in.
+///
+/// An entry whose credential is missing is skipped rather than treated as the
+/// next account: it cannot be launched, and reporting that as an error after
+/// the active account was already cleared left the user signed out anyway.
+pub fn sign_out_active() -> LauncherResult<Option<MsaAccountSummary>> {
+    let _guard = store_guard();
+    ensure_accounts_writable()?;
+    let mut store = read_store_unlocked()?;
+    ensure_accounts_writable()?;
+    store.active = None;
+    let next = match store.first_usable_parked() {
+        Some(position) => {
+            let entry = store.parked.remove(position);
+            store.active = entry.credentials;
+            store.active.as_ref().map(|creds| summary(creds, true))
+        }
+        None => None,
+    };
+    write_store_unlocked(&store)?;
+    Ok(next)
+}
+
+fn summary(creds: &MsaCredentials, active: bool) -> MsaAccountSummary {
+    MsaAccountSummary {
+        uuid: creds.uuid.clone(),
+        username: creds.username.clone(),
+        active,
+        needs_reauth: creds.needs_reauth(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Durable, race-safe credential refresh
+// ---------------------------------------------------------------------------
+
+/// Outcome of [`get_valid_credentials`].
+#[derive(Debug)]
+pub enum MsaCredentialOutcome {
+    /// Credentials are valid and ready to use (possibly just-refreshed).
+    Valid(MsaCredentials),
+    /// Session has been permanently invalidated; user must sign in again.
+    SignInRequired,
+    /// Temporary failure; stored credentials preserved.
+    RefreshFailed(LauncherError),
+}
+
+/// The access-token value handed to the game for a local, offline session.
+///
+/// Minecraft's own launch arguments (`--accessToken ${auth_access_token}` in the
+/// version JSON, substituted in `launch_planner::substitute`) only pass this on
+/// to the session service. Single-player never validates it; the conventional
+/// placeholder is `0`, and `user_type` stays `legacy` exactly as the delegated
+/// launch path already uses for an account Agora does not own. No real token is
+/// involved, and online servers reject it, which the note says.
+pub const OFFLINE_ACCESS_TOKEN: &str = "0";
+
+/// The sentence a launch result and the UI must show for an offline session.
+pub const OFFLINE_PLAY_NOTE: &str =
+    "Playing offline: online servers and Realms will not accept this session.";
+
+/// Whether a failed refresh means "no network" rather than "the account is no
+/// longer valid". Only failures in this list fall back to the stored profile.
+///
+/// A 4xx (including `invalid_grant` and every other refusal) is a decision by
+/// Microsoft about the session, so it must never launch offline. Lockdown Mode,
+/// a disabled Microsoft switch and an unreadable privacy store all mean no
+/// network request was made, which is the same condition for this purpose.
+pub fn is_offline_refresh_failure(error: &LauncherError) -> bool {
+    match error {
+        LauncherError::NetworkOffline | LauncherError::NetworkUnavailable { .. } => true,
+        LauncherError::NetworkMsaDisabled => true,
+        LauncherError::Generic { code, .. } => matches!(
+            code.as_str(),
+            "ERR_NETWORK"
+                | "ERR_NETWORK_LOCKDOWN"
+                | "ERR_NETWORK_ENDPOINT_DISABLED"
+                | "ERR_NETWORK_SETTINGS_UNREADABLE"
+                | ERR_MSA_SERVER_UNAVAILABLE
+        ),
+        _ => false,
+    }
+}
+
+/// The offline note, naming the reason so a lockdown/settings launch is not
+/// mistaken for a normal outage.
+pub fn offline_play_note(error: &LauncherError) -> String {
+    let reason = match error {
+        LauncherError::NetworkOffline | LauncherError::NetworkUnavailable { .. } => {
+            "Agora could not reach Microsoft."
+        }
+        LauncherError::NetworkMsaDisabled => "Microsoft sign-in is turned off in Settings.",
+        LauncherError::Generic { code, .. } => match code.as_str() {
+            "ERR_NETWORK_LOCKDOWN" => "Lockdown Mode is on, so Agora is using no network.",
+            "ERR_NETWORK_ENDPOINT_DISABLED" => {
+                "Microsoft sign-in is turned off in Settings, so Agora is using no network."
+            }
+            "ERR_NETWORK_SETTINGS_UNREADABLE" => {
+                "Agora could not read the privacy settings, so it is using no network."
+            }
+            ERR_MSA_SERVER_UNAVAILABLE => "Microsoft's sign-in servers are unavailable.",
+            _ => "Agora could not renew the Microsoft sign-in.",
+        },
+        _ => "Agora could not renew the Microsoft sign-in.",
+    };
+    format!("{OFFLINE_PLAY_NOTE} {reason}")
+}
+
+static MSA_REFRESH_MUTEX: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Injectable abstraction for the complete MSA refresh chain.
+#[async_trait::async_trait]
+pub(crate) trait MsaRefreshHttp: Send + Sync {
+    async fn refresh_credentials(
+        &self,
+        clients: &HttpClients,
+        credentials: &MsaCredentials,
+    ) -> LauncherResult<MsaCredentials>;
+}
+
+/// Production MSA refresh client that delegates to the real HTTP endpoints.
+pub(crate) struct LiveMsaRefreshHttp;
+
+#[async_trait::async_trait]
+impl MsaRefreshHttp for LiveMsaRefreshHttp {
+    async fn refresh_credentials(
+        &self,
+        clients: &HttpClients,
+        credentials: &MsaCredentials,
+    ) -> LauncherResult<MsaCredentials> {
+        let oauth = refresh_oauth_token(clients, &credentials.refresh_token).await?;
+        run_minecraft_chain(clients, &oauth, false).await
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+use std::collections::VecDeque;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::Mutex;
+
+/// In-memory scripted MSA refresh client for testing.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone)]
+#[allow(dead_code)]
+pub(crate) struct MockMsaRefreshHttp {
+    call_count: Arc<AtomicU64>,
+    responses: Arc<Mutex<MockMsaResponses>>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+type MockMsaResponses = VecDeque<LauncherResult<(String, String, u64)>>;
+
+#[cfg(any(test, feature = "test-support"))]
+#[allow(dead_code)]
+impl MockMsaRefreshHttp {
+    pub(crate) fn new() -> Self {
+        Self {
+            call_count: Arc::new(AtomicU64::new(0)),
+            responses: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
+
+    pub(crate) fn queue_success(&self, access_token: &str, refresh_token: &str, expires_in: u64) {
+        self.responses.lock().unwrap().push_back(Ok((
+            access_token.to_string(),
+            refresh_token.to_string(),
+            expires_in,
+        )));
+    }
+
+    pub(crate) fn queue_error(&self, error: LauncherError) {
+        self.responses.lock().unwrap().push_back(Err(error));
+    }
+
+    pub(crate) fn call_count(&self) -> u64 {
+        self.call_count.load(AtomicOrdering::SeqCst)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[async_trait::async_trait]
+impl MsaRefreshHttp for MockMsaRefreshHttp {
+    async fn refresh_credentials(
+        &self,
+        _clients: &HttpClients,
+        credentials: &MsaCredentials,
+    ) -> LauncherResult<MsaCredentials> {
+        self.call_count.fetch_add(1, AtomicOrdering::SeqCst);
+        let mut lock = self.responses.lock().unwrap();
+        let (access_token, refresh_token, expires_in) = lock.pop_front().unwrap_or_else(|| {
+            panic!(
+                "MockMsaRefreshHttp: no more responses (call #{})",
+                self.call_count.load(AtomicOrdering::SeqCst)
+            )
+        })?;
+        Ok(MsaCredentials {
+            username: credentials.username.clone(),
+            uuid: credentials.uuid.clone(),
+            access_token,
+            refresh_token,
+            expires: Utc::now() + chrono::Duration::seconds(expires_in as i64),
+            client_id: AGORA_MSA_CLIENT_ID.to_string(),
+            auth_version: MSA_AUTH_VERSION,
+        })
+    }
+}
+
+/// Obtain valid MSA credentials with single-flight refresh and double-check.
+///
+/// 1. Loads stored credentials; returns `SignInRequired` if none exist or if
+///    they came from the pre-migration flow.
+/// 2. If still within the 5‑minute margin, returns `Valid` immediately.
+/// 3. Acquires a refresh mutex and re‑checks (another caller may have refreshed).
+/// 4. Refreshes the Microsoft token and repeats the Xbox/Minecraft exchanges.
+///    - On `invalid_grant` / `expired_token`, clears credentials and returns `SignInRequired`.
+///    - On network / 5xx / malformed responses, preserves credentials and returns `RefreshFailed`.
+///    - On success, persists the result and returns `Valid`.
+pub async fn get_valid_credentials(clients: &HttpClients) -> MsaCredentialOutcome {
+    // A refused request is a temporary condition — Lockdown Mode or a disabled
+    // endpoint — so stored credentials must be preserved rather than treated as
+    // an invalidated session.
+    if let Err(error) = clients.authorize(ClientCategory::Microsoft) {
+        return MsaCredentialOutcome::RefreshFailed(error);
+    }
+    get_valid_credentials_inner(&LiveMsaRefreshHttp, clients).await
+}
+
+/// Internal variant with injectable HTTP — enables deterministic testing.
+async fn get_valid_credentials_inner(
+    http: &dyn MsaRefreshHttp,
+    clients: &HttpClients,
+) -> MsaCredentialOutcome {
+    // 1. Load stored credentials
+    let creds = match load_credentials() {
+        Ok(Some(c)) => c,
+        Ok(None) => return MsaCredentialOutcome::SignInRequired,
+        Err(e) => return MsaCredentialOutcome::RefreshFailed(e),
+    };
+
+    // A credential from the old application cannot be renewed by this one.
+    // It is kept on disk so the UI can explain the one-time sign-in rather
+    // than silently forgetting the account.
+    if creds.needs_reauth() {
+        return MsaCredentialOutcome::SignInRequired;
+    }
+
+    // 2. Return immediately if still fresh
+    if !creds.needs_refresh() {
+        return MsaCredentialOutcome::Valid(creds);
+    }
+
+    // 3. Single-flight with double-check
+    let _lock = MSA_REFRESH_MUTEX.lock().await;
+
+    let creds = match load_credentials() {
+        Ok(Some(c)) => c,
+        Ok(None) => return MsaCredentialOutcome::SignInRequired,
+        Err(e) => return MsaCredentialOutcome::RefreshFailed(e),
+    };
+    if creds.needs_reauth() {
+        return MsaCredentialOutcome::SignInRequired;
+    }
+    if !creds.needs_refresh() {
+        return MsaCredentialOutcome::Valid(creds);
+    }
+
+    // 4. Complete refresh chain — the permanent/transient decision point.
+    let refreshed = match http.refresh_credentials(clients, &creds).await {
+        Ok(result) => result,
+        Err(LauncherError::MsaAuthRequired) => {
+            // Permanent: invalid_grant or expired_token
+            let _ = clear_account_credentials(&creds.uuid);
+            return MsaCredentialOutcome::SignInRequired;
+        }
+        Err(e) => {
+            // Transient: preserve existing credentials
+            return MsaCredentialOutcome::RefreshFailed(e);
+        }
+    };
+
+    match commit_refreshed(&refreshed) {
+        Ok(()) => MsaCredentialOutcome::Valid(refreshed),
+        Err(e) => MsaCredentialOutcome::RefreshFailed(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status(code: u16) -> reqwest::StatusCode {
+        reqwest::StatusCode::from_u16(code).unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // Configuration
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn uses_agora_public_client_and_consumers_authority() {
+        assert_eq!(AGORA_MSA_CLIENT_ID, "2dbd8051-d5dd-4611-bcae-b38400c1dc30");
+        assert_eq!(MSA_SCOPE, "XboxLive.signin offline_access");
+        assert!(DEVICE_CODE_URL.starts_with("https://login.microsoftonline.com/consumers/"));
+        assert!(TOKEN_URL.starts_with("https://login.microsoftonline.com/consumers/"));
+        assert!(DEVICE_CODE_URL.ends_with("/oauth2/v2.0/devicecode"));
+        assert!(TOKEN_URL.ends_with("/oauth2/v2.0/token"));
+    }
+
+    #[test]
+    fn secrets_are_redacted_in_debug_output() {
+        let flow = MsaDeviceCodeFlow {
+            device_code: "super-secret-device-code".into(),
+            user_code: "ABCD-EFGH".into(),
+            verification_uri: "https://microsoft.com/link".into(),
+            expires_at: Utc::now(),
+            interval_secs: 5,
+        };
+        let rendered = format!("{flow:?}");
+        assert!(!rendered.contains("super-secret-device-code"));
+        assert!(!rendered.contains("ABCD-EFGH"));
+
+        let rendered = format!("{:?}", current_creds());
+        assert!(!rendered.contains("mc_test_access"));
+        assert!(!rendered.contains("mc_test_refresh"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Device-code poll classification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn poll_success_yields_tokens() {
+        let body = r#"{"access_token":"ms-access","refresh_token":"ms-refresh","expires_in":3600}"#;
+        match classify_device_poll(status(200), body) {
+            DevicePoll::Complete(token) => {
+                assert_eq!(token.access_token, "ms-access");
+                assert_eq!(token.refresh_token, "ms-refresh");
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poll_classifies_pending_slowdown_declined_and_expiry() {
+        assert!(matches!(
+            classify_device_poll(status(400), r#"{"error":"authorization_pending"}"#),
+            DevicePoll::Pending
+        ));
+        assert!(matches!(
+            classify_device_poll(status(400), r#"{"error":"slow_down"}"#),
+            DevicePoll::SlowDown
+        ));
+        assert!(matches!(
+            classify_device_poll(status(400), r#"{"error":"authorization_declined"}"#),
+            DevicePoll::Declined
+        ));
+        assert!(matches!(
+            classify_device_poll(status(400), r#"{"error":"access_denied"}"#),
+            DevicePoll::Declined
+        ));
+        assert!(matches!(
+            classify_device_poll(status(400), r#"{"error":"expired_token"}"#),
+            DevicePoll::Expired
+        ));
+        // A 5xx with no OAuth error is a blip, not a decision.
+        assert!(matches!(
+            classify_device_poll(status(503), "<html>gateway</html>"),
+            DevicePoll::Pending
+        ));
+    }
+
+    #[test]
+    fn poll_reports_application_access_denial_distinctly() {
+        for code in ["unauthorized_client", "invalid_client", "invalid_scope"] {
+            let body = format!(r#"{{"error":"{code}"}}"#);
+            match classify_device_poll(status(400), &body) {
+                DevicePoll::Fatal(LauncherError::Generic { code, .. }) => {
+                    assert_eq!(code, "ERR_MSA_APP_ACCESS_DENIED");
+                }
+                other => panic!("expected application-access denial, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn poll_never_echoes_error_descriptions() {
+        let body = r#"{"error":"invalid_request","error_description":"AADSTS900144 user@example.com secret detail"}"#;
+        let outcome = classify_device_poll(status(400), body);
+        let rendered = format!("{outcome:?}");
+        assert!(!rendered.contains("user@example.com"));
+        assert!(!rendered.contains("secret detail"));
+        assert!(rendered.contains("invalid_request"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Polling loop
+    // -----------------------------------------------------------------------
+
+    /// Scripted poller with a virtual clock: `sleep` advances time instead of
+    /// waiting, so expiry and backoff are exercised without real delays.
+    struct ScriptedPoller {
+        script: Mutex<VecDeque<LauncherResult<DevicePoll>>>,
+        now: Mutex<DateTime<Utc>>,
+        slept: AtomicU64,
+        calls: AtomicU64,
+        cancel_after: Option<(u64, MsaLoginCancel)>,
+    }
+
+    impl ScriptedPoller {
+        fn new(script: Vec<LauncherResult<DevicePoll>>) -> Self {
+            Self {
+                script: Mutex::new(script.into()),
+                now: Mutex::new(Utc::now()),
+                slept: AtomicU64::new(0),
+                calls: AtomicU64::new(0),
+                cancel_after: None,
+            }
+        }
+
+        fn cancelling_after(mut self, calls: u64, cancel: MsaLoginCancel) -> Self {
+            self.cancel_after = Some((calls, cancel));
+            self
+        }
+
+        fn slept(&self) -> u64 {
+            self.slept.load(AtomicOrdering::SeqCst)
+        }
+
+        fn calls(&self) -> u64 {
+            self.calls.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DeviceTokenPoller for ScriptedPoller {
+        async fn poll_once(&self) -> LauncherResult<DevicePoll> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            if let Some((after, cancel)) = &self.cancel_after {
+                if call >= *after {
+                    cancel.cancel();
+                }
+            }
+            self.script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(DevicePoll::Pending))
+        }
+
+        async fn sleep(&self, secs: u64) {
+            self.slept.fetch_add(secs, AtomicOrdering::SeqCst);
+            let mut now = self.now.lock().unwrap();
+            *now += chrono::Duration::seconds(secs as i64);
+        }
+
+        fn now(&self) -> DateTime<Utc> {
+            *self.now.lock().unwrap()
+        }
+    }
+
+    fn far_future() -> DateTime<Utc> {
+        Utc::now() + chrono::Duration::hours(1)
+    }
+
+    #[tokio::test]
+    async fn poll_loop_returns_token_after_pending() {
+        let poller = ScriptedPoller::new(vec![
+            Ok(DevicePoll::Pending),
+            Ok(DevicePoll::Pending),
+            Ok(DevicePoll::Complete(OAuthToken {
+                access_token: "ms-access".into(),
+                refresh_token: "ms-refresh".into(),
+            })),
+        ]);
+        let token = run_device_poll(&poller, 5, far_future(), &MsaLoginCancel::new())
+            .await
+            .expect("device poll should complete");
+        assert_eq!(token.access_token, "ms-access");
+        // Two pending answers, five seconds of waiting each — no busy polling.
+        assert_eq!(poller.slept(), 10);
+    }
+
+    #[tokio::test]
+    async fn poll_loop_backs_off_on_slow_down() {
+        let poller = ScriptedPoller::new(vec![
+            Ok(DevicePoll::SlowDown),
+            Ok(DevicePoll::Complete(OAuthToken {
+                access_token: "ms-access".into(),
+                refresh_token: "ms-refresh".into(),
+            })),
+        ]);
+        run_device_poll(&poller, 5, far_future(), &MsaLoginCancel::new())
+            .await
+            .expect("device poll should complete");
+        // 5s interval + 5s slow_down increment.
+        assert_eq!(poller.slept(), 10);
+    }
+
+    #[tokio::test]
+    async fn poll_loop_stops_when_cancelled() {
+        let cancel = MsaLoginCancel::new();
+        let poller = ScriptedPoller::new(vec![Ok(DevicePoll::Pending), Ok(DevicePoll::Pending)])
+            .cancelling_after(1, cancel.clone());
+
+        let error = run_device_poll(&poller, 5, far_future(), &cancel)
+            .await
+            .expect_err("cancellation must stop the loop");
+        assert!(format!("{error:?}").contains("ERR_MSA_LOGIN_CANCELLED"));
+        assert_eq!(poller.calls(), 1, "must not poll again after cancellation");
+        // Cancellation is noticed within the first second of the wait.
+        assert!(poller.slept() <= 1);
+    }
+
+    #[tokio::test]
+    async fn poll_loop_stops_at_expiry() {
+        let poller = ScriptedPoller::new(vec![]);
+        let expires_at = poller.now() + chrono::Duration::seconds(12);
+        let error = run_device_poll(&poller, 5, expires_at, &MsaLoginCancel::new())
+            .await
+            .expect_err("expiry must stop the loop");
+        assert!(format!("{error:?}").contains("ERR_MSA_LOGIN_EXPIRED"));
+    }
+
+    #[tokio::test]
+    async fn poll_loop_reports_denial() {
+        let poller = ScriptedPoller::new(vec![Ok(DevicePoll::Declined)]);
+        let error = run_device_poll(&poller, 5, far_future(), &MsaLoginCancel::new())
+            .await
+            .expect_err("denial must stop the loop");
+        assert!(format!("{error:?}").contains("ERR_MSA_LOGIN_DECLINED"));
+    }
+
+    #[tokio::test]
+    async fn poll_loop_retries_transient_network_errors_but_not_policy_refusals() {
+        let poller = ScriptedPoller::new(vec![
+            Err(LauncherError::NetworkOffline),
+            Ok(DevicePoll::Complete(OAuthToken {
+                access_token: "ms-access".into(),
+                refresh_token: "ms-refresh".into(),
+            })),
+        ]);
+        run_device_poll(&poller, 5, far_future(), &MsaLoginCancel::new())
+            .await
+            .expect("a network blip must not end the login");
+
+        // Lockdown / disabled endpoint / disabled MSA preference must stop it.
+        for code in [
+            "ERR_NETWORK_LOCKDOWN",
+            "ERR_NETWORK_ENDPOINT_DISABLED",
+            "ERR_NETWORK_GATE_MISSING",
+            "ERR_NETWORK_DISABLED",
+        ] {
+            let poller = ScriptedPoller::new(vec![Err(err(code, "blocked"))]);
+            let error = run_device_poll(&poller, 5, far_future(), &MsaLoginCancel::new())
+                .await
+                .expect_err("a policy refusal must stop the loop");
+            assert!(format!("{error:?}").contains(code));
+            assert_eq!(poller.calls(), 1);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Xbox / Minecraft response validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn xsts_errors_are_distinguished() {
+        let cases = [
+            (2148916233u64, "ERR_MSA_XBOX_NO_ACCOUNT"),
+            (2148916227, "ERR_MSA_XBOX_BANNED"),
+            (2148916235, "ERR_MSA_XBOX_REGION"),
+            (2148916238, "ERR_MSA_XBOX_CHILD_ACCOUNT"),
+            (2148916236, "ERR_MSA_XBOX_ADULT_VERIFICATION"),
+        ];
+        for (xerr, expected) in cases {
+            match xsts_error_for(xerr) {
+                Some(LauncherError::Generic { code, .. }) => assert_eq!(code, expected),
+                other => panic!("expected {expected} for {xerr}, got {other:?}"),
+            }
+        }
+        assert!(xsts_error_for(1).is_none());
+    }
+
+    #[test]
+    fn xerr_parses_from_number_or_string() {
+        assert_eq!(parse_xerr(r#"{"XErr":2148916233}"#), Some(2148916233));
+        assert_eq!(parse_xerr(r#"{"XErr":"2148916233"}"#), Some(2148916233));
+        assert_eq!(parse_xerr("not json"), None);
+        assert_eq!(parse_xerr("{}"), None);
+    }
+
+    #[test]
+    fn entitlements_require_a_java_item_not_just_a_200() {
+        // The regression this guards: an empty items array is a successful
+        // response from an account that owns nothing.
+        assert!(!entitlements_grant_java(r#"{"items":[]}"#));
+        assert!(!entitlements_grant_java(r#"{}"#));
+        assert!(!entitlements_grant_java("not json"));
+        // Bedrock ownership does not grant Java.
+        assert!(!entitlements_grant_java(
+            r#"{"items":[{"name":"product_minecraft_bedrock"},{"name":"game_minecraft_bedrock"}]}"#
+        ));
+        assert!(entitlements_grant_java(
+            r#"{"items":[{"name":"product_minecraft"},{"name":"game_minecraft"}]}"#
+        ));
+        assert!(entitlements_grant_java(
+            r#"{"items":[{"name":"product_game_pass_ultimate"}]}"#
+        ));
+    }
+
+    #[test]
+    fn user_hash_is_read_from_display_claims() {
+        let token: xbox_types::XboxToken = serde_json::from_str(
+            r#"{"Token":"xbl","DisplayClaims":{"xui":[{"uhs":"user-hash"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(token.user_hash().as_deref(), Some("user-hash"));
+
+        let token: xbox_types::XboxToken =
+            serde_json::from_str(r#"{"Token":"xbl","DisplayClaims":{}}"#).unwrap();
+        assert!(token.user_hash().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Credential expiry, migration, and storage
+    // -----------------------------------------------------------------------
+
+    fn current_creds() -> MsaCredentials {
+        MsaCredentials {
+            username: "test_user".into(),
+            uuid: "abc-def-ghi".into(),
+            access_token: "mc_test_access".into(),
+            refresh_token: "mc_test_refresh".into(),
+            expires: Utc::now() + chrono::Duration::hours(1),
+            client_id: AGORA_MSA_CLIENT_ID.into(),
+            auth_version: MSA_AUTH_VERSION,
+        }
+    }
+
+    fn expired_creds() -> MsaCredentials {
+        let mut c = current_creds();
+        c.expires = Utc::now() - chrono::Duration::minutes(1);
+        c
+    }
+
+    #[test]
+    fn credentials_expiry_logic() {
+        assert!(expired_creds().is_expired());
+        assert!(expired_creds().needs_refresh());
+        assert!(!current_creds().is_expired());
+        assert!(!current_creds().needs_refresh());
+    }
+
+    #[test]
+    fn legacy_credentials_are_detected_and_migrate_by_signing_in() {
+        // Credentials written by the old flow have no client_id/auth_version.
+        let legacy: MsaCredentials = serde_json::from_str(
+            r#"{"username":"old","uuid":"u","access_token":"a","refresh_token":"r",
+                "expires":"2099-01-01T00:00:00Z"}"#,
+        )
+        .expect("pre-migration credentials must still deserialize");
+        assert_eq!(legacy.auth_version, 0);
+        assert!(legacy.client_id.is_empty());
+        assert!(legacy.needs_reauth());
+
+        // A credential from some other application is equally unusable.
+        let mut foreign = current_creds();
+        foreign.client_id = "00000000-0000-0000-0000-000000000000".into();
+        assert!(foreign.needs_reauth());
+
+        assert!(!current_creds().needs_reauth());
+    }
+
+    static TEST_MSA_MUTEX: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    fn reset_repair_state_for_test() {
+        REPAIR_NEEDED.store(false, std::sync::atomic::Ordering::Relaxed);
+        REPAIR_WARNED.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    struct TestMsaCredDir(tempfile::TempDir);
+    impl Drop for TestMsaCredDir {
+        fn drop(&mut self) {
+            reset_repair_state_for_test();
+            let _ = clear_credentials();
+            std::env::remove_var("AGORA_TEST_SECRET_DIR");
+        }
+    }
+
+    fn write_test_msa_creds(creds: &MsaCredentials) -> TestMsaCredDir {
+        let dir = tempfile::tempdir().expect("temp dir for MSA test credentials");
+        std::env::set_var("AGORA_TEST_SECRET_DIR", dir.path());
+        reset_repair_state_for_test();
+        let _ = clear_credentials();
+        store_credentials(creds).expect("store test MSA credentials");
+        TestMsaCredDir(dir)
+    }
+
+    fn test_clients() -> HttpClients {
+        HttpClients::new().expect("http clients")
+    }
+
+    fn account(uuid: &str, name: &str) -> MsaCredentials {
+        MsaCredentials {
+            username: name.into(),
+            uuid: uuid.into(),
+            ..current_creds()
+        }
+    }
+
+    fn names() -> Vec<(String, bool)> {
+        list_accounts()
+            .unwrap()
+            .into_iter()
+            .map(|a| (a.username, a.active))
+            .collect()
+    }
+
+    /// Start from an empty secret directory without creating the new store.
+    fn legacy_test_dir() -> TestMsaCredDir {
+        let dir = tempfile::tempdir().expect("temp dir for legacy MSA test credentials");
+        std::env::set_var("AGORA_TEST_SECRET_DIR", dir.path());
+        reset_repair_state_for_test();
+        TestMsaCredDir(dir)
+    }
+
+    fn store_legacy(service: &str, account: &str, file: &str, value: &str) {
+        auth::store_secret(service, account, file, CREDENTIALS_KEY_CONTEXT, value)
+            .expect("store legacy credential");
+    }
+
+    fn store_legacy_active(creds: &MsaCredentials) {
+        store_legacy(
+            KEYRING_SERVICE,
+            KEYRING_ACCOUNT,
+            CREDENTIALS_FALLBACK_FILE,
+            &serde_json::to_string(creds).unwrap(),
+        );
+    }
+
+    fn store_legacy_parked(creds: &MsaCredentials) {
+        let (account, file) = account_slot(&creds.uuid).unwrap();
+        store_legacy(
+            KEYRING_SERVICE,
+            &account,
+            &file,
+            &serde_json::to_string(creds).unwrap(),
+        );
+    }
+
+    fn store_legacy_index(entries: &[&MsaCredentials]) {
+        let index: Vec<AccountIndexEntry> = entries
+            .iter()
+            .map(|creds| AccountIndexEntry {
+                uuid: creds.uuid.clone(),
+                username: creds.username.clone(),
+            })
+            .collect();
+        store_legacy(
+            KEYRING_SERVICE,
+            ACCOUNT_INDEX_ACCOUNT,
+            ACCOUNT_INDEX_FILE,
+            &serde_json::to_string(&index).unwrap(),
+        );
+    }
+
+    fn store_legacy_index_raw(json: &str) {
+        store_legacy(
+            KEYRING_SERVICE,
+            ACCOUNT_INDEX_ACCOUNT,
+            ACCOUNT_INDEX_FILE,
+            json,
+        );
+    }
+
+    fn store_new_raw(json: &str) {
+        store_legacy(
+            KEYRING_SERVICE,
+            ACCOUNT_STORE_ACCOUNT,
+            ACCOUNT_STORE_FILE,
+            json,
+        );
+    }
+
+    fn credential_dir_for_test() -> std::path::PathBuf {
+        std::path::PathBuf::from(std::env::var("AGORA_TEST_SECRET_DIR").unwrap())
+    }
+
+    fn stored_file_contents(file: &str) -> Vec<u8> {
+        std::fs::read(credential_dir_for_test().join(file)).unwrap()
+    }
+
+    fn store_path() -> std::path::PathBuf {
+        credential_dir_for_test().join(ACCOUNT_STORE_FILE)
+    }
+
+    fn backup_path() -> std::path::PathBuf {
+        credential_dir_for_test().join(ACCOUNT_STORE_BACKUP_FILE)
+    }
+
+    fn corrupt_store(bytes: &[u8]) {
+        std::fs::write(store_path(), bytes).expect("corrupt the account store");
+    }
+
+    fn quarantined_files(file_name: &str) -> Vec<std::path::PathBuf> {
+        let mut kept: Vec<_> = std::fs::read_dir(credential_dir_for_test())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .map(|name| {
+                        name.to_string_lossy()
+                            .starts_with(&format!("{file_name}.corrupt-"))
+                    })
+                    .unwrap_or(false)
+            })
+            .collect();
+        kept.sort();
+        kept
+    }
+
+    fn repair_marker_exists_for_test() -> bool {
+        credential_dir_for_test().join(REPAIR_MARKER_FILE).exists()
+    }
+
+    #[tokio::test]
+    async fn migrating_the_old_slots_keeps_every_account() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let _td = legacy_test_dir();
+        let alice = account("aaaa1111", "Alice");
+        let bob = account("bbbb2222", "Bob");
+        let cara = account("cccc3333", "Cara");
+        store_legacy_active(&alice);
+        store_legacy_parked(&bob);
+        store_legacy_parked(&cara);
+        store_legacy_index(&[&bob, &cara]);
+
+        assert_eq!(
+            names(),
+            vec![
+                ("Alice".into(), true),
+                ("Bob".into(), false),
+                ("Cara".into(), false)
+            ]
+        );
+
+        // The migrated store is a real store, not a read-through of the old slots.
+        switch_account("cccc3333").unwrap();
+        assert_eq!(load_credentials().unwrap().unwrap().username, "Cara");
+        let stored = auth::load_secret(
+            KEYRING_SERVICE,
+            ACCOUNT_STORE_ACCOUNT,
+            ACCOUNT_STORE_FILE,
+            ACCOUNT_STORE_KEY_CONTEXT,
+        )
+        .unwrap()
+        .expect("migration must write the one store");
+        assert!(stored.contains("Cara"));
+    }
+
+    #[tokio::test]
+    async fn a_crash_after_the_migration_write_does_not_duplicate_or_resurrect_accounts() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let _td = legacy_test_dir();
+        let alice = account("aaaa1111", "Alice");
+        store_legacy_active(&alice);
+        store_legacy_index(&[]);
+        assert_eq!(names(), vec![("Alice".into(), true)]);
+
+        // Simulate a crash between writing the new store and removing the old
+        // slots: both now exist, and the old ones name a different account.
+        let ghost = account("dddd4444", "Ghost");
+        store_legacy_active(&ghost);
+        store_legacy_index(&[&ghost]);
+
+        assert_eq!(
+            names(),
+            vec![("Alice".into(), true)],
+            "the new store is authoritative and the leftovers are inert"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_index_still_launches_the_active_account() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let _td = legacy_test_dir();
+        let alice = account("aaaa1111", "Alice");
+        let bob = account("bbbb2222", "Bob");
+        store_legacy_active(&alice);
+        store_legacy_parked(&bob);
+        store_legacy_index_raw("{ this is not the account list");
+        let corrupt_bytes = stored_file_contents(ACCOUNT_INDEX_FILE);
+
+        // Direct launch reads exactly this.
+        assert_eq!(
+            load_credentials().unwrap().unwrap().username,
+            "Alice",
+            "a corrupt index must not lock the player out"
+        );
+        assert!(account_store_status().needs_repair);
+        assert!(repair_marker_exists_for_test());
+
+        let kept = quarantined_files(ACCOUNT_INDEX_FILE)
+            .pop()
+            .expect("the corrupt index must be kept");
+        assert_eq!(std::fs::read(&kept).unwrap(), corrupt_bytes);
+        assert!(!credential_dir_for_test().join(ACCOUNT_INDEX_FILE).exists());
+        let (_, parked_file) = account_slot(&bob.uuid).unwrap();
+        assert!(
+            auth::fallback_secret_present(&parked_file),
+            "the parked token must not be deleted or forgotten"
+        );
+    }
+
+    #[tokio::test]
+    async fn switching_is_refused_until_the_index_is_repaired() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let _td = legacy_test_dir();
+        let alice = account("aaaa1111", "Alice");
+        let bob = account("bbbb2222", "Bob");
+        store_legacy_active(&alice);
+        store_legacy_parked(&bob);
+        store_legacy_index_raw("{ this is not the account list");
+        let _ = load_credentials().unwrap();
+
+        let switch_error = switch_account("bbbb2222").expect_err("switching must be refused");
+        assert_eq!(switch_error.code(), ACCOUNT_STORE_NEEDS_REPAIR_CODE);
+        assert!(switch_error.to_string().contains("repair"));
+
+        let add_error = store_signed_in_account(&account("cccc3333", "Cara"))
+            .expect_err("adding an account must be refused");
+        assert_eq!(add_error.code(), ACCOUNT_STORE_NEEDS_REPAIR_CODE);
+        assert!(add_error.to_string().contains("repair"));
+    }
+
+    #[tokio::test]
+    async fn a_first_switch_on_an_unread_index_is_still_refused() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let _td = legacy_test_dir();
+        let alice = account("aaaa1111", "Alice");
+        let bob = account("bbbb2222", "Bob");
+        store_legacy_active(&alice);
+        store_legacy_parked(&bob);
+        store_legacy_index_raw("{ this is not the account list");
+
+        // No earlier read: the detection happens inside this call.
+        let error = switch_account("bbbb2222").expect_err("switching must be refused");
+        assert_eq!(error.code(), ACCOUNT_STORE_NEEDS_REPAIR_CODE);
+
+        assert_eq!(load_credentials().unwrap().unwrap().username, "Alice");
+    }
+
+    #[tokio::test]
+    async fn repair_rebuilds_the_index_and_keeps_the_corrupt_file() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let _td = legacy_test_dir();
+        let alice = account("aaaa1111", "Alice");
+        let bob = account("bbbb2222", "Bob");
+        store_legacy_active(&alice);
+        store_legacy_parked(&bob);
+        store_legacy_index_raw("{ this is not the account list");
+        let _ = load_credentials().unwrap();
+        let kept = quarantined_files(ACCOUNT_INDEX_FILE)
+            .pop()
+            .expect("the corrupt index must be kept");
+
+        let report = repair_account_store().expect("repair must rebuild the index");
+        assert!(report.repaired);
+        assert_eq!(
+            report
+                .accounts
+                .iter()
+                .map(|account| (account.username.clone(), account.active))
+                .collect::<Vec<_>>(),
+            vec![("Alice".into(), true), ("Bob".into(), false)]
+        );
+        assert!(report.unresolved.is_empty());
+        assert!(!account_store_status().needs_repair);
+        assert!(!repair_marker_exists_for_test());
+        assert!(kept.exists(), "repair must never delete the corrupt copy");
+
+        // The rebuilt list is a working index again.
+        switch_account("bbbb2222").expect("switching works after repair");
+        assert_eq!(load_credentials().unwrap().unwrap().username, "Bob");
+        assert_eq!(names(), vec![("Bob".into(), true), ("Alice".into(), false)]);
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_new_store_recovers_the_active_account_from_the_backup() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let _td = write_test_msa_creds(&account("aaaa1111", "Alice"));
+        store_signed_in_account(&account("bbbb2222", "Bob")).unwrap();
+        assert!(backup_path().is_file(), "a write keeps a recovery copy");
+
+        corrupt_store(b"{ not a store");
+        let corrupt_bytes = stored_file_contents(ACCOUNT_STORE_FILE);
+
+        assert_eq!(
+            load_credentials().unwrap().unwrap().username,
+            "Bob",
+            "the recovery copy keeps the active account launchable"
+        );
+        assert!(account_store_status().needs_repair);
+        let kept = quarantined_files(ACCOUNT_STORE_FILE)
+            .pop()
+            .expect("the corrupt store must be kept");
+        assert_eq!(std::fs::read(&kept).unwrap(), corrupt_bytes);
+
+        let error = switch_account("aaaa1111").expect_err("switching must be refused");
+        assert_eq!(error.code(), ACCOUNT_STORE_NEEDS_REPAIR_CODE);
+
+        let report = repair_account_store().expect("repair from the backup");
+        assert!(report.repaired);
+        assert_eq!(names(), vec![("Bob".into(), true), ("Alice".into(), false)]);
+        assert!(!account_store_status().needs_repair);
+        assert!(kept.exists(), "repair must never delete the corrupt copy");
+    }
+
+    #[tokio::test]
+    async fn a_missing_primary_falls_back_to_the_recovery_copy() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let _td = write_test_msa_creds(&account("aaaa1111", "Alice"));
+        assert!(backup_path().is_file());
+        std::fs::remove_file(store_path()).expect("remove the primary");
+
+        assert_eq!(
+            load_credentials().unwrap().unwrap().username,
+            "Alice",
+            "a primary lost after the recovery copy was written still launches"
+        );
+        assert!(account_store_status().needs_repair);
+        assert!(repair_account_store().unwrap().repaired);
+        assert!(!account_store_status().needs_repair);
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_store_with_no_recovery_copy_is_an_error() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let _td = legacy_test_dir();
+        store_new_raw("{ not a store");
+
+        let error = list_accounts().expect_err("nothing readable is reported honestly");
+        assert_eq!(error.code(), ACCOUNT_STORE_NEEDS_REPAIR_CODE, "{error:?}");
+        assert!(load_credentials().is_err());
+        assert!(account_store_status().needs_repair);
+    }
+
+    #[tokio::test]
+    async fn repair_reports_when_there_is_nothing_to_repair() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let _td = write_test_msa_creds(&account("aaaa1111", "Alice"));
+
+        let report = repair_account_store().expect("a readable store needs no repair");
+        assert!(!report.repaired);
+        assert!(report.notes[0].contains("readable"));
+        assert_eq!(report.accounts[0].username, "Alice");
+    }
+
+    #[tokio::test]
+    async fn signing_out_skips_an_entry_without_a_parked_credential() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let _td = legacy_test_dir();
+        let bob = account("bbbb2222", "Bob");
+        let cara = account("cccc3333", "Cara");
+        store_legacy_active(&account("aaaa1111", "Alice"));
+        // Bob is in the index but his parked credential is missing.
+        store_legacy_index(&[&bob, &cara]);
+        store_legacy_parked(&cara);
+
+        let next = sign_out_active()
+            .expect("a missing parked credential must not fail sign-out")
+            .expect("Cara becomes active");
+        assert_eq!(next.username, "Cara");
+        assert_eq!(names(), vec![("Cara".into(), true), ("Bob".into(), false)]);
+        assert!(list_accounts().unwrap()[1].needs_reauth);
+    }
+
+    #[tokio::test]
+    async fn signing_in_does_not_overwrite_a_store_it_cannot_read() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let _td = legacy_test_dir();
+        corrupt_store(b"{ not a store");
+        let before = stored_file_contents(ACCOUNT_STORE_FILE);
+
+        let error = store_signed_in_account(&account("bbbb2222", "Bob"))
+            .expect_err("a failed read must stop the write");
+        assert_eq!(error.code(), ACCOUNT_STORE_NEEDS_REPAIR_CODE, "{error:?}");
+        let kept = quarantined_files(ACCOUNT_STORE_FILE)
+            .pop()
+            .expect("the unreadable store must be kept");
+        assert_eq!(
+            std::fs::read(&kept).unwrap(),
+            before,
+            "the unreadable store must be kept exactly as it was"
+        );
+    }
+
+    struct BlockingRefreshHttp {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl MsaRefreshHttp for BlockingRefreshHttp {
+        async fn refresh_credentials(
+            &self,
+            _clients: &HttpClients,
+            credentials: &MsaCredentials,
+        ) -> LauncherResult<MsaCredentials> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(MsaCredentials {
+                access_token: "refreshed_token".into(),
+                refresh_token: "refreshed_refresh".into(),
+                expires: Utc::now() + chrono::Duration::hours(1),
+                ..credentials.clone()
+            })
+        }
+    }
+
+    async fn expired_alice_with_parked_bob() -> (TestMsaCredDir, MsaCredentials, MsaCredentials) {
+        let td = write_test_msa_creds(&expired_creds());
+        let alice = MsaCredentials {
+            username: "Alice".into(),
+            uuid: "aaaa1111".into(),
+            ..expired_creds()
+        };
+        let bob = account("bbbb2222", "Bob");
+        store_credentials(&alice).unwrap();
+        store_signed_in_account(&bob).unwrap();
+        switch_account("aaaa1111").unwrap();
+        (td, alice, bob)
+    }
+
+    #[tokio::test]
+    async fn a_refresh_racing_a_switch_does_not_overwrite_the_switch() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let (_td, _alice, _bob) = expired_alice_with_parked_bob().await;
+        let http = BlockingRefreshHttp {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        };
+
+        let clients = test_clients();
+        let refresh = get_valid_credentials_inner(&http, &clients);
+        tokio::pin!(refresh);
+        tokio::select! {
+            outcome = &mut refresh => panic!("refresh finished before the switch: {outcome:?}"),
+            _ = http.started.notified() => {}
+        }
+
+        switch_account("bbbb2222").expect("switch while the refresh waits");
+        http.release.notify_one();
+        let outcome = refresh.await;
+        assert!(
+            matches!(outcome, MsaCredentialOutcome::Valid(_)),
+            "{outcome:?}"
+        );
+
+        assert_eq!(
+            load_credentials().unwrap().unwrap().username,
+            "Bob",
+            "the refresh must not overwrite the account the user switched to"
+        );
+        switch_account("aaaa1111").unwrap();
+        assert_eq!(
+            load_credentials().unwrap().unwrap().access_token,
+            "refreshed_token",
+            "the refreshed token belongs in Alice's parked entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_does_not_resurrect_an_account_signed_out_during_it() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let (_td, _alice, _bob) = expired_alice_with_parked_bob().await;
+        let http = BlockingRefreshHttp {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        };
+
+        let clients = test_clients();
+        let refresh = get_valid_credentials_inner(&http, &clients);
+        tokio::pin!(refresh);
+        tokio::select! {
+            outcome = &mut refresh => panic!("refresh finished before sign-out: {outcome:?}"),
+            _ = http.started.notified() => {}
+        }
+
+        remove_account("aaaa1111").expect("sign Alice out while the refresh waits");
+        http.release.notify_one();
+        let outcome = refresh.await;
+        assert!(
+            matches!(outcome, MsaCredentialOutcome::Valid(_)),
+            "{outcome:?}"
+        );
+
+        assert_eq!(names(), vec![("Bob".into(), true)]);
+    }
+
+    #[tokio::test]
+    async fn signing_in_a_second_account_keeps_the_first() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let _td = write_test_msa_creds(&account("aaaa1111", "Alice"));
+
+        store_signed_in_account(&account("bbbb2222", "Bob")).unwrap();
+        assert_eq!(names(), vec![("Bob".into(), true), ("Alice".into(), false)]);
+
+        // Signing in again as the same person replaces, not duplicates.
+        store_signed_in_account(&account("bbbb2222", "Bob")).unwrap();
+        assert_eq!(names().len(), 2);
+
+        // Signing in to the parked account makes it active without a copy.
+        store_signed_in_account(&account("aaaa1111", "Alice")).unwrap();
+        assert_eq!(names(), vec![("Alice".into(), true), ("Bob".into(), false)]);
+    }
+
+    #[tokio::test]
+    async fn switching_and_removing_accounts() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let _td = write_test_msa_creds(&account("aaaa1111", "Alice"));
+        store_signed_in_account(&account("bbbb2222", "Bob")).unwrap();
+        store_signed_in_account(&account("cccc3333", "Cara")).unwrap();
+
+        let switched = switch_account("aaaa1111").unwrap();
+        assert_eq!(switched.username, "Alice");
+        assert_eq!(load_credentials().unwrap().unwrap().username, "Alice");
+        assert_eq!(names().len(), 3);
+        assert!(switch_account("dddd4444").is_err());
+        assert!(switch_account("../x").is_err());
+
+        remove_account("bbbb2222").unwrap();
+        assert_eq!(
+            names(),
+            vec![("Alice".into(), true), ("Cara".into(), false)]
+        );
+
+        // Signing out the active account hands over to the next one.
+        let next = sign_out_active().unwrap().unwrap();
+        assert_eq!(next.username, "Cara");
+        assert_eq!(names(), vec![("Cara".into(), true)]);
+        assert!(sign_out_active().unwrap().is_none());
+        assert!(names().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_valid_credentials_fresh_returns_immediately() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let http = MockMsaRefreshHttp::new();
+        let _td = write_test_msa_creds(&current_creds());
+
+        let outcome = get_valid_credentials_inner(&http, &test_clients()).await;
+
+        match outcome {
+            MsaCredentialOutcome::Valid(c) => {
+                assert_eq!(c.access_token, "mc_test_access");
+            }
+            _ => panic!("expected Valid for fresh credentials"),
+        }
+        assert_eq!(http.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_valid_credentials_no_creds_returns_sign_in_required() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let http = MockMsaRefreshHttp::new();
+        let _td = write_test_msa_creds(&current_creds());
+
+        // Clear after writing so no credentials exist
+        let _ = clear_credentials();
+
+        let outcome = get_valid_credentials_inner(&http, &test_clients()).await;
+
+        assert!(matches!(outcome, MsaCredentialOutcome::SignInRequired));
+    }
+
+    #[tokio::test]
+    async fn test_get_valid_credentials_refresh_success() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let http = MockMsaRefreshHttp::new();
+        http.queue_success("new_mc_token", "new_refresh_token", 28800);
+        let _td = write_test_msa_creds(&expired_creds());
+
+        let outcome = get_valid_credentials_inner(&http, &test_clients()).await;
+
+        match outcome {
+            MsaCredentialOutcome::Valid(c) => {
+                assert_eq!(c.username, "test_user");
+                assert_eq!(c.access_token, "new_mc_token");
+                assert_eq!(c.refresh_token, "new_refresh_token");
+                assert_eq!(c.client_id, AGORA_MSA_CLIENT_ID);
+                assert_eq!(c.auth_version, MSA_AUTH_VERSION);
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+        assert_eq!(http.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_legacy_credentials_require_sign_in_without_refresh_attempt() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let http = MockMsaRefreshHttp::new();
+        // No responses queued: a refresh attempt would panic the mock.
+        let mut legacy = expired_creds();
+        legacy.client_id = String::new();
+        legacy.auth_version = 0;
+        let _td = write_test_msa_creds(&legacy);
+
+        let outcome = get_valid_credentials_inner(&http, &test_clients()).await;
+
+        assert!(matches!(outcome, MsaCredentialOutcome::SignInRequired));
+        assert_eq!(
+            http.call_count(),
+            0,
+            "a legacy refresh token must never be sent to the new application"
+        );
+        // Kept on disk so the UI can explain the one-time sign-in.
+        assert!(load_credentials().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_get_valid_credentials_invalid_grant_is_permanent() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let http = MockMsaRefreshHttp::new();
+        http.queue_error(LauncherError::MsaAuthRequired);
+        let _td = write_test_msa_creds(&expired_creds());
+
+        let outcome = get_valid_credentials_inner(&http, &test_clients()).await;
+        assert!(matches!(outcome, MsaCredentialOutcome::SignInRequired));
+
+        // Credentials should be cleared
+        assert!(load_credentials().unwrap().is_none());
+        assert_eq!(http.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_valid_credentials_transient_preserves_creds() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let http = MockMsaRefreshHttp::new();
+        http.queue_error(LauncherError::NetworkOffline);
+        let _td = write_test_msa_creds(&expired_creds());
+
+        let outcome = get_valid_credentials_inner(&http, &test_clients()).await;
+        assert!(matches!(outcome, MsaCredentialOutcome::RefreshFailed(_)));
+
+        // Credentials should still be present
+        let loaded = load_credentials().unwrap();
+        assert!(loaded.is_some(), "creds must survive transient error");
+        assert_eq!(http.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_valid_credentials_double_check_skips_refresh() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let http = MockMsaRefreshHttp::new();
+        // No responses queued — if the double-check works, refresh is never called
+        let _td = write_test_msa_creds(&current_creds());
+
+        let outcome = get_valid_credentials_inner(&http, &test_clients()).await;
+        assert!(matches!(outcome, MsaCredentialOutcome::Valid(_)));
+        assert_eq!(http.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_is_msa_permanent_refresh_error_classification() {
+        assert!(is_msa_permanent_refresh_error(
+            r#"{"error":"invalid_grant"}"#
+        ));
+        assert!(is_msa_permanent_refresh_error(
+            r#"{"error":"expired_token"}"#
+        ));
+        assert!(is_msa_permanent_refresh_error(
+            r#"{"error":"invalid_grant","error_description":"The refresh token has expired"}"#
+        ));
+        assert!(!is_msa_permanent_refresh_error(
+            r#"{"error":"server_error"}"#
+        ));
+        assert!(!is_msa_permanent_refresh_error(
+            r#"{"error":"temporarily_unavailable"}"#
+        ));
+        assert!(!is_msa_permanent_refresh_error("not-json"));
+        assert!(!is_msa_permanent_refresh_error(""));
+    }
+
+    #[test]
+    fn only_no_network_refresh_failures_are_offline_playable() {
+        for error in [
+            LauncherError::NetworkOffline,
+            LauncherError::NetworkUnavailable {
+                action: "renew the Microsoft session".into(),
+            },
+            LauncherError::NetworkMsaDisabled,
+            LauncherError::Generic {
+                code: "ERR_NETWORK_LOCKDOWN".into(),
+                message: String::new(),
+            },
+            LauncherError::Generic {
+                code: "ERR_NETWORK_ENDPOINT_DISABLED".into(),
+                message: String::new(),
+            },
+            LauncherError::Generic {
+                code: "ERR_NETWORK_SETTINGS_UNREADABLE".into(),
+                message: String::new(),
+            },
+            LauncherError::Generic {
+                code: "ERR_MSA_SERVER_UNAVAILABLE".into(),
+                message: String::new(),
+            },
+        ] {
+            assert!(
+                is_offline_refresh_failure(&error),
+                "should allow offline play: {error:?}"
+            );
+        }
+
+        for error in [
+            LauncherError::MsaAuthRequired,
+            LauncherError::AuthExpired,
+            LauncherError::Generic {
+                code: "ERR_MSA_OAUTH_REFRESH_HTTP".into(),
+                message: String::new(),
+            },
+            LauncherError::Generic {
+                code: "ERR_MSA_NO_ENTITLEMENT".into(),
+                message: String::new(),
+            },
+            LauncherError::Generic {
+                code: "ERR_NETWORK_GATE_MISSING".into(),
+                message: String::new(),
+            },
+        ] {
+            assert!(
+                !is_offline_refresh_failure(&error),
+                "must not launch offline: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_server_error_is_offline_playable_but_invalid_grant_is_not() {
+        let server = refresh_http_failure(status(503), r#"{"error":"server_error"}"#);
+        assert_eq!(server.code(), ERR_MSA_SERVER_UNAVAILABLE);
+        assert!(is_offline_refresh_failure(&server));
+
+        let invalid = refresh_http_failure(status(400), r#"{"error":"invalid_grant"}"#);
+        assert!(matches!(invalid, LauncherError::MsaAuthRequired));
+        assert!(!is_offline_refresh_failure(&invalid));
+
+        let other_4xx = refresh_http_failure(status(429), r#"{"error":"temporarily_unavailable"}"#);
+        assert_eq!(other_4xx.code(), "ERR_MSA_OAUTH_REFRESH_HTTP");
+        assert!(!is_offline_refresh_failure(&other_4xx));
+    }
+
+    #[test]
+    fn the_offline_note_names_the_reason_and_what_will_not_work() {
+        let transport = offline_play_note(&LauncherError::NetworkOffline);
+        assert!(transport.contains("online servers and Realms will not accept this session"));
+        assert!(transport.contains("could not reach Microsoft"));
+
+        let lockdown = offline_play_note(&LauncherError::Generic {
+            code: "ERR_NETWORK_LOCKDOWN".into(),
+            message: String::new(),
+        });
+        assert!(lockdown.contains("Lockdown Mode"));
+
+        let disabled = offline_play_note(&LauncherError::NetworkMsaDisabled);
+        assert!(disabled.contains("Settings"));
+    }
+
+    /// Build a local state DB with one network setting written.
+    fn state_db_with(dir: &std::path::Path, key: &str, enabled: bool) -> std::path::PathBuf {
+        let db_path = dir.join("local_state.db");
+        db::init_local_state_db(&db_path).expect("init local state db");
+        let conn = db::local_state_connection(&db_path).expect("open local state db");
+        db::set_setting(&conn, key, &serde_json::json!(enabled)).expect("write setting");
+        db_path
+    }
+
+    #[tokio::test]
+    async fn login_and_refresh_stop_when_msa_networking_is_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = state_db_with(dir.path(), "network_msa_enabled", false);
+
+        let error = begin_login(&test_clients(), &db_path)
+            .await
+            .expect_err("sign-in must be refused when the MSA preference is off");
+        assert!(format!("{error:?}").contains("ERR_NETWORK_DISABLED"));
+
+        let flow = MsaDeviceCodeFlow {
+            device_code: "device".into(),
+            user_code: "ABCD-EFGH".into(),
+            verification_uri: "https://microsoft.com/link".into(),
+            expires_at: far_future(),
+            interval_secs: 5,
+        };
+        let error = poll_login(&test_clients(), &flow, &db_path, &MsaLoginCancel::new())
+            .await
+            .expect_err("polling must be refused when the MSA preference is off");
+        assert!(format!("{error:?}").contains("ERR_NETWORK_DISABLED"));
+
+        let error = refresh_credentials(&test_clients(), &current_creds(), &db_path)
+            .await
+            .expect_err("refresh must be refused when the MSA preference is off");
+        assert!(format!("{error:?}").contains("ERR_NETWORK_DISABLED"));
+    }
+
+    #[tokio::test]
+    async fn lockdown_mode_blocks_login_and_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = state_db_with(dir.path(), "network_lockdown_enabled", true);
+
+        let error = begin_login(&test_clients(), &db_path)
+            .await
+            .expect_err("Lockdown Mode must refuse sign-in");
+        assert!(format!("{error:?}").contains("ERR_NETWORK_DISABLED"));
+
+        let error = refresh_credentials(&test_clients(), &current_creds(), &db_path)
+            .await
+            .expect_err("Lockdown Mode must refuse refresh");
+        assert!(format!("{error:?}").contains("ERR_NETWORK_DISABLED"));
+    }
+
+    #[tokio::test]
+    async fn test_refresh_credentials_refuses_legacy_without_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("local_state.db");
+        let mut legacy = current_creds();
+        legacy.auth_version = 0;
+        legacy.client_id = String::new();
+
+        let error = refresh_credentials(&test_clients(), &legacy, &db_path)
+            .await
+            .expect_err("legacy credentials must not be refreshed");
+        assert!(format!("{error:?}").contains("ERR_MSA_LEGACY_CREDENTIALS"));
+    }
+}
+
+#[cfg(test)]
+mod transient_poll_error_tests {
+    use super::is_transient_poll_error;
+    use agora_core::error::LauncherError;
+
+    #[test]
+    fn any_network_failure_keeps_the_device_code_poll_going() {
+        assert!(is_transient_poll_error(&LauncherError::NetworkOffline));
+        assert!(is_transient_poll_error(
+            &LauncherError::NetworkUnavailable {
+                action: "sign in to Microsoft".into(),
+            }
+        ));
+    }
+
+    #[test]
+    fn a_refusal_stops_the_poll() {
+        assert!(!is_transient_poll_error(&LauncherError::AuthExpired));
+    }
+}

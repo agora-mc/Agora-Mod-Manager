@@ -10,6 +10,7 @@ Ed25519 signature file registry.db.sig.
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -20,18 +21,18 @@ import sqlite3
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+from urllib.parse import urlparse
 
 import requests
 
 from governance import (
-    COMMUNITY_REVIEW_LABEL,
+    GovernanceError,
     GovernanceMode,
     GovernancePolicy,
-    REGISTRY_VOTE_LABEL,
     enrich_governance_tables,
     enrich_registry_item_scores,
     resolve_governance_repo,
@@ -45,6 +46,12 @@ try:
     import nacl.encoding  # type: ignore
 except ImportError:
     nacl = None  # type: ignore
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger("compiler")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REGISTRY_DIR = REPO_ROOT / "registry"
@@ -214,88 +221,6 @@ def _get_registry_repo() -> str:
             "must be set to owner/repository"
         )
     return repo
-GITHUB_REACTION_UPVOTES = {"+1"}
-GITHUB_REACTION_DOWNVOTES = {"-1"}
-
-# How the issue body's "### Mod Registry ID" field looks when rendered by
-# GitHub issues created from the form. The form emits a heading followed by
-# the value on its own line.
-MOD_ID_FIELD_RE = re.compile(
-    r"###\s*Mod Registry ID\s*\r?\n+\s*(\S+)\s*(?:\r?\n|$)",
-    re.IGNORECASE,
-)
-
-# --- ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 step 5/6/8 + ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.2 Raid Shield circuit-breaker response ---
-#
-# When the velocity circuit breaker fires (Pass 2 set m.status='under_review' +
-# m.anomaly_window_start), the compiler performs beyond-just-status-flip:
-#   - ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.2 Raid Shield: programmatically enable "existing users only"
-#     interaction limits on the governance repo (covers ALL items, not just
-#     the offending one ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â GitHub interaction-limits are repo-wide).
-#   - ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 step 6: DELETE the offending reactions from GitHub via the REST
-#     API (their data is captured pre-DELETE in the audit log entry below).
-#   - ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 step 8 (create): create a 7-day triage poll in Discussions under
-#     a "Triage" category if it exists (soft-fail with a warning if the
-#     category isn't present ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â discussion creation is OPTIONAL, status flip
-#     is the hard requirement).
-#   - Admin-alert issue: file a high-priority confidential issue in the
-#     governance repo (private repos are out of scope; we file as a
-#     confidential issue on the configured registry repository itself).
-#
-# When `net_score < -10` organically (no spike), step 5 mandates the same
-# under_review flip + triage poll creation, but WITHOUT reaction-deletion
-# (no offending burst to delete) and WITHOUT Raid Shield (interaction limit
-# is only for burst-attack defense).
-TRIAGE_POLL_DURATION_DAYS = 7
-ORGANIC_UNDER_REVIEW_THRESHOLD = -10  # ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§5.3: net_score drops below -10 organically
-TRIAGE_DISCUSSION_CATEGORY_CANDIDATES = ("Triage", "Mod Reviews", "Community Triage")
-
-
-@dataclass
-class UserReaction:
-    """One (user, vote_direction, timestamp) extracted from a GitHub reaction.
-
-    `comment_id` is None when the reaction was placed directly on the issue
-    itself (rather than on a comment). `is_upvote` is True for +1 / thumbs_up
-    emoji, False for -1 / thumbs_down, None for neutral emoji (laugh, hooray,
-    confused, heart, rocket, eyes) ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â those are still tracked because user
-    participation in ANY reaction on the mod's tracking issue counts toward
-    diversity (Sybil resistance, Pass 2).
-    """
-    user: str
-    is_upvote: bool | None
-    timestamp: datetime
-    comment_id: int | None = None
-
-
-@dataclass
-class ModSocialMetrics:
-    """Raw (pre-trust-filter) social metrics for one mod.
-
-    Populated in Pass 1 by `_hydrate_github_social_metrics`. Pass 2 will consume
-    these to compute final upvotes/downvotes/net_score/velocity after applying
-    the trust + Sybil + velocity circuit-breaker rules from ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 steps 4, 5, 9.
-    """
-    mod_id: str
-    issue_number: int
-    reactions: list[UserReaction] = field(default_factory=list)
-    # Pass 2 (computed by _apply_trust_velocity_pass ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â not populated by Pass 1):
-    upvotes: int = 0
-    downvotes: int = 0
-    net_score: int = 0
-    velocity: float = 0.0
-    status: str = "active"
-    anomaly_window_start: datetime | None = None  # set if velocity circuit breaker fired
-    raw_reviews: list[dict[str, Any]] = field(default_factory=list)
-    # Each entry: {"author": str, "text": str, "issue_number": int, "created_at": ISO-datetime-string}.
-    # Populated during _hydrate_github_social_metrics by parsing the form's
-    # "Your Technical Review" field from the issue body. Pass 2 / step 7 then
-    # filters via _scrub_review_text and feeds the survivors into
-    # curator_reviews.top_reviews_json.
-    scrubbed_reviews: list[dict[str, Any]] = field(default_factory=list)
-    immunity_cooldown_until: str | None = None
-
-
 def _load_github_token() -> str | None:
     """Read GITHUB_TOKEN from env (loaded by _load_dotenv()). Returns None when unset."""
     token = os.environ.get("GITHUB_TOKEN", "").strip()
@@ -354,1328 +279,45 @@ def _github_request(
     raise last_exc or RuntimeError(f"GitHub API {method} {path} exhausted retries")
 
 
-def _github_graphql(
-    query: str,
-    *,
-    token: str,
-    variables: dict[str, Any] | None = None,
-    max_retries: int = 5,
-) -> dict[str, Any]:
-    """POST a GraphQL query to the GitHub API. Handles rate limits + errors.
+def _load_poll_blacklist(*, allow_partial: bool = False) -> set[str]:
+    """Read registry/governance/poll_blacklist.json or stop the run.
 
-    Returns the `data` field of the GraphQL response. Raises on `errors[]`
-    in the response or non-2xx after retries. Rate-limit handling mirrors
-    `_github_request`: sleep until reset epoch on 403/429.
-    """
-    body = {"query": query}
-    if variables:
-        body["variables"] = variables
-    last_exc: Exception | None = None
-    for attempt in range(max_retries):
-        resp = requests.post(
-            f"{GITHUB_API_BASE}/graphql",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-                "User-Agent": f"AgoraCompiler/1.0 (https://github.com/{_get_registry_repo()})",
-            },
-            json=body,
-            timeout=60,
-        )
-        if resp.status_code in (200, 201):
-            payload = resp.json()
-            if "errors" in payload and payload["errors"]:
-                raise RuntimeError(f"GraphQL errors: {payload['errors']}")
-            return payload.get("data", {}) or {}
-        if resp.status_code in (403, 429):
-            remaining = resp.headers.get("X-RateLimit-Remaining")
-            reset_epoch = resp.headers.get("X-RateLimit-Reset")
-            if remaining == "0" or resp.status_code == 429:
-                sleep_for = 1.0
-                if reset_epoch:
-                    try:
-                        sleep_for = max(1.0, float(reset_epoch) - time.time() + 1.0)
-                    except ValueError:
-                        pass
-                logger.warning(
-                    "GitHub GraphQL rate-limited (attempt %d/%d). Sleeping %.0fs.",
-                    attempt + 1, max_retries, sleep_for,
-                )
-                time.sleep(min(sleep_for, 3600.0))
-                continue
-        body_excerpt = resp.text[:500] if resp.text else ""
-        last_exc = RuntimeError(f"GraphQL HTTP {resp.status_code}: {body_excerpt}")
-        break
-    raise last_exc or RuntimeError("GraphQL exhausted retries")
-
-
-def _user_org_interaction_count(login: str, org: str, *, token: str) -> int:
-    """Spec ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 step 4 (strict): count a user's interactions across the agora-mc org.
-
-    Uses the GraphQL `user.contributionsCollection` resolver scoped to the
-    org via `organization` argument. Returns the sum of totalIssuesContributedTo,
-    totalPullRequestContributions, totalIssueCommentsContributionsForContributor
-    within the scoped org. On any error: returns 0 (treated as untrusted ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â
-    fail-safe). NEVER cache this method on its own ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â callers cache via a
-    dict[str, int] passed in to amortize across mods.
-    """
-    query = """
-    query ($login: String!, $org: String!) {
-      user(login: $login) {
-        contributionsCollection(organization: $org) {
-          totalIssueContributions
-          totalPullRequestContributions
-          totalIssueCommentsContributionsForContributor
-          totalCommitContributions
-          totalRepositoryContributions
-        }
-      }
-    }
-    """
-    try:
-        data = _github_graphql(query, token=token, variables={"login": login, "org": org})
-        cc = (data.get("user") or {}).get("contributionsCollection") or {}
-        return int(cc.get("totalIssueContributions", 0)) \
-            + int(cc.get("totalPullRequestContributions", 0)) \
-            + int(cc.get("totalIssueCommentsContributionsForContributor", 0)) \
-            + int(cc.get("totalCommitContributions", 0)) \
-            + int(cc.get("totalRepositoryContributions", 0))
-    except Exception as exc:
-        logger.warning(
-            "Trust check: could not fetch contributionsCollection for '%s' in org '%s' (%s); treating as zero interactions.",
-            login, org, exc,
-        )
-        return 0
-
-
-def _github_paginate(
-    path: str,
-    *,
-    token: str,
-    per_page: int = 100,
-    max_pages: int = 50,
-    params: dict[str, Any] | None = None,
-) -> list[dict[str, Any]]:
-    """Fetch all pages of a GitHub list endpoint (Link-header pagination)."""
-    out: list[dict[str, Any]] = []
-    for page in range(1, max_pages + 1):
-        page_params: dict[str, Any] = {"per_page": per_page, "page": page}
-        if params:
-            page_params.update(params)
-        page_items = _github_request("GET", path, token=token, params=page_params)
-        if not isinstance(page_items, list):
-            break
-        out.extend(page_items)
-        if len(page_items) < per_page:
-            break
-    return out
-
-
-def _load_poll_blacklist() -> set[str]:
-    """Read registry/governance/poll_blacklist.json. Returns empty set on any error.
-
-    The schema is `{"usernames": ["name1", "name2"]}`.
+    The file is committed, so a missing or malformed copy means something
+    broke. Treating it as empty would count votes from blacklisted users.
+    The schema is ``{"usernames": ["name1", "name2"]}``.
     """
     path = REGISTRY_DIR / "governance" / "poll_blacklist.json"
     try:
         with path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
-        names = data.get("usernames", [])
-        return {str(n).lower() for n in names if isinstance(n, str)}
     except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("Could not load poll_blacklist.json (%s); treating as empty.", exc)
+        message = f"cannot read poll blacklist {path}: {exc}"
+        if not allow_partial:
+            raise GovernanceError(message) from exc
+        logger.warning("%s; continuing because partial governance is allowed.", message)
         return set()
-
-
-def _get_label_names(labels: list[Any]) -> list[str]:
-    """Return label names from a GitHub labels field (dict or string form)."""
-    out: list[str] = []
-    for label in labels:
-        if isinstance(label, dict):
-            name = label.get("name", "")
-            if name:
-                out.append(name)
-        elif isinstance(label, str):
-            out.append(label)
-    return out
-
-
-def _extract_mod_id(issue_body: str | None) -> str | None:
-    """Extract the mod registry ID from a review-form issue body."""
-    if not issue_body:
-        return None
-    m = MOD_ID_FIELD_RE.search(issue_body)
-    if not m:
-        return None
-    return m.group(1).strip().lower()
-
-
-def _parse_reaction(reaction_obj: dict[str, Any], comment_id: int | None) -> UserReaction | None:
-    """Convert a single GitHub reaction dict to a UserReaction, or None for malformed input."""
-    user_obj = reaction_obj.get("user") or {}
-    user = user_obj.get("login")
-    content = reaction_obj.get("content")
-    created_at = reaction_obj.get("created_at")
-    if not user or not content or not created_at:
-        return None
-    try:
-        ts = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if content in GITHUB_REACTION_UPVOTES:
-        is_up = True
-    elif content in GITHUB_REACTION_DOWNVOTES:
-        is_up = False
-    else:
-        is_up = None
-    return UserReaction(user=user.lower(), is_upvote=is_up, timestamp=ts, comment_id=comment_id)
-
-
-def _fetch_reactions_for_issue(
-    owner: str,
-    repo: str,
-    issue_number: int,
-    *,
-    token: str,
-    blacklist: set[str],
-) -> list[UserReaction]:
-    """Fetch all reactions on an issue + each of its comments (paginated).
-
-    Pass 1 ignores blacklist ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â that's applied at aggregation time in Pass 2.
-    """
-    out: list[UserReaction] = []
-    issue_reactions = _github_paginate(
-        f"/repos/{owner}/{repo}/issues/{issue_number}/reactions",
-        token=token,
-    )
-    for r in issue_reactions:
-        parsed = _parse_reaction(r, comment_id=None)
-        if parsed:
-            out.append(parsed)
-    comments = _github_paginate(
-        f"/repos/{owner}/{repo}/issues/{issue_number}/comments",
-        token=token,
-    )
-    for c in comments:
-        cid = c.get("id")
-        if not isinstance(cid, int):
-            continue
-        comment_reactions = _github_paginate(
-            f"/repos/{owner}/{repo}/issues/comments/{cid}/reactions",
-            token=token,
+    names = data.get("usernames") if isinstance(data, dict) else None
+    if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
+        message = (
+            f"malformed poll blacklist {path}: expected an object with a "
+            "'usernames' list of strings"
         )
-        for r in comment_reactions:
-            parsed = _parse_reaction(r, comment_id=cid)
-            if parsed:
-                out.append(parsed)
-    return out
-
-
-def _hydrate_github_social_metrics(
-    items: list[dict[str, Any]],
-) -> None:
-    """Attach `_social_metrics: ModSocialMetrics` to each item dict that has
-    a corresponding review-issue in the governance repo.
-
-    Mutates `items` in-place (mirrors the `_hydrate_modrinth_metadata` pattern).
-    On any error (no token, network failure, malformed data): silently leave
-    items untouched ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Pass 2 will treat missing `_social_metrics` as zeros.
-
-    ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 Step 3 (Pass 1): enumerate governance-repo issues, extract mod_id
-    from each review-form body, fetch reactions (issue-level + per-comment),
-    attach a ModSocialMetrics obj to the corresponding item dict.
-    """
-    token = _load_github_token()
-    if not token:
-        logger.info("GITHUB_TOKEN not set; social metrics will be zeroed (local dev mode).")
-        return
-    gov_full = _get_registry_repo()
-    owner, _, repo = gov_full.partition("/")
-    if not owner or not repo:
-        logger.warning("AGORA_REGISTRY_REPO='%s' is not 'owner/repo' format; skipping social metrics.", gov_full)
-        return
-    blacklist = _load_poll_blacklist()
-
-    mod_ids_present = {item["id"].lower(): item for item in items if "id" in item}
-
-    try:
-        all_issues = _github_paginate(
-            f"/repos/{owner}/{repo}/issues",
-            token=token,
-            params={"state": "all"},
-        )
-    except RuntimeError as exc:
-        if "404" in str(exc):
-            logger.warning(
-                "Registry repo %s/%s not found or has no issues (404). "
-                "Social metrics will be zeroed. Set AGORA_REGISTRY_REPO to the correct owner/repo.",
-                owner, repo,
-            )
-            return
-        raise
-    logger.info("Found %d issues in %s/%s governance repo", len(all_issues), owner, repo)
-
-    by_mod: dict[str, ModSocialMetrics] = {}
-    for issue in all_issues:
-        if "pull_request" in issue:
-            continue
-        issue_number = issue.get("number")
-        if not isinstance(issue_number, int):
-            continue
-        mod_id = _extract_mod_id(issue.get("body"))
-        if not mod_id or mod_id not in mod_ids_present:
-            continue
-        labels = _get_label_names(issue.get("labels") or [])
-        is_vote_issue = REGISTRY_VOTE_LABEL in labels
-        review_text = _extract_review_text(issue.get("body"))
-        author_obj = issue.get("user") or {}
-        author = author_obj.get("login")
-        created_at_str = issue.get("created_at")
-        if review_text and author and created_at_str and mod_id in by_mod:
-            by_mod[mod_id].raw_reviews.append({
-                "author": author,
-                "text": review_text,
-                "issue_number": issue_number,
-                "created_at": created_at_str,
-            })
-        # The `registry-vote` label is REQUIRED for an issue to contribute
-        # votes. Community-review issues are review sources only.
-        if not is_vote_issue:
-            if COMMUNITY_REVIEW_LABEL not in labels:
-                logger.warning(
-                    "Issue #%d maps to mod '%s' but lacks the '%s' label; "
-                    "reactions (votes) not harvested.",
-                    issue_number, mod_id, REGISTRY_VOTE_LABEL,
-                )
-            metrics = by_mod.get(mod_id)
-            if metrics is None:
-                metrics = ModSocialMetrics(mod_id=mod_id, issue_number=issue_number)
-                by_mod[mod_id] = metrics
-            continue
-        try:
-            reactions = _fetch_reactions_for_issue(
-                owner, repo, issue_number, token=token, blacklist=blacklist,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Failed to fetch reactions for %s/%s issue #%d (mod %s): %s",
-                owner, repo, issue_number, mod_id, exc,
-            )
-            reactions = []
-        metrics = by_mod.get(mod_id)
-        if metrics is None:
-            metrics = ModSocialMetrics(mod_id=mod_id, issue_number=issue_number)
-            by_mod[mod_id] = metrics
-        metrics.reactions.extend(reactions)
-
-    attached = 0
-    for mod_id, item in mod_ids_present.items():
-        metrics = by_mod.get(mod_id)
-        if metrics is not None:
-            item["_social_metrics"] = metrics
-            attached += 1
-    logger.info(
-        "Attached raw social metrics to %d of %d items (Pass 1: zero trust/velocity filtering applied)",
-        attached, len(mod_ids_present),
-    )
-
-
-def _sybil_diversity_weight(login: str, mod_ids_voted_on_by_user: list[str]) -> float:
-    """Reduced weight for users who only participated on a SINGLE mod (Sybil defence, ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 step 4).
-
-    Spec: "Vote weight receives a small multiplier if the account has a
-    demonstrated history of participating in *different* issues/repositories."
-    Accounts that only ever reacted on one item are treated with suspicion.
-    v1: returns 0.5 (small multiplier) when len(set(mod_ids)) <= 1, else 1.0.
-    """
-    distinct_mods = {m for m in mod_ids_voted_on_by_user if m}
-    if len(distinct_mods) <= 1:
-        return 0.5
-    return 1.0
-
-
-def _user_interaction_counts(
-    metrics_by_mod: dict[str, "ModSocialMetrics"],
-    *,
-    token: str,
-    org: str,
-    cache: dict[str, int],
-) -> dict[str, int]:
-    """Populate per-user interaction counts across the agora-mc org via GraphQL.
-
-    Spec ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 step 4: trust activity threshold is "at least 3 interactions
-    (issues opened, comments, PRs, or reactions) across repositories owned by
-    the agora-mc organization." Cached per session to amortize across items.
-    """
-    distinct_users: set[str] = set()
-    for mod_id, m in metrics_by_mod.items():
-        for r in m.reactions:
-            distinct_users.add(r.user)
-    for user in distinct_users:
-        if user not in cache:
-            cache[user] = _user_org_interaction_count(user, org, token=token)
-    return cache
-
-
-def _is_user_trusted(
-    login: str,
-    *,
-    interaction_count: int,
-    token: str,
-    now: datetime,
-    cache: dict[str, bool | None],
-    age_threshold_days: int = 30,
-    activity_threshold: int = 3,
-) -> bool:
-    """Apply ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 step 4 trust gating to one user.
-
-    Trust = (account age >= 30 days) AND (interaction_count >= 3 in this repo).
-    `cache` prevents refetching the same user's profile across mods. On any API
-    failure (rate limit exhausted, 404, etc.) the user is treated as UNtrusted
-    (fail-safe ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â bad actors waste time, no false-positive trust grants).
-    """
-    cached = cache.get(login)
-    if cached is not None:
-        return cached
-    # Fetch the user profile for `created_at`.
-    try:
-        profile = _github_request("GET", f"/users/{login}", token=token)
-        created_at_str = profile.get("created_at") if isinstance(profile, dict) else None
-        if not created_at_str:
-            cache[login] = False
-            return False
-        created_at = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
-        age_ok = (now - created_at).days >= age_threshold_days
-    except Exception as exc:
-        logger.warning("Trust check: could not fetch profile for user '%s' (%s); treating as untrusted.", login, exc)
-        cache[login] = False
-        return False
-    activity_ok = interaction_count >= activity_threshold
-    trusted = age_ok and activity_ok
-    cache[login] = trusted
-    return trusted
-
-
-def _compute_velocity(
-    upvote_timestamps: list[datetime],
-    downvote_timestamps: list[datetime],
-    now: datetime,
-) -> tuple[float, bool, datetime | None]:
-    """ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 step 5: compute velocity (trending metric) and anomaly flag.
-
-    Returns (velocity_float, is_anomaly, anomaly_window_start).
-
-    The `velocity` column is used for the Browse sort to surface trending
-    items (desktop renders "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“Ãƒâ€šÃ‚Â² X.X" / "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“Ãƒâ€šÃ‚Â¼ X.X"). We define:
-        - historical_avg_per_6h = count_in_7d / 28     (7-day window / 6-hour windows)
-        - recent_6h_total = upvotes_last_6h + downvotes_last_6h
-        - velocity = (recent_6h_total - historical_avg_per_6h) / max(historical_avg_per_6h, 0.5)
-        - velocity is clamped to [-10.0, 10.0] for column sanity.
-
-    The circuit-breaker (separate from velocity) fires when:
-        (recent_downvotes_6h / max(historical_downvotes_7d_avg_per_6h, 1.0)) > 5.0
-        AND recent_downvotes_6h > 20
-    When it fires, anomaly_window_start = (now - 6h) ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â the caller uses this to
-    freeze vote counts at pre-spike values by excluding reactions in the
-    window [anomaly_window_start, now].
-    """
-    seven_d_ago = now - timedelta(days=7)
-    six_h_ago = now - timedelta(hours=6)
-
-    up_7d = [t for t in upvote_timestamps if seven_d_ago <= t <= now]
-    down_7d = [t for t in downvote_timestamps if seven_d_ago <= t <= now]
-    up_6h = [t for t in upvote_timestamps if six_h_ago <= t <= now]
-    down_6h = [t for t in downvote_timestamps if six_h_ago <= t <= now]
-
-    total_7d = len(up_7d) + len(down_7d)
-    historical_avg_per_6h = total_7d / 28.0  # 7 days / 6h windows = 28
-    recent_6h_total = len(up_6h) + len(down_6h)
-
-    if historical_avg_per_6h < 0.5:
-        velocity = (recent_6h_total / 0.5) - 1.0
-    else:
-        velocity = (recent_6h_total - historical_avg_per_6h) / historical_avg_per_6h
-    velocity = max(-10.0, min(10.0, velocity))
-
-    # Circuit breaker ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â DOWNVOTES only (raid signature per spec ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 step 5).
-    historical_downvotes_per_6h = len(down_7d) / 28.0
-    recent_downvotes_6h = len(down_6h)
-    ratio = recent_downvotes_6h / max(historical_downvotes_per_6h, 1.0)
-    if ratio > 5.0 and recent_downvotes_6h > 20:
-        return velocity, True, six_h_ago
-    return velocity, False, None
-
-
-def _apply_trust_velocity_pass(
-    items: list[dict[str, Any]],
-    *,
-    token: str,
-    blacklist: set[str],
-) -> None:
-    """Pass 2: apply ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 steps 4 (trust), Sybil weighting, 5 (velocity breaker), 9 (immune).
-
-    Walks each item's attached `_social_metrics` (added by Pass 1), filters
-    reactions by user trust + diversity, computes final upvotes/downvotes/
-    net_score/velocity/status. Mutates each ModSocialMetrics in place.
-
-    Items with `governance.immune == true` skip ALL score evaluation per ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1
-    step 9: their metrics stay at default (0, 0, 0, 0.0, "active") regardless
-    of reactions ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â and the attached `_social_metrics` is REMOVED from the
-    item dict so the immune-passthrough in `insert_registry_item` can detect
-    the immune case cleanly.
-
-    When GITHUB_TOKEN is absent (local dev) this is a no-op ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â items keep
-    their defaults and the DB shows zeros (same as before Pass 2).
-    """
-    if not token:
-        return
-    now = datetime.now(timezone.utc)
-
-    # Collect all metrics objects that need processing.
-    by_mod: dict[str, ModSocialMetrics] = {}
-    immune_mods: set[str] = set()
-    for item in items:
-        item_id = item.get("id")
-        if not item_id:
-            continue
-        item_id_lower = item_id.lower()
-        gov = item.get("governance") or {}
-        if gov.get("immune") is True:
-            immune_mods.add(item_id_lower)
-            continue  # immune: skip entirely, leave metrics absent
-        social = item.get("_social_metrics")
-        if social is None:
-            continue
-        by_mod[item_id_lower] = social
-
-    if not by_mod:
-        return
-
-    # Build per-user mod-diversity map: {user: list of mod_ids they reacted on}.
-    user_mods: dict[str, list[str]] = {}
-    for mod_id, m in by_mod.items():
-        for r in m.reactions:
-            user_mods.setdefault(r.user, []).append(mod_id)
-
-    trust_cache: dict[str, bool | None] = {}
-    trust_interaction_cache: dict[str, int] = {}
-    # Pre-populate blacklist users as untrusted.
-    for u in blacklist:
-        trust_cache[u] = False
-        trust_interaction_cache[u] = 0
-
-    for mod_id, m in by_mod.items():
-        # Compute pre-anomaly reaction lists.
-        up_ts = [r.timestamp for r in m.reactions if r.is_upvote is True]
-        down_ts = [r.timestamp for r in m.reactions if r.is_upvote is False]
-
-        velocity, is_anomaly, anomaly_start = _compute_velocity(up_ts, down_ts, now)
-        m.velocity = velocity
-        if is_anomaly:
-            m.status = "under_review"
-            m.anomaly_window_start = anomaly_start
-            logger.warning(
-                "Velocity circuit breaker fired for mod '%s' (anomaly window from %s). Counts will be frozen at pre-spike values.",
-                mod_id, anomaly_start,
-            )
-
-        # Tally upvotes/downvotes applying trust + Sybil + freeze-at-pre-spike.
-        accepted_up = 0
-        accepted_down = 0
-        gov_full = _get_registry_repo()
-        gov_org = gov_full.split("/")[0]
-        interaction_counts = _user_interaction_counts(by_mod, token=token, org=gov_org, cache=trust_interaction_cache)
-        for r in m.reactions:
-            if r.is_upvote is None:
-                continue  # neutral reaction (laugh, hooray, etc.) ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â not a vote
-            # Freeze-at-pre-spike: if anomaly fired, drop reactions inside
-            # the 6h anomaly window before counting.
-            if is_anomaly and anomaly_start is not None and r.timestamp >= anomaly_start:
-                continue
-            # Trust gate (ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 step 4).
-            interaction_count = interaction_counts.get(r.user, 0)
-            if not _is_user_trusted(
-                r.user,
-                interaction_count=interaction_count,
-                token=token,
-                now=now,
-                cache=trust_cache,
-            ):
-                continue
-            # Sybil diversity weighting (ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 step 4 Sybil resistance).
-            diversity = _sybil_diversity_weight(r.user, user_mods.get(r.user, []))
-            if diversity < 0.99:
-                # v1: drop low-weight votes entirely (proportional weighting
-                # on binary votes is equivalent to drop-some-here).
-                continue
-            if r.is_upvote:
-                accepted_up += 1
-            else:
-                accepted_down += 1
-        m.upvotes = accepted_up
-        m.downvotes = accepted_down
-        m.net_score = accepted_up - accepted_down
-
-        # Spec ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 step 7: sentiment + spam scrubbing of review comments.
-        # Survivors are attached as `m.scrubbed_reviews`. `insert_registry_item`
-        # will write them into curator_reviews.top_reviews_json as JSON.
-        scrubbed: list[dict[str, Any]] = []
-        for raw in m.raw_reviews:
-            passed, cleaned, reason = _scrub_review_text(raw.get("text", ""))
-            if not passed:
-                logger.info(
-                    "Dropped review for mod '%s' by '%s' (reason: %s).",
-                    mod_id, raw.get("author", "?"), reason,
-                )
-                continue
-            scrubbed.append({
-                "author": raw.get("author"),
-                "text": cleaned,
-                "issue_number": raw.get("issue_number"),
-                "created_at": raw.get("created_at"),
-            })
-        # Top 10 reviews (by issue creation order; tiebreak: longest review).
-        scrubbed.sort(key=lambda r: (r.get("created_at", ""), -len(r.get("text", ""))))
-        m.scrubbed_reviews = scrubbed[:10]
-
-
-# --- ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.2 Raid Shield (interaction-limits toggle) ---
-
-def _enable_raid_shield(owner: str, repo: str, *, token: str) -> bool:
-    """ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.2: programmatically enable "existing users only" interaction limits.
-
-    Sets `limit: existing_users` on the repo via
-    `PUT /repos/{owner}/{repo}/interaction-limits`. Returns True on success,
-    False on failure. The limit expires automatically (GitHub default is 24h
-    for the existing_users tier; future nightly runs will re-enable if a new
-    spike is detected).
-    """
-    try:
-        _github_request(
-            "PUT",
-            f"/repos/{owner}/{repo}/interaction-limits",
-            token=token,
-            body={"limit": "existing_users", "expiry": "24h"},
-        )
-        logger.warning("Raid Shield ENABLED on %s/%s ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â only existing users can interact for 24h.", owner, repo)
-        return True
-    except Exception as exc:
-        logger.warning("Failed to enable Raid Shield on %s/%s: %s", owner, repo, exc)
-        return False
-
-
-# --- ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 step 6 (DELETE offending reactions + admin-alert issue) ---
-
-def _gather_offending_reactions(
-    owner: str,
-    repo: str,
-    issue_number: int,
-    window_start: datetime,
-    *,
-    token: str,
-) -> list[dict[str, Any]]:
-    """Re-fetch reactions on the offending issue + its comments, restricted to
-    the anomaly window [window_start, now]. Returns a list of dicts each with:
-        {"user": str, "reaction_id": int, "content": str, "comment_id": int|None,
-         "issue_number": int, "created_at": ISO-8601}
-    These are the reactions about to be DELETEd. Captured pre-DELETE for audit.
-    """
-    now = datetime.now(timezone.utc)
-    out: list[dict[str, Any]] = []
-    # Issue-level reactions.
-    for r in _github_paginate(
-        f"/repos/{owner}/{repo}/issues/{issue_number}/reactions", token=token,
-    ):
-        try:
-            created = datetime.fromisoformat((r.get("created_at") or "").replace("Z", "+00:00"))
-        except ValueError:
-            continue
-        if not (window_start <= created <= now):
-            continue
-        out.append({
-            "user": (r.get("user") or {}).get("login"),
-            "reaction_id": r.get("id"),
-            "content": r.get("content"),
-            "comment_id": None,
-            "issue_number": issue_number,
-            "created_at": r.get("created_at"),
-        })
-    # Per-comment reactions.
-    comments = _github_paginate(
-        f"/repos/{owner}/{repo}/issues/{issue_number}/comments", token=token,
-    )
-    for c in comments:
-        cid = c.get("id")
-        if not isinstance(cid, int):
-            continue
-        for r in _github_paginate(
-            f"/repos/{owner}/{repo}/issues/comments/{cid}/reactions", token=token,
-        ):
-            try:
-                created = datetime.fromisoformat((r.get("created_at") or "").replace("Z", "+00:00"))
-            except ValueError:
-                continue
-            if not (window_start <= created <= now):
-                continue
-            out.append({
-                "user": (r.get("user") or {}).get("login"),
-                "reaction_id": r.get("id"),
-                "content": r.get("content"),
-                "comment_id": cid,
-                "issue_number": issue_number,
-                "created_at": r.get("created_at"),
-            })
-    return out
-
-
-def _delete_reaction(
-    owner: str,
-    repo: str,
-    *,
-    issue_number: int,
-    comment_id: int | None,
-    reaction_id: int,
-    token: str,
-) -> bool:
-    """DELETE a single reaction from GitHub via REST. Returns True on success.
-
-    Routes to the issue-level OR comment-level delete endpoint based on
-    `comment_id`. Per ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 step 6, this requires `issues:write` permission
-    on the GitHub token, which `compile.yml` already grants.
-    """
-    try:
-        if comment_id is None:
-            _github_request(
-                "DELETE",
-                f"/repos/{owner}/{repo}/issues/{issue_number}/reactions/{reaction_id}",
-                token=token,
-            )
-        else:
-            _github_request(
-                "DELETE",
-                f"/repos/{owner}/{repo}/issues/comments/{comment_id}/reactions/{reaction_id}",
-                token=token,
-            )
-        return True
-    except Exception as exc:
-        logger.warning("Failed to DELETE reaction %d on issue #%d (%s): %s",
-                       reaction_id, issue_number, owner + "/" + repo, exc)
-        return False
-
-
-def _append_audit_entry(action: str, details: str, *, actor: str | None = None, target_type: str | None = None, target_id: str | None = None, reason: str | None = None) -> None:
-    """Append an entry to registry/governance/audit_log.json BEFORE risky
-    operations (DELETE reactions, enable Raid Shield). Captures intent even
-    when the subsequent API call fails.
-
-    Per Ã‚Â§4.6: each entry carries timestamp, action, actor, target_type,
-    target_id, reason, and details. The root object includes log_format_version.
-    Rotation archives the oldest 2,000 entries to an archive file when the log
-    exceeds 10,000 entries, keeping the most recent 8,000.
-    """
-    path = REGISTRY_DIR / "governance" / "audit_log.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        if path.exists():
-            with path.open("r", encoding="utf-8") as fh:
-                data = json.load(fh)
-        else:
-            data = {"log_format_version": 1, "entries": []}
-    except (OSError, json.JSONDecodeError):
-        data = {"log_format_version": 1, "entries": []}
-    if "log_format_version" not in data:
-        data["log_format_version"] = 1
-    entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "action": action,
-        "details": details,
-    }
-    if actor is not None:
-        entry["actor"] = actor
-    if target_type is not None:
-        entry["target_type"] = target_type
-    if target_id is not None:
-        entry["target_id"] = target_id
-    if reason is not None:
-        entry["reason"] = reason
-    data["entries"].append(entry)
-    if len(data["entries"]) > 10000:
-        archive_date = datetime.now(timezone.utc).strftime("%Y%m%d")
-        archive_path = REGISTRY_DIR / "governance" / f"audit_log_archive.{archive_date}.json"
-        oldest_2000 = data["entries"][:2000]
-        data["entries"] = data["entries"][-8000:]
-        if archive_path.exists():
-            with archive_path.open("r", encoding="utf-8") as fh:
-                archive_data = json.load(fh)
-            archive_data.extend(oldest_2000)
-        else:
-            archive_data = oldest_2000
-        with archive_path.open("w", encoding="utf-8") as fh:
-            json.dump(archive_data, fh, indent=2)
-    with path.open("w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2)
-
-
-# --- ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.2 Discord webhook alert (real-time push to curator alerts channel) ---
-
-def _load_discord_webhook_url() -> str | None:
-    """Read DISCORD_WEBHOOK_URL from env. Returns None when unset.
-
-    The webhook URL is a Discord channel-level integration (Settings ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢
-    Integrations ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ Webhooks ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ New Webhook). No bot account required ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â just
-    a webhook URL. When absent, all Discord notifications are silently skipped
-    (curator alerts only via the audit trail + admin-alert issue). When Discord
-    returns 4xx/5xx, the warning is logged but the compile continues.
-    """
-    url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
-    return url or None
-
-
-def _post_discord_alert(
-    *,
-    mod_id: str,
-    reason: str,
-    severity: str,  # "spike" or "organic"
-    offending_reactions: list[dict[str, Any]] | None = None,
-    admin_alert_issue_url: str | None = None,
-) -> None:
-    """Post a formatted Discord alert to the configured webhook.
-
-    Uses Discord's webhook JSON API: POST {webhook_url} with a JSON body
-    containing `embeds[]`. Sev-volume colors: red (#ED4245) for spike-triggered
-    attacks, orange (#EE8430) for organic under_review triggers. Failure-safe:
-    logs a warning and returns None on any network or HTTP error. NEVER raises.
-    """
-    webhook_url = _load_discord_webhook_url()
-    if not webhook_url:
-        return  # Discord notifications are optional; silent no-op.
-
-    # Pick embed color by severity.
-    color = 0xED4245 if severity == "spike" else 0xEE8430
-    title = f"ÃƒÆ’Ã‚Â°Ãƒâ€¦Ã‚Â¸Ãƒâ€¦Ã‚Â¡Ãƒâ€šÃ‚Â¨ Coordinated Attack: `{mod_id}`" if severity == "spike" else f"ÃƒÆ’Ã‚Â¢Ãƒâ€¦Ã‚Â¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¯Ãƒâ€šÃ‚Â¸Ãƒâ€šÃ‚Â Mod under review: `{mod_id}`"
-
-    fields: list[dict[str, Any]] = [
-        {"name": "Reason", "value": reason, "inline": False},
-        {"name": "Severity", "value": severity, "inline": True},
-    ]
-    if offending_reactions is not None:
-        unique_users = sorted({r.get("user") or "?" for r in offending_reactions})
-        fields.append({
-            "name": "Offending users",
-            "value": (", ".join(unique_users)[:1024] or "(none captured)"),
-            "inline": False,
-        })
-        fields.append({
-            "name": "Reactions DELETEd",
-            "value": str(len(offending_reactions)),
-            "inline": True,
-        })
-    if admin_alert_issue_url:
-        fields.append({
-            "name": "Admin-alert issue",
-            "value": admin_alert_issue_url,
-            "inline": False,
-        })
-
-    body = {
-        "username": "Agora Compiler",
-        "embeds": [{
-            "title": title,
-            "color": color,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "fields": fields,
-            "footer": {"text": "Agora nightly compiler"},
-        }],
-    }
-    try:
-        resp = requests.post(webhook_url, json=body, timeout=15)
-        if resp.status_code not in (200, 204):
-            logger.warning(
-                "Discord webhook returned HTTP %d: %s",
-                resp.status_code, resp.text[:300] if resp.text else "",
-            )
-    except Exception as exc:
-        logger.warning("Discord webhook POST failed: %s", exc)
-
-
-def _create_admin_alert_issue(
-    owner: str,
-    repo: str,
-    *,
-    mod_id: str,
-    offending_reactions: list[dict[str, Any]],
-    token: str,
-) -> None:
-    """ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 step 6: file a high-priority issue in the governance repo for
-    curator review. Title format: `[ALERT] Coordinated Attack Detected: <mod_id>`.
-
-    The body summarizes offending users (lowercased), the reaction contents,
-    timestamps, and the audit entry reference. Uses `issues:write` permission.
-    Failure is logged but does not abort the broader compile loop.
-    """
-    user_summary = "\n".join(
-        f"- @{r['user']} ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â {r['content']} on {r['created_at']} (issue #{r['issue_number']}, comment_id={r['comment_id']})"
-        for r in offending_reactions if r.get("user")
-    )
-    body = (
-        f"## Coordinated Attack Detected\n\n"
-        f"The nightly compiler's velocity circuit breaker fired for mod "
-        f"`{mod_id}`. {len(offending_reactions)} offending reactions were "
-        f"identified in the 6-hour anomaly window and DELETED from GitHub.\n\n"
-        f"### Offending Reactions (captured pre-DELETE)\n\n{user_summary}\n\n"
-        f"### Action Taken\n\n"
-        f"- [x] Velocity circuit breaker fired (status ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ under_review)\n"
-        f"- [x] Reaction counts frozen at pre-spike values\n"
-        f"- [x] Raid Shield interaction-limits enabled (existing users only, 24h)\n"
-        f"- [x] Offending reactions DELETEd from GitHub\n"
-        f"- [x] Triage poll created in Discussions\n"
-        f"- [x] This admin-alert issue filed\n\n"
-        f"### Curator Action Required\n\n"
-        f"Review offending users for org-level action (suspension, addition to "
-        f"`registry/governance/poll_blacklist.json`).\n"
-    )
-    try:
-        _github_request(
-            "POST",
-            f"/repos/{owner}/{repo}/issues",
-            token=token,
-            body={
-                "title": f"[ALERT] Coordinated Attack Detected: {mod_id}",
-                "body": body,
-                "labels": ["triage", "coordinated-attack"],
-            },
-        )
-        logger.warning("Filed admin-alert issue for mod '%s' coordinated attack.", mod_id)
-    except Exception as exc:
-        logger.warning("Failed to file admin-alert issue for mod '%s': %s", mod_id, exc)
-
-
-# --- ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 step 8 (create triage poll) ---
-
-def _find_triage_discussion_category(owner: str, repo: str, *, token: str) -> int | None:
-    """Discover a Discussions category id matching one of the candidate names.
-
-    Returns None when Discussions aren't enabled on the repo OR no matching
-    category exists. Soft-fails ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â poll creation is OPTIONAL; the status flip
-    is the hard requirement of ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 step 5.
-    """
-    try:
-        for cat_name in TRIAGE_DISCUSSION_CATEGORY_CANDIDATES:
-            data = _github_graphql(
-                """
-                query ($owner: String!, $repo: String!) {
-                  repository(owner: $owner, name: $repo) {
-                    discussionCategories(first: 50) {
-                      nodes { id name }
-                    }
-                  }
-                }
-                """,
-                token=token,
-                variables={"owner": owner, "repo": repo},
-            )
-            nodes = (((data.get("repository") or {}).get("discussionCategories") or {}).get("nodes") or [])
-            for node in nodes:
-                if (node.get("name") or "").strip().lower() == str(cat_name).strip().lower():
-                    return node.get("id")
-        return None
-    except Exception as exc:
-        logger.warning("Could not fetch discussion categories on %s/%s: %s", owner, repo, exc)
-        return None
-
-
-def _create_triage_poll(
-    owner: str,
-    repo: str,
-    *,
-    mod_id: str,
-    issue_number: int,
-    reason: str,
-    token: str,
-) -> str | None:
-    """ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 step 5 / ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§5.3: open a 7-day triage discussion poll.
-
-    Title: "[Community Triage] Should '<mod_id>' be removed from the registry?"
-    Body explains the reason (velocity spike OR organic net_score < -10).
-
-    Returns the discussion node URL on success, None on failure (the
-    Discussions API requires `discussions:write` permission, already granted
-    in compile.yml; if Discussions aren't enabled on the repo or no triage
-    category exists, this silently no-ops with a warning).
-    """
-    category_id = _find_triage_discussion_category(owner, repo, token=token)
-    if category_id is None:
-        logger.warning(
-            "Triage discussion category not found on %s/%s (looked for %s). "
-            "Status is still 'under_review'; poll will not be created.",
-            owner, repo, TRIAGE_DISCUSSION_CATEGORY_CANDIDATES,
-        )
-        return None
-    title = f"[Community Triage] Should '{mod_id}' be removed from the registry?"
-    body = (
-        f"## Triage Poll Triggered\n\n"
-        f"**Mod:** `{mod_id}` (tracking issue #{issue_number})\n\n"
-        f"**Reason:** {reason}\n\n"
-        f"**Duration:** {TRIAGE_POLL_DURATION_DAYS} days.\n\n"
-        f"### Vote\n\n"
-        f"- ÃƒÆ’Ã‚Â°Ãƒâ€¦Ã‚Â¸ÃƒÂ¢Ã¢â€šÂ¬Ã‹Å“Ãƒâ€šÃ‚Â Keep `{mod_id}` in the registry (status restored to 'active', "
-        f"30-day immunity cooldown granted).\n"
-        f"- ÃƒÆ’Ã‚Â°Ãƒâ€¦Ã‚Â¸ÃƒÂ¢Ã¢â€šÂ¬Ã‹Å“Ãƒâ€¦Ã‚Â½ Remove `{mod_id}` ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â JSON file moved to `registry/archived/`, "
-        f"item removed from all future builds.\n\n"
-        f"### Notes\n\n"
-        f"- Reactions from users listed in `registry/governance/poll_blacklist.json` "
-        f"will be counted at weight 0 at poll resolution.\n"
-        f"- The nightly compiler resolves this poll automatically after "
-        f"{TRIAGE_POLL_DURATION_DAYS} days.",
-    )
-    try:
-        data = _github_graphql(
-            """
-            mutation ($repoId: ID!, $categoryId: ID!, $title: String!, $body: String!) {
-              createDiscussion(input: {repositoryId: $repoId, categoryId: $categoryId, title: $title, body: $body}) {
-                discussion { url }
-              }
-            }
-            """,
-            token=token,
-            variables={"repoId": "", "categoryId": category_id, "title": title, "body": body},
-        )
-        discussion = (((data.get("createDiscussion") or {}).get("discussion")) or {})
-        url = discussion.get("url")
-        if url:
-            logger.info("Created triage discussion for mod '%s': %s", mod_id, url)
-        return url
-    except Exception as exc:
-        logger.warning("Failed to create triage discussion for mod '%s': %s", mod_id, exc)
-        return None
-
-
-# --- ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 step 8 (resolve expired triage polls) ---
-
-def _resolve_expired_triage_polls(
-    owner: str,
-    repo: str,
-    *,
-    items: list[dict[str, Any]],
-    token: str,
-) -> None:
-    """ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 step 5/8: for items currently 'under_review', look up associated
-    triage discussions; if the 7-day window has expired, tally votes from
-    poll_blacklist-free users and either archive the item (Remove wins) or
-    restore it (Keep wins).
-
-    Archive = move the JSON manifest file from registry/mods/<id>.json (or
-    packs/, etc) to registry/archived/<id>.json. Item will be excluded from
-    the next nightly build (insert_registry_item only ingests from the 7
-    CONTENT_DIRS, not from registry/archived/).
-    """
-    now = datetime.now(timezone.utc)
-    for item in items:
-        social = item.get("_social_metrics")
-        if social is None or social.status != "under_review":
-            continue
-        start = social.anomaly_window_start
-        if start is None:
-            continue
-        elapsed = now - start
-        if elapsed < timedelta(days=TRIAGE_POLL_DURATION_DAYS):
-            continue
-        try:
-            data = _github_graphql(
-                """
-                query ($q: String!) {
-                  search(query: $q, type: DISCUSSION, first: 5) {
-                    nodes { ... on Discussion { id url title reactions { totalCount content } }
-                    }
-                  }
-                }
-                """,
-                token=token,
-                variables={"q": f"repo:{owner}/{repo} [Community Triage] {social.mod_id}"},
-            )
-            nodes = ((data.get("search") or {}).get("nodes")) or []
-            if not nodes:
-                continue
-            discussion = nodes[0]
-            keep_votes = 0
-            remove_votes = 0
-            data2 = _github_graphql(
-                """
-                query ($id: ID!) {
-                  node(id: $id) {
-                    ... on Discussion {
-                      reactions(first: 100) {
-                        nodes { user { login } content }
-                      }
-                      reactionGroups { content viewerHasReacted }
-                    }
-                  }
-                }
-                """,
-                token=token,
-                variables={"id": discussion.get("id")},
-            )
-            reactions = ((((data2.get("node") or {}).get("reactions")) or {}).get("nodes")) or []
-            blacklist = _load_poll_blacklist()
-            for rxn in reactions:
-                user = ((rxn.get("user") or {}).get("login") or "").lower()
-                if user in blacklist:
-                    continue
-                content = rxn.get("content")
-                if content in ("THUMBS_UP", "+1", "HOORAY"):
-                    keep_votes += 1
-                elif content in ("THUMBS_DOWN", "-1"):
-                    remove_votes += 1
-            total_votes = keep_votes + remove_votes
-            if remove_votes > keep_votes:
-                item_id = social.mod_id
-                content_type = item.get("content_type", "mod")
-                src_dir = REGISTRY_DIR / ("packs" if content_type == "pack" else content_type + "s")
-                src_path = src_dir / f"{item_id}.json"
-                archived_dir = REGISTRY_DIR / "archived"
-                archived_dir.mkdir(parents=True, exist_ok=True)
-                dest_path = archived_dir / f"{item_id}.json"
-                if src_path.exists():
-                    src_path.rename(dest_path)
-                    logger.warning(
-                        "Triage result: REMOVE won for '%s' (%d vs %d votes). Manifest archived to %s.",
-                        item_id, remove_votes, keep_votes, dest_path,
-                    )
-                    _append_audit_entry("triage_archive", f"Mod '{item_id}' archived: Remove {remove_votes} vs Keep {keep_votes}.", actor="compiler-bot", target_type="mod", target_id=item_id, reason="poll_result_remove")
-                social.status = "archived"
-            elif keep_votes == 0 and remove_votes == 0:
-                _append_audit_entry("triage_zero_votes", f"Triage poll for '{social.mod_id}' expired with zero votes; remaining under_review.", actor="compiler-bot", target_type="mod", target_id=social.mod_id, reason="community_triage")
-            else:
-                social.status = "active"
-                cooldown_until = (now + timedelta(days=30)).isoformat()
-                social.immunity_cooldown_until = cooldown_until
-                if keep_votes == remove_votes:
-                    logger.info(
-                        "Triage result: TIE for '%s' (%d vs %d votes). Resolved as KEEP per tie-break rule; 30-day immunity cooldown set.",
-                        social.mod_id, keep_votes, remove_votes,
-                    )
-                    _append_audit_entry("triage_tie_keep", f"Tie resolved as KEEP for '{social.mod_id}': Keep {keep_votes} vs Remove {remove_votes} (tie-break).", actor="compiler-bot", target_type="mod", target_id=social.mod_id, reason="community_triage")
-                else:
-                    logger.info(
-                        "Triage result: KEEP won for '%s' (%d vs %d votes). Status restored to 'active'; 30-day immunity cooldown set.",
-                        social.mod_id, keep_votes, remove_votes,
-                    )
-                    _append_audit_entry("triage_keep", f"Mod '{social.mod_id}' kept: Keep {keep_votes} vs Remove {remove_votes}.", actor="compiler-bot", target_type="mod", target_id=social.mod_id, reason="community_triage")
-        except Exception as exc:
-            logger.warning("Failed to resolve triage for '%s': %s", social.mod_id, exc)
-
-
-# --- Pass 3 entrypoint (circuit-breaker response) ---
-
-def _respond_to_circuit_breaker(
-    items: list[dict[str, Any]],
-    *,
-    token: str,
-    owner: str,
-    repo: str,
-) -> None:
-    """Execute ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.2 Raid Shield + ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 steps 5 organic-trigger, 6 DELETE +
-    admin-alert, 8 create triage poll for every mod whose Pass 2 set
-    `status='under_review'`.
-
-    Also handles the ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 step 5 ORGANIC trigger path (net_score <
-    ORGANIC_UNDER_REVIEW_THRESHOLD without a circuit-breaker spike) by
-    flipping status to 'under_review' + creating a triage poll WITHOUT
-    Raid Shield / DELETE / admin-alert (those responses are spike-only).
-    """
-    raid_shield_enabled = False
-    now = datetime.now(timezone.utc)
-    for item in items:
-        social = item.get("_social_metrics")
-        if social is None:
-            continue
-        # ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 step 5 ORGANIC path (no spike, but net_score too low).
-        # \u00a73.1 step 5 ORGANIC path (no spike, but net_score too low).
-            if social.status == "active" and social.net_score < ORGANIC_UNDER_REVIEW_THRESHOLD:
-                if social.anomaly_window_start is None:
-                    social.anomaly_window_start = now
-                if social.status != "under_review":
-                    social.status = "under_review"
-                logger.warning(
-                    "Organic under_review trigger for mod \u0027%s\u0027: net_score=%d (threshold=%d).",
-                    social.mod_id, social.net_score, ORGANIC_UNDER_REVIEW_THRESHOLD,
-                )
-                _append_audit_entry(
-                    "organic_under_review",
-                    f"Mod \u0027{social.mod_id}\u0027 net_score={social.net_score} (< {ORGANIC_UNDER_REVIEW_THRESHOLD}). Status \u2192 under_review.",
-                    actor="compiler-bot", target_type="mod", target_id=social.mod_id, reason="velocity_anomaly",
-                )
-            _create_triage_poll(
-                owner, repo,
-                mod_id=social.mod_id,
-                issue_number=social.issue_number,
-                reason=f"Organic net_score dropped below threshold ({ORGANIC_UNDER_REVIEW_THRESHOLD}).",
-                token=token,
-            )
-            _post_discord_alert(
-                mod_id=social.mod_id,
-                reason=f"Organic net_score dropped below threshold ({ORGANIC_UNDER_REVIEW_THRESHOLD}).",
-                severity="organic",
-                offending_reactions=None,
-            )
-            continue
-        # Spike-triggered under_review (circuit breaker already fired in Pass 2).
-        if social.status == "under_review" and social.anomaly_window_start is not None:
-            if not raid_shield_enabled:
-                raid_shield_enabled = _enable_raid_shield(owner, repo, token=token)
-            offending = _gather_offending_reactions(
-                owner, repo, social.issue_number,
-                window_start=social.anomaly_window_start,
-                token=token,
-            )
-            if offending:
-                _append_audit_entry(
-                    "raid_breaker_offenders",
-                    f"Mod '{social.mod_id}' (issue #{social.issue_number}): gathered "
-                    f"{len(offending)} offending reactions for DELETE. Users: " +
-                    ", ".join(sorted({r.get("user") or "?" for r in offending})),
-                    actor="compiler-bot", target_type="mod", target_id=social.mod_id, reason="velocity_anomaly",
-                )
-                for r in offending:
-                    _delete_reaction(
-                        owner, repo,
-                        issue_number=r.get("issue_number") or social.issue_number,
-                        comment_id=r.get("comment_id"),
-                        reaction_id=r.get("reaction_id") or 0,
-                        token=token,
-                    )
-            _create_triage_poll(
-                owner, repo,
-                mod_id=social.mod_id,
-                issue_number=social.issue_number,
-                reason="Velocity circuit breaker: coordinated downvote spike detected (>5ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â historical, >20 in 6h).",
-                token=token,
-            )
-            _create_admin_alert_issue(
-                owner, repo,
-                mod_id=social.mod_id,
-                offending_reactions=offending,
-                token=token,
-            )
-            # Discord webhook ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â real-time push to curator alerts channel
-            # (silent no-op when DISCORD_WEBHOOK_URL env var is absent).
-            _post_discord_alert(
-                mod_id=social.mod_id,
-                reason="Velocity circuit breaker: coordinated downvote spike detected (>5ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â historical, >20 in 6h).",
-                severity="spike",
-                offending_reactions=offending,
-            )
-
-
-# --- ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 step 7: sentiment + spam scrubbing ---
-
-# Regex patterns exported for reuse by tests.
-VERSION_BEGGING_RE = re.compile(
-    r"(?i)(when\s+is|update\s+to|port\s+to|for\s+1\.\d+|1\.\d+\s*when|when\s+1\.\d+)\s*(release|coming|update|\?)?"
-)
-EMPTY_PRAISE_RE = re.compile(
-    r"(?i)^(good\s+mod|nice|cool|pog|great|wow|awesome\s+sauce|epic|gg|nice\s+mod)\s*[!.?]*$"
-)
-
-
-def _regex_filter_comment(text: str) -> tuple[bool, str]:
-    """Apply ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 step 7 regex filters. Returns (passed, reason_if_dropped)."""
-    if not text or not text.strip():
-        return False, "empty"
-    if VERSION_BEGGING_RE.search(text):
-        return False, "version-begging"
-    if EMPTY_PRAISE_RE.match(text.strip()):
-        return False, "empty-praise"
-    return True, ""
-
-
-def _nlp_filter_comment(text: str) -> tuple[bool, str]:
-    """Apply ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 step 7 NLP filters. Returns (passed, reason_if_dropped).
-
-    Lazy-imports profanity_check + vaderSentiment so the compiler runs cleanly
-    in local dev (without those deps) when the NLP path isn't reached (no
-    GITHUB_TOKEN ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ no review text to scrub). On import failure: log warning,
-    treat as passed (fail-OPEN for benign content rather than dropping legit
-    reviews because the runner didn't `pip install -r requirements.txt`).
-    """
-    try:
-        from profanity_check import predict as _profanity_predict
-    except ImportError as exc:
-        logger.warning("profanity-check not installed (%s); skipping NLP filter (fail-open).", exc)
-        return True, ""
-    try:
-        from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-    except ImportError as exc:
-        logger.warning("vaderSentiment not installed (%s); skipping NLP filter (fail-open).", exc)
-        return True, ""
-    # profanity_check: returns [0] for clean, [1] for toxic.
-    try:
-        is_toxic = bool(_profanity_predict([text])[0])
-    except Exception as exc:
-        logger.warning("profanity_check failed on text (len=%d): %s; skipping.", len(text), exc)
-        is_toxic = False
-    if is_toxic:
-        return False, "profanity"
-    # vaderSentiment: discard extreme-aggression intensity even if profanity passes.
-    try:
-        analyzer = SentimentIntensityAnalyzer()
-        scores = analyzer.polarity_scores(text)
-        if scores.get("neg", 0.0) >= 0.9 and scores.get("compound", 0.0) <= -0.85:
-            return False, "extreme-aggression"
-    except Exception as exc:
-        logger.warning("vaderSentiment failed on text (len=%d): %s; skipping.", len(text), exc)
-    return True, ""
-
-
-def _scrub_review_text(text: str) -> tuple[bool, str, str]:
-    """Full ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.1 step 7 scrub pipeline. Returns (passed, cleaned_text, drop_reason)."""
-    passed, reason = _regex_filter_comment(text)
-    if not passed:
-        return False, text, reason
-    passed, reason = _nlp_filter_comment(text)
-    if not passed:
-        return False, text, reason
-    return True, text.strip(), ""
-
-
-REVIEW_TEXT_FIELD_RE = re.compile(
-    r"###\s*Your Technical Review[^:\n]*\r?\n+(.*?)(?:\r?\n###|\Z)",
-    re.IGNORECASE | re.DOTALL,
-)
-
-
-def _extract_review_text(issue_body: str | None) -> str | None:
-    """Extract the review-text field from a review-form issue body.
-
-    Mirrors _extract_mod_id: the form emits `### Your Technical Review (50
-    character minimum)` heading followed by the textarea value. Returns the
-    trimmed review text, or None if absent.
-    """
-    if not issue_body:
-        return None
-    m = REVIEW_TEXT_FIELD_RE.search(issue_body)
-    if not m:
-        return None
-    return m.group(1).strip() or None
-
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-logger = logging.getLogger("compiler")
+        if not allow_partial:
+            raise GovernanceError(message)
+        logger.warning("%s; continuing because partial governance is allowed.", message)
+        return set()
+    return {name.lower() for name in names}
 
 
 # ---------------------------------------------------------------------------
 # Schema setup
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 9
+# The catalog schema version lives in one file that both this compiler and the
+# app (`agora_core::registry_sync::APP_REGISTRY_SCHEMA_VERSION`) read, so the two
+# can never disagree. Bump it there, never here.
+SCHEMA_VERSION_FILE = Path(__file__).resolve().parent / "registry_schema_version"
+SCHEMA_VERSION = int(SCHEMA_VERSION_FILE.read_text(encoding="utf-8").strip())
 
 
 CREATE_INDEXES = [
@@ -1710,7 +352,10 @@ def create_tables(conn: sqlite3.Connection) -> None:
             -- primary source do not have to parse JSON.
             download_strategy TEXT NOT NULL,
             source_identifier TEXT NOT NULL,
-            sha256 TEXT NOT NULL,
+            -- The manifest's sha256 when it states one, NULL otherwise. An
+            -- install checks the file against what its source published
+            -- (download_sources_json pins, GitHub digests), not this column.
+            sha256 TEXT,
             upvotes INTEGER DEFAULT 0,
             downvotes INTEGER DEFAULT 0,
             net_score INTEGER DEFAULT 0,
@@ -1785,13 +430,22 @@ def create_tables(conn: sqlite3.Connection) -> None:
         )
     """)
 
+    # Community crash signatures (format v2). The app converts each row into a
+    # rule in its own crash pack, so every column here is data the engine's rule
+    # format already understands. `games_json` is a non-empty JSON array of game
+    # ids; a rule only applies to those games.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS crash_signatures (
             id TEXT PRIMARY KEY,
             name TEXT,
+            games_json TEXT NOT NULL,
             regex_pattern TEXT,
-            solution_markdown TEXT,
-            action_button_json TEXT
+            level TEXT,
+            cause TEXT,
+            text TEXT,
+            action_kind TEXT,
+            action_content_key TEXT,
+            action_label TEXT
         )
     """)
 
@@ -1963,6 +617,62 @@ def create_tables(conn: sqlite3.Connection) -> None:
         )
     """)
 
+    # Entries for games other than Minecraft (MASTER_SPEC §26.8). A separate
+    # table, so registry_items keeps its Minecraft-only shape and an older
+    # client, which never reads this table, cannot list them in Minecraft's browse.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS game_catalog_items (
+            id TEXT PRIMARY KEY,
+            game TEXT NOT NULL,
+            name TEXT NOT NULL,
+            author TEXT,
+            content_type TEXT NOT NULL,
+            download_strategy TEXT NOT NULL,
+            source_identifier TEXT NOT NULL,
+            sha256 TEXT,
+            download_sources_json TEXT NOT NULL DEFAULT '[]',
+            game_compatibility_json TEXT NOT NULL,
+            provides_framework TEXT,
+            description TEXT,
+            license_id TEXT,
+            page_url TEXT,
+            icon_url TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            date_added TEXT
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_game_catalog_items_game ON game_catalog_items(game)"
+    )
+
+    # Official plugins: plugin packages whose id, version and package SHA-256 this
+    # signed registry vouches for. Another additive table, for the same reason as
+    # game_catalog_items: the schema version is unchanged, an older client never
+    # reads it, and a newer client reading a registry without it finds no official
+    # plugins. One row per listed version: the current one and, when the source
+    # keeps it, the previous one, so a bad update can be rolled back.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS official_plugins (
+            plugin_id TEXT NOT NULL,
+            version TEXT NOT NULL,
+            channel TEXT NOT NULL CHECK (channel IN ('current', 'previous')),
+            name TEXT NOT NULL,
+            description TEXT,
+            game_ids_json TEXT NOT NULL DEFAULT '[]',
+            package_url TEXT NOT NULL,
+            package_sha256 TEXT NOT NULL,
+            package_tree_sha256 TEXT NOT NULL,
+            package_size INTEGER NOT NULL,
+            min_agora_version TEXT NOT NULL,
+            revoked INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (plugin_id, version)
+        )
+    """)
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_official_plugins_channel "
+        "ON official_plugins(plugin_id, channel)"
+    )
+
     for index_sql in CREATE_INDEXES:
         cursor.execute(index_sql)
 
@@ -2046,6 +756,108 @@ def validate_sha256(raw: Any) -> str:
     return raw
 
 
+def validate_optional_sha256(raw: Any, item_id: str) -> str | None:
+    """The manifest's sha256 when it states one, otherwise None.
+
+    Curators never hash files by hand. For a github_release or modrinth_id
+    entry the install checks the file against what its source published, so
+    the manifest may omit sha256. When it is present it must still be a
+    well-formed hash, and ``require_manifest_sha256`` decides whether it is
+    needed.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", raw):
+        logger.error(
+            "%s: sha256, when present, must be exactly 64 hex characters, got %r", item_id, raw
+        )
+        raise SystemExit(1)
+    return raw
+
+
+def require_manifest_sha256(item_id: str, sources: list[dict[str, Any]], raw: Any) -> None:
+    """Require the manifest's sha256 when any download source is pinned.
+
+    A pinned source (direct_hash, technic_pack, provider_pack) has no upstream
+    to check the file against, so the manifest hash is the only record of which
+    file it is. Every other strategy takes its hash from the source.
+    """
+    pinned = sorted(
+        {source["strategy"] for source in sources if is_pinned_strategy(source["strategy"])}
+    )
+    if pinned and raw is None:
+        logger.error(
+            "%s: sha256 is required because a download source is %s: "
+            "it is the only record of which file that source serves",
+            item_id,
+            ", ".join(pinned),
+        )
+        raise SystemExit(1)
+
+
+def canonical_source_pins(item_id: str, strategy: str, raw: Any) -> list[dict[str, str]]:
+    """Validate a download source's ``pins`` and return them in canonical form.
+
+    A pin names one exact file: a GitHub release ``tag``, the release ``asset``
+    filename, and the ``sha256`` the curator expects that file to have. A pin
+    is compared only with that file. Pins exist only on github_release sources.
+    """
+    if raw is None:
+        return []
+    if strategy not in ("github_release", "manual_link"):
+        logger.error(
+            "%s: pins are only for github_release and manual_link sources, not %s",
+            item_id,
+            strategy,
+        )
+        raise SystemExit(1)
+    if not isinstance(raw, list):
+        logger.error("%s: pins must be an array of {tag, asset, sha256} objects", item_id)
+        raise SystemExit(1)
+    pins: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for index, pin in enumerate(raw):
+        where = f"{item_id}: pins[{index}]"
+        if not isinstance(pin, dict):
+            logger.error("%s must be an object, got %r", where, pin)
+            raise SystemExit(1)
+        allowed = {"tag", "asset", "sha256"} if strategy == "github_release" else {
+            "asset",
+            "sha256",
+        }
+        unknown = sorted(str(key) for key in set(pin) - allowed)
+        if unknown:
+            logger.error("%s has unknown key(s): %s", where, ", ".join(unknown))
+            raise SystemExit(1)
+        # A GitHub release has a tag; a manual_link names its file, so its pin
+        # is the exact asset name and the hash, with no release tag.
+        tag = pin.get("tag", "")
+        if strategy == "github_release" and (not isinstance(tag, str) or not tag.strip()):
+            logger.error("%s.tag must be a non-empty release tag", where)
+            raise SystemExit(1)
+        if not isinstance(tag, str):
+            logger.error("%s.tag must be a string", where)
+            raise SystemExit(1)
+        asset = pin.get("asset")
+        if not isinstance(asset, str) or not asset.strip() or "/" in asset or "\\" in asset:
+            logger.error("%s.asset must be a non-empty release asset filename", where)
+            raise SystemExit(1)
+        sha = pin.get("sha256")
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", sha):
+            logger.error("%s.sha256 must be exactly 64 hex characters", where)
+            raise SystemExit(1)
+        key = (tag.strip(), asset.strip())
+        if key in seen:
+            logger.error("%s repeats the pin for release %s, asset %s", where, key[0], key[1])
+            raise SystemExit(1)
+        seen.add(key)
+        if strategy == "github_release":
+            pins.append({"tag": key[0], "asset": key[1], "sha256": sha.lower()})
+        else:
+            pins.append({"asset": key[1], "sha256": sha.lower()})
+    return pins
+
+
 # ---------------------------------------------------------------------------
 # Mod / pack insertion
 # ---------------------------------------------------------------------------
@@ -2101,6 +913,13 @@ def validate_download_strategy(item: dict[str, Any]) -> str:
     """
     item_id = item.get("id", "<unknown>")
     strategy = item.get("download_strategy")
+    if strategy == "manual_link":
+        logger.error(
+            "%s: download_strategy manual_link is only for entries for other games; a Minecraft "
+            "entry downloads its file itself",
+            item_id,
+        )
+        raise SystemExit(1)
     if strategy not in VALID_DOWNLOAD_STRATEGIES:
         logger.error(
             "%s: download_strategy must be one of %s, got %r",
@@ -2121,20 +940,33 @@ def validate_download_strategy(item: dict[str, Any]) -> str:
     return strategy
 
 
-def validate_pinned_source(
-    item_id: str,
-    strategy: str,
-    source: str,
-    declared: Any,
-) -> None:
-    """Enforce the hand-pinned contract for one ``direct_hash``/``technic_pack``
-    source.
+def _validate_manual_link_url(item_id: str, source: str) -> None:
+    """A manual_link identifier is the https page the player downloads from.
 
-    Applied per *source* rather than per *item* so that a manifest listing
-    several download sources gets every pinned entry checked, not just the
-    preferred one. A fallback that only fails once the preferred source is down
-    is worse than no fallback at all.
+    It is not a file URL: it names a page, so the file-name rule that pinned
+    sources obey does not apply. Plain ``http://`` is refused because the page
+    is opened in the player's browser and must not be downgraded.
     """
+    parsed = urlparse(source)
+    if parsed.scheme != "https" or not parsed.netloc:
+        reason = "must be an https:// URL" if parsed.scheme != "http" else (
+            "must be https://, not http://"
+        )
+        logger.error(
+            "%s: manual_link source_identifier %s, got %r", item_id, reason, source
+        )
+        raise SystemExit(1)
+    if any(ch.isspace() for ch in source):
+        logger.error(
+            "%s: manual_link source_identifier must not contain spaces, got %r",
+            item_id,
+            source,
+        )
+        raise SystemExit(1)
+
+
+def _validate_pinned_url(item_id: str, strategy: str, source: str) -> None:
+    """The URL rules every pinned source obeys, whatever game it is for."""
     if strategy == "provider_pack":
         if not PROVIDER_PACK_IDENTIFIER.fullmatch(source):
             logger.error(
@@ -2175,6 +1007,23 @@ def validate_pinned_source(
             source,
         )
         raise SystemExit(1)
+
+
+def validate_pinned_source(
+    item_id: str,
+    strategy: str,
+    source: str,
+    declared: Any,
+) -> None:
+    """Enforce the hand-pinned contract for one ``direct_hash``/``technic_pack``
+    source.
+
+    Applied per *source* rather than per *item* so that a manifest listing
+    several download sources gets every pinned entry checked, not just the
+    preferred one. A fallback that only fails once the preferred source is down
+    is worse than no fallback at all.
+    """
+    _validate_pinned_url(item_id, strategy, source)
 
     if not declared:
         logger.error(
@@ -2278,6 +1127,8 @@ def normalize_download_sources(item: dict[str, Any]) -> list[dict[str, str]]:
     same contract as a pinned primary, and a duplicate ``(strategy,
     identifier)`` pair is dropped rather than retried twice.
     """
+    if is_other_game(item):
+        return _canonical_other_game_sources(item)
     item_id = item.get("id", "<unknown>")
     raw = item.get("download_sources")
 
@@ -2308,6 +1159,13 @@ def normalize_download_sources(item: dict[str, Any]) -> list[dict[str, str]]:
                 )
                 raise SystemExit(1)
             strategy = entry.get("strategy")
+            if strategy == "manual_link":
+                logger.error(
+                    "%s: download_sources strategy manual_link is only for entries for other "
+                    "games; a Minecraft entry downloads its file itself",
+                    item_id,
+                )
+                raise SystemExit(1)
             if strategy not in VALID_DOWNLOAD_STRATEGIES:
                 logger.error(
                     "%s: download_sources strategy must be one of %s, got %r",
@@ -2324,7 +1182,11 @@ def normalize_download_sources(item: dict[str, Any]) -> list[dict[str, str]]:
                     entry,
                 )
                 raise SystemExit(1)
-            sources.append({"strategy": strategy, "identifier": identifier})
+            source: dict[str, Any] = {"strategy": strategy, "identifier": identifier}
+            pins = canonical_source_pins(item_id, strategy, entry.get("pins"))
+            if pins:
+                source["pins"] = pins
+            sources.append(source)
 
         # download_sources is authoritative when present. A manifest may still
         # spell out the legacy pair, but it must then agree with the preferred
@@ -2402,6 +1264,377 @@ def normalize_download_sources(item: dict[str, Any]) -> list[dict[str, str]]:
     return sources
 
 
+# ---------------------------------------------------------------------------
+# Catalog entries for other games (MASTER_SPEC §26.8)
+# ---------------------------------------------------------------------------
+
+MINECRAFT_GAME = "minecraft"
+
+# Strategies an entry for another game may use. The Minecraft-only strategies
+# (modrinth_id, technic_pack, curated_pack, provider_pack) do not apply.
+# manual_link is the player-downloads-it-themselves strategy: the entry links
+# to the page and names the file pattern Agora recognises.
+OTHER_GAME_STRATEGIES = frozenset({"github_release", "direct_hash", "manual_link"})
+
+# Fields that only mean something for Minecraft. An entry for another game
+# states its compatibility in game_compatibility instead. modrinth_id is
+# refused too: it would add a Modrinth source to a game Modrinth does not host.
+OTHER_GAME_FORBIDDEN_FIELDS = (
+    "compatible_versions",
+    "mod_dependencies",
+    "package_signatures",
+    "mod_jar_aliases",
+    "modrinth_id",
+)
+
+# Mods only for now. Packs and the other kinds stay Minecraft-only until a
+# game needs them.
+OTHER_GAME_KINDS = ("mods",)
+
+# Where game packages live. Read as data; nothing in them is executed.
+GAME_PACKAGE_GLOBS = (
+    "packages/official/*/games/package.json",
+    "packages/tracers/*/games/package.json",
+)
+
+_GAME_VERSION_RE = re.compile(r"(?:[0-9]+|\*)(?:\.(?:[0-9]+|\*))*")
+_NUMERIC_VERSION_RE = re.compile(r"[0-9]+(?:\.[0-9]+)*")
+_OWNER_REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+")
+_GAME_COMPAT_KEYS = frozenset({"stores", "game_versions", "requires", "asset", "download_hint"})
+_GAME_REQUIRE_KEYS = frozenset({"framework", "min_version"})
+_MAX_DOWNLOAD_HINT = 200
+
+
+@dataclass(frozen=True)
+class GameDeclaration:
+    """What a game package declares about one game: its stores and frameworks."""
+
+    id: str
+    stores: frozenset[str]
+    frameworks: frozenset[str]
+
+
+def game_package_paths() -> list[Path]:
+    paths: list[Path] = []
+    for pattern in GAME_PACKAGE_GLOBS:
+        paths.extend(sorted(REPO_ROOT.glob(pattern)))
+    return paths
+
+
+def load_game_declarations(package_paths: list[Path] | None = None) -> dict[str, GameDeclaration]:
+    """Read the games that game packages declare, keyed by game id.
+
+    A game's stores are its ``stores[].store`` values. Its frameworks are the
+    package's top-level ``frameworks`` whose ``game`` is that game, plus the
+    game's own ``framework_ids``.
+    """
+    declared: dict[str, GameDeclaration] = {}
+    paths = game_package_paths() if package_paths is None else package_paths
+    for path in paths:
+        try:
+            package = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"Cannot read game package {path}: {exc}") from exc
+        package_frameworks = [
+            fw for fw in package.get("frameworks", []) if isinstance(fw, dict) and fw.get("id")
+        ]
+        for game in package.get("games", []):
+            if not isinstance(game, dict):
+                raise SystemExit(f"{path}: every game must be an object")
+            game_id = str(game.get("id", "")).strip()
+            if not game_id:
+                raise SystemExit(f"{path}: a game has no id")
+            if game_id == MINECRAFT_GAME or game_id in declared:
+                raise SystemExit(
+                    f"{path}: game id {game_id!r} is declared more than once, "
+                    "or is reserved for Minecraft"
+                )
+            stores = frozenset(
+                str(store["store"])
+                for store in game.get("stores", [])
+                if isinstance(store, dict) and store.get("store")
+            )
+            frameworks = {
+                str(fw["id"])
+                for fw in package_frameworks
+                if str(fw.get("game", game_id)) == game_id
+            }
+            frameworks.update(str(framework) for framework in game.get("framework_ids", []))
+            declared[game_id] = GameDeclaration(game_id, stores, frozenset(frameworks))
+    return declared
+
+
+def is_other_game(item: dict[str, Any]) -> bool:
+    return item.get("game", MINECRAFT_GAME) != MINECRAFT_GAME
+
+
+def load_game_manifests(
+    declarations: dict[str, GameDeclaration],
+) -> list[tuple[Path, dict[str, Any]]]:
+    """Load every manifest under ``registry/games/<game>/<kind>/``.
+
+    The folder names the game, and the manifest's ``game`` must say the same
+    thing. Archived entries are skipped, as everywhere else.
+    """
+    root = REGISTRY_DIR / "games"
+    results: list[tuple[Path, dict[str, Any]]] = []
+    if not root.exists():
+        return results
+    for path in sorted(root.rglob("*.json")):
+        parts = path.relative_to(root).parts
+        if "archived" in parts:
+            continue
+        if len(parts) != 3:
+            raise SystemExit(
+                f"{path}: entries for other games live at registry/games/<game>/<kind>/<id>.json"
+            )
+        game_id, kind = parts[0], parts[1]
+        if game_id not in declarations:
+            raise SystemExit(f"{path}: {game_id!r} is not a game that any game package defines")
+        if kind not in OTHER_GAME_KINDS:
+            raise SystemExit(
+                f"{path}: only {', '.join(OTHER_GAME_KINDS)} entries are accepted for other games, "
+                f"not {kind!r}"
+            )
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                item = json.load(fh)
+        except (json.JSONDecodeError, OSError) as exc:
+            raise SystemExit(f"{path}: cannot read manifest: {exc}") from exc
+        if not isinstance(item, dict):
+            raise SystemExit(f"{path}: a manifest must be a JSON object")
+        if item.get("game") != game_id:
+            raise SystemExit(
+                f'{path}: "game" must be {game_id!r} to match its folder, got {item.get("game")!r}'
+            )
+        results.append((path, item))
+    return results
+
+
+def check_game_scope(
+    path: Path,
+    item: dict[str, Any],
+    declarations: dict[str, GameDeclaration],
+) -> None:
+    """Enforce which game an entry is for, and which fields that game allows.
+
+    Every failure names the file and the field. Minecraft entries must not
+    carry ``game_compatibility``; entries for another game must carry it and
+    none of the Minecraft-only fields.
+    """
+    in_games_dir = path.is_relative_to(REGISTRY_DIR / "games")
+    game = item.get("game", MINECRAFT_GAME)
+    if not in_games_dir:
+        if game != MINECRAFT_GAME:
+            raise SystemExit(
+                f'{path}: "game" is {game!r}, but entries for other games live under '
+                f"registry/games/{game}/<kind>/"
+            )
+        if "game_compatibility" in item:
+            raise SystemExit(
+                f'{path}: "game_compatibility" is only for entries of other games; '
+                "Minecraft entries use compatible_versions"
+            )
+        return
+
+    if game not in declarations:
+        raise SystemExit(f"{path}: {game!r} is not a game that any game package defines")
+    decl = declarations[game]
+    for field_name in OTHER_GAME_FORBIDDEN_FIELDS:
+        if field_name in item:
+            raise SystemExit(
+                f'{path}: "{field_name}" is Minecraft-only and cannot appear on an entry for {game}'
+            )
+    if item.get("content_type") != "mod":
+        raise SystemExit(f'{path}: an entry for {game} must have content_type "mod"')
+    provides = item.get("provides_framework")
+    if provides is not None:
+        if not isinstance(provides, str) or provides not in decl.frameworks:
+            raise SystemExit(
+                f'{path}: "provides_framework" names {provides!r}, which {decl.id} does not '
+                f"declare (declared: {', '.join(sorted(decl.frameworks)) or 'none'})"
+            )
+    validate_optional_sha256(item.get("sha256"), str(path))
+    item["_manifest_path"] = str(path)
+    # Strategies first, so a Modrinth or unknown strategy is named as such
+    # rather than tripping an asset rule that only makes sense for GitHub.
+    sources = _canonical_other_game_sources(item)
+    require_manifest_sha256(str(path), sources, item.get("sha256"))
+    _validate_game_compatibility(path, item, decl)
+
+
+def _validate_game_compatibility(path: Path, item: dict[str, Any], decl: GameDeclaration) -> None:
+    where = f"{path}: game_compatibility"
+    entries = item.get("game_compatibility")
+    if not isinstance(entries, list) or not entries:
+        raise SystemExit(f"{where} must be a non-empty array")
+
+    raw_sources = item.get("download_sources")
+    if raw_sources is None:
+        raw_sources = [{"strategy": item.get("download_strategy")}]
+    if not isinstance(raw_sources, list):
+        raise SystemExit(f"{path}: download_sources must be an array")
+    # An asset picks one file out of a GitHub release, or names the file a
+    # matching manual_link download must look like, so either source needs it.
+    # A direct_hash mirror serves the same bytes and names its file in the URL,
+    # so it never takes one.
+    strategy_names = {
+        str(source.get("strategy"))
+        for source in raw_sources
+        if isinstance(source, dict)
+    }
+    needs_asset = bool(strategy_names & {"github_release", "manual_link"})
+
+    for index, entry in enumerate(entries):
+        label = f"{where}[{index}]"
+        if not isinstance(entry, dict):
+            raise SystemExit(f"{label} must be an object")
+        unknown = sorted(str(key) for key in set(entry) - _GAME_COMPAT_KEYS)
+        if unknown:
+            raise SystemExit(f"{label} has unknown key(s): {', '.join(unknown)}")
+
+        stores = entry.get("stores")
+        if not isinstance(stores, list) or not stores:
+            raise SystemExit(f"{label}.stores must be a non-empty array")
+        for store in stores:
+            if not isinstance(store, str) or store not in decl.stores:
+                raise SystemExit(
+                    f"{label}.stores names {store!r}, which {decl.id} does not declare "
+                    f"(declared: {', '.join(sorted(decl.stores)) or 'none'})"
+                )
+
+        versions = entry.get("game_versions")
+        if not isinstance(versions, list) or not versions:
+            raise SystemExit(f"{label}.game_versions must be a non-empty array")
+        for version in versions:
+            if not isinstance(version, str) or not _GAME_VERSION_RE.fullmatch(version):
+                raise SystemExit(
+                    f"{label}.game_versions entry {version!r} must be an exact version such as "
+                    "1.6.1179.0, or a glob on whole components such as 1.6.1170.*"
+                )
+
+        requires = entry.get("requires", [])
+        if not isinstance(requires, list):
+            raise SystemExit(f"{label}.requires must be an array")
+        for requirement in requires:
+            req_label = f"{label}.requires"
+            if not isinstance(requirement, dict):
+                raise SystemExit(f"{req_label} entries must be objects")
+            unknown = sorted(str(key) for key in set(requirement) - _GAME_REQUIRE_KEYS)
+            if unknown:
+                raise SystemExit(f"{req_label} has unknown key(s): {', '.join(unknown)}")
+            framework = requirement.get("framework")
+            if not isinstance(framework, str) or framework not in decl.frameworks:
+                raise SystemExit(
+                    f"{req_label} names framework {framework!r}, which {decl.id} does not declare "
+                    f"(declared: {', '.join(sorted(decl.frameworks)) or 'none'})"
+                )
+            if "min_version" in requirement:
+                min_version = requirement["min_version"]
+                if not isinstance(min_version, str) or not _NUMERIC_VERSION_RE.fullmatch(min_version):
+                    raise SystemExit(
+                        f"{req_label} min_version {min_version!r} must be dot-separated numbers "
+                        "such as 2.2.6"
+                    )
+
+        if needs_asset:
+            asset = entry.get("asset")
+            if not isinstance(asset, str) or not asset.strip() or "/" in asset or "\\" in asset:
+                raise SystemExit(
+                    f"{label}.asset is required for github_release or manual_link: the release "
+                    "asset to pick, or the file-name pattern a download must match, such as "
+                    "CrashLogger-*.7z"
+                )
+        elif "asset" in entry:
+            raise SystemExit(
+                f"{label}.asset is only for github_release or manual_link; a direct_hash entry "
+                "names its file in the URL"
+            )
+
+        # A manual_link page can tell the player which file to pick. The hint
+        # is one short line in the dialog, so it is kept short and single-line.
+        if "download_hint" in entry:
+            hint = entry.get("download_hint")
+            if not isinstance(hint, str) or not hint.strip():
+                raise SystemExit(f"{label}.download_hint must be a non-empty string")
+            if "\n" in hint or "\r" in hint or len(hint) > _MAX_DOWNLOAD_HINT:
+                raise SystemExit(
+                    f"{label}.download_hint must be one line of at most "
+                    f"{_MAX_DOWNLOAD_HINT} characters"
+                )
+            if "manual_link" not in strategy_names:
+                raise SystemExit(
+                    f"{label}.download_hint is only for manual_link; an automatic source "
+                    "picks the file itself"
+                )
+
+
+def _canonical_other_game_sources(item: dict[str, Any]) -> list[dict[str, str]]:
+    """Validate and canonicalize the download sources of an entry for another game.
+
+    Only github_release and direct_hash are accepted. Each direct_hash source
+    gets the same URL rules as Minecraft's, without the Minecraft
+    compatible_versions requirement, which the entry does not have.
+    """
+    label = item.get("_manifest_path", item.get("id", "<unknown>"))
+    raw = item.get("download_sources")
+    if raw is None:
+        raw = [{"strategy": item.get("download_strategy"), "identifier": item.get("source_identifier", "")}]
+    if not isinstance(raw, list) or not raw:
+        raise SystemExit(f"{label}: download_sources must be a non-empty array")
+
+    sources: list[dict[str, str]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise SystemExit(f"{label}: each download_sources entry must be an object")
+        strategy = entry.get("strategy")
+        if not isinstance(strategy, str) or strategy not in OTHER_GAME_STRATEGIES:
+            raise SystemExit(
+                f"{label}: strategy {strategy!r} is not available for {item.get('game')}; "
+                "use github_release or direct_hash"
+            )
+        identifier = str(entry.get("identifier", "")).strip()
+        if not identifier:
+            raise SystemExit(f"{label}: download_sources entry {entry!r} has no identifier")
+        if strategy == "direct_hash":
+            _validate_pinned_url(label, strategy, identifier)
+        elif strategy == "manual_link":
+            _validate_manual_link_url(label, identifier)
+        elif not _OWNER_REPO_RE.fullmatch(identifier):
+            raise SystemExit(f"{label}: github_release identifier must be owner/repo, got {identifier!r}")
+        source: dict[str, Any] = {"strategy": strategy, "identifier": identifier}
+        pins = canonical_source_pins(label, strategy, entry.get("pins"))
+        if pins:
+            source["pins"] = pins
+        sources.append(source)
+
+    # A manual_link is a fallback, not a source Agora can fetch from. It is
+    # allowed only last, after at least one automatic source, so the install
+    # never treats "ask the player to download it" as the primary answer.
+    manual_indexes = [
+        index for index, source in enumerate(sources) if source["strategy"] == "manual_link"
+    ]
+    if manual_indexes and manual_indexes != [len(sources) - 1]:
+        index = manual_indexes[0]
+        raise SystemExit(
+                f"{label}: download_sources[{index}].strategy is manual_link, which may only be "
+                "the last fallback, never before an automatic source"
+            )
+
+    if item.get("download_sources") is not None:
+        legacy_strategy = item.get("download_strategy")
+        if legacy_strategy is not None and legacy_strategy != sources[0]["strategy"]:
+            raise SystemExit(
+                f"{label}: download_strategy {legacy_strategy!r} disagrees with "
+                f"download_sources[0].strategy {sources[0]['strategy']!r}"
+            )
+
+    item["download_sources"] = sources
+    item["download_strategy"] = sources[0]["strategy"]
+    item["source_identifier"] = sources[0]["identifier"]
+    return sources
+
+
 def default_compatible_versions(item: dict[str, Any]) -> list[dict[str, str]]:
     """Return a sensible compatibility fallback when none is provided.
 
@@ -2468,6 +1701,326 @@ def manifest_date_added(path: Path) -> str:
     return datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
 
 
+OFFICIAL_PLUGIN_ID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\.[a-z0-9]+(?:-[a-z0-9]+)*")
+OFFICIAL_PLUGIN_ID_MAX = 96
+OFFICIAL_VERSION_RE = re.compile(
+    r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+)
+OFFICIAL_GAME_ID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+# Matches the 64 MiB a plugin package may expand to; the zip is smaller still.
+OFFICIAL_PACKAGE_MAX_BYTES = 64 * 1024 * 1024
+OFFICIAL_PLUGIN_RELEASE_KEYS = {
+    "version", "package_url", "sha256", "tree_sha256", "size", "revoked",
+}
+# `revoked` is optional; its absence means "not revoked".
+OFFICIAL_PLUGIN_RELEASE_REQUIRED = OFFICIAL_PLUGIN_RELEASE_KEYS - {"revoked"}
+OFFICIAL_PLUGIN_KEYS = {
+    "id", "name", "description", "game_ids", "min_agora_version", "current", "previous",
+}
+OFFICIAL_FETCH_TIMEOUT_SECONDS = 30
+
+
+def _fetch_official_package(url: str) -> bytes:
+    """Download an official plugin package, refusing anything larger than the size cap."""
+    response = requests.get(url, timeout=OFFICIAL_FETCH_TIMEOUT_SECONDS, stream=True)
+    try:
+        response.raise_for_status()
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=65536):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > OFFICIAL_PACKAGE_MAX_BYTES:
+                raise ValueError(
+                    f"the package is larger than the {OFFICIAL_PACKAGE_MAX_BYTES}-byte cap"
+                )
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        response.close()
+
+
+def _github_annotation_text(text: str) -> str:
+    """Escape a message for a GitHub Actions workflow command."""
+    return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def _official_asset_warning(message: str) -> None:
+    """Warn once in the log, and as an Actions annotation when the compile runs in Actions."""
+    logger.warning("%s", message)
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        print(f"::warning::{_github_annotation_text(message)}", flush=True)
+
+
+def _official_asset_missing(
+    path: Path,
+    label: str,
+    release: dict[str, Any],
+    fetch: Callable[[str], bytes],
+) -> str | None:
+    """Why a release's asset is missing, or None when the bytes match its pins.
+
+    A fetch failure means the asset was not published or is not reachable. That
+    is not a reason to block every other catalog entry, so the caller leaves this
+    plugin out and warns. A download that succeeds but does not match the pinned
+    size or sha256 is a wrong entry and stops the compile.
+    """
+    url = release["package_url"]
+    try:
+        data = fetch(url)
+    except Exception as exc:  # noqa: BLE001 - every fetch failure means the same thing
+        return f"{path}: {label}.package_url does not resolve to a package: {url}: {exc}"
+    if len(data) != release["size"]:
+        raise SystemExit(
+            f"{path}: {label}.size is {release['size']} but {url} served {len(data)} bytes"
+        )
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != release["sha256"]:
+        raise SystemExit(
+            f"{path}: {label}.sha256 is {release['sha256']} but {url} served {actual}"
+        )
+    return None
+
+
+def _official_release(path: Path, label: str, release: Any) -> dict[str, Any]:
+    if not isinstance(release, dict):
+        raise SystemExit(f"{path}: {label!r} must be an object")
+    unknown = sorted(set(release) - OFFICIAL_PLUGIN_RELEASE_KEYS)
+    if unknown:
+        raise SystemExit(f"{path}: {label!r} has unknown field(s): {', '.join(unknown)}")
+    missing = sorted(OFFICIAL_PLUGIN_RELEASE_REQUIRED - set(release))
+    if missing:
+        raise SystemExit(f"{path}: {label!r} is missing: {', '.join(missing)}")
+    revoked = release.get("revoked", False)
+    if not isinstance(revoked, bool):
+        raise SystemExit(f"{path}: {label}.revoked must be true or false, got {revoked!r}")
+    version = release["version"]
+    if not isinstance(version, str) or not OFFICIAL_VERSION_RE.fullmatch(version):
+        raise SystemExit(f"{path}: {label}.version must be a semantic version, got {version!r}")
+    url = release["package_url"]
+    # https only, and nothing in the authority but a host: no userinfo, no port,
+    # no whitespace. The app pins the host of this URL for the download.
+    if (
+        not isinstance(url, str)
+        or not re.fullmatch(r"https://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?:/[^\s#]*)?", url)
+    ):
+        raise SystemExit(
+            f"{path}: {label}.package_url must be an https:// URL with a plain host, got {url!r}"
+        )
+    sha256 = release["sha256"]
+    if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+        raise SystemExit(
+            f"{path}: {label}.sha256 must be exactly 64 lowercase hex characters, got {sha256!r}"
+        )
+    # The digest of the files the zip unpacks to. Pinning it here, in the signed
+    # registry, is what lets the app check an installed folder against something
+    # local state cannot rewrite. scripts/official_plugin_digest.py computes it.
+    tree_sha256 = release["tree_sha256"]
+    if not isinstance(tree_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", tree_sha256):
+        raise SystemExit(
+            f"{path}: {label}.tree_sha256 must be exactly 64 lowercase hex characters, "
+            f"got {tree_sha256!r}"
+        )
+    size = release["size"]
+    if (
+        isinstance(size, bool)
+        or not isinstance(size, int)
+        or size <= 0
+        or size > OFFICIAL_PACKAGE_MAX_BYTES
+    ):
+        raise SystemExit(
+            f"{path}: {label}.size must be a whole number of bytes between 1 and "
+            f"{OFFICIAL_PACKAGE_MAX_BYTES}, got {size!r}"
+        )
+    return {
+        "version": version,
+        "package_url": url,
+        "sha256": sha256,
+        "tree_sha256": tree_sha256,
+        "size": size,
+        "revoked": revoked,
+    }
+
+
+def load_official_plugins(
+    fetch: Callable[[str], bytes] | None = _fetch_official_package,
+) -> list[tuple[Path, dict[str, Any]]]:
+    """Read ``registry/official-plugins/<id>.json``, one file per official plugin.
+
+    The folder is flat and the file name must be the plugin id, so an id cannot
+    be listed twice. Anything malformed refuses the whole compile: this table is
+    what the app trusts to decide which downloads count as official, so a typo
+    must not become a silently missing or silently different entry.
+
+    Each release's ``package_url`` must also serve the bytes its ``size`` and
+    ``sha256`` pin. Pass a fetcher in tests; ``None`` skips the download and is
+    only for tests that are not about the asset.
+    """
+    root = REGISTRY_DIR / "official-plugins"
+    results: list[tuple[Path, dict[str, Any]]] = []
+    if not root.exists():
+        return results
+    for path in sorted(root.rglob("*")):
+        if path.is_dir():
+            continue
+        parts = path.relative_to(root).parts
+        if "archived" in parts:
+            continue
+        if len(parts) != 1 or path.suffix != ".json":
+            raise SystemExit(
+                f"{path}: official plugins live at registry/official-plugins/<plugin-id>.json"
+            )
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (json.JSONDecodeError, OSError) as exc:
+            raise SystemExit(f"{path}: cannot read official plugin entry: {exc}") from exc
+        if not isinstance(data, dict):
+            raise SystemExit(f"{path}: an official plugin entry must be a JSON object")
+        unknown = sorted(set(data) - OFFICIAL_PLUGIN_KEYS)
+        if unknown:
+            raise SystemExit(f"{path}: unknown field(s): {', '.join(unknown)}")
+        plugin_id = data.get("id")
+        if (
+            not isinstance(plugin_id, str)
+            or len(plugin_id) > OFFICIAL_PLUGIN_ID_MAX
+            or not OFFICIAL_PLUGIN_ID_RE.fullmatch(plugin_id)
+        ):
+            raise SystemExit(
+                f"{path}: id must be `publisher.plugin` in lowercase letters, digits and inner "
+                f"hyphens, got {plugin_id!r}"
+            )
+        if path.stem != plugin_id:
+            raise SystemExit(f"{path}: the file name must be the plugin id, {plugin_id}.json")
+        name = data.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise SystemExit(f"{path}: name is required")
+        description = data.get("description")
+        if description is not None and not isinstance(description, str):
+            raise SystemExit(f"{path}: description must be text")
+        game_ids = data.get("game_ids", [])
+        if not isinstance(game_ids, list) or any(
+            not isinstance(g, str) or not OFFICIAL_GAME_ID_RE.fullmatch(g) for g in game_ids
+        ):
+            raise SystemExit(f"{path}: game_ids must be a list of lowercase game ids")
+        if len(set(game_ids)) != len(game_ids):
+            raise SystemExit(f"{path}: game_ids lists a game twice")
+        min_version = data.get("min_agora_version")
+        if not isinstance(min_version, str) or not OFFICIAL_VERSION_RE.fullmatch(min_version):
+            raise SystemExit(
+                f"{path}: min_agora_version must be a semantic version, got {min_version!r}"
+            )
+        if "current" not in data:
+            raise SystemExit(f"{path}: current is required")
+        current = _official_release(path, "current", data["current"])
+        previous = None
+        if data.get("previous") is not None:
+            previous = _official_release(path, "previous", data["previous"])
+            if previous["version"] == current["version"]:
+                raise SystemExit(f"{path}: previous must be a different version from current")
+        if fetch is not None:
+            missing = _official_asset_missing(path, "current", current, fetch)
+            if missing is None and previous is not None:
+                missing = _official_asset_missing(path, "previous", previous, fetch)
+            if missing is not None:
+                _official_asset_warning(
+                    f"Official plugin {plugin_id} left out of the catalog: {missing}"
+                )
+                continue
+        results.append(
+            (
+                path,
+                {
+                    "id": plugin_id,
+                    "name": name.strip(),
+                    "description": description,
+                    "game_ids": list(game_ids),
+                    "min_agora_version": min_version,
+                    "current": current,
+                    "previous": previous,
+                },
+            )
+        )
+    return results
+
+
+def insert_official_plugins(
+    conn: sqlite3.Connection, entries: list[tuple[Path, dict[str, Any]]]
+) -> None:
+    """Write one official_plugins row per listed version (current, then previous)."""
+    cursor = conn.cursor()
+    for _path, entry in entries:
+        for channel in ("current", "previous"):
+            release = entry[channel]
+            if release is None:
+                continue
+            cursor.execute(
+                """
+                INSERT INTO official_plugins (
+                    plugin_id, version, channel, name, description, game_ids_json,
+                    package_url, package_sha256, package_tree_sha256, package_size,
+                    min_agora_version, revoked
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    entry["id"],
+                    release["version"],
+                    channel,
+                    entry["name"],
+                    entry["description"],
+                    json.dumps(entry["game_ids"], separators=(",", ":")),
+                    release["package_url"],
+                    release["sha256"],
+                    release["tree_sha256"],
+                    release["size"],
+                    entry["min_agora_version"],
+                    int(release["revoked"]),
+                ),
+            )
+
+
+def insert_game_catalog_item(conn: sqlite3.Connection, item: dict[str, Any], path: Path) -> None:
+    """Insert one entry for another game into game_catalog_items.
+
+    Only what an installer needs is stored. Votes, governance, categories,
+    curator notes and changelogs are Minecraft catalog features and are not
+    written for other games yet.
+    """
+    download_sources = normalize_download_sources(item)
+    sha256 = validate_optional_sha256(item.get("sha256"), item["id"])
+    require_manifest_sha256(item["id"], download_sources, item.get("sha256"))
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO game_catalog_items (
+            id, game, name, author, content_type, download_strategy, source_identifier,
+            sha256, download_sources_json, game_compatibility_json, provides_framework,
+            description, license_id, page_url, icon_url, status, date_added
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
+        """,
+        (
+            item["id"],
+            item["game"],
+            item["name"],
+            item.get("author"),
+            item.get("content_type", "mod"),
+            item["download_strategy"],
+            item["source_identifier"],
+            sha256,
+            json.dumps(download_sources, separators=(",", ":")),
+            json.dumps(item["game_compatibility"], separators=(",", ":")),
+            item.get("provides_framework"),
+            item.get("description"),
+            item.get("license"),
+            item.get("page_url"),
+            item.get("icon_url"),
+            manifest_date_added(path),
+        ),
+    )
+
+
 def insert_registry_item(conn: sqlite3.Connection, item: dict[str, Any], path: Path) -> None:
     """Insert a mod/pack/asset row into registry_items."""
     cursor = conn.cursor()
@@ -2478,11 +2031,12 @@ def insert_registry_item(conn: sqlite3.Connection, item: dict[str, Any], path: P
     immunity_reason = governance.get("override_justification")
     allow_comments = bool(governance.get("allow_comments", True))
 
-    sha256 = validate_sha256(item.get("sha256"))
     # Idempotent: main() normalizes every item up front so hydration sees the
     # derived fields, but a caller that inserts a hand-built dict still gets a
     # validated source list.
     download_sources = normalize_download_sources(item)
+    sha256 = validate_optional_sha256(item.get("sha256"), item_id)
+    require_manifest_sha256(item_id, download_sources, item.get("sha256"))
     download_strategy = item["download_strategy"]
     gallery = item.get("gallery_urls", [])
     compatible_versions = (
@@ -3377,27 +2931,193 @@ def insert_pack_versions(
 # ---------------------------------------------------------------------------
 
 
+# Format v2 of a community crash signature. The app turns each row into a
+# crash rule, so these are the only values its closed types accept.
+SIGNATURE_LEVELS = ("possible", "likely")
+SIGNATURE_CAUSES = (
+    "mod",
+    "version_mismatch",
+    "missing_requirement",
+    "file",
+    "setting",
+    "save",
+    "memory",
+    "driver",
+    "game_install",
+    "other",
+)
+SIGNATURE_ACTION_KINDS = (
+    "install_content",
+    "open_console",
+    "open_jvm_settings",
+    "open_crash_log",
+    "review_mods",
+)
+_SIGNATURE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+
+def validate_crash_signature(sig: Any) -> list[str]:
+    """Every reason *sig* is not a v2 community crash signature.
+
+    The format is a plain data shape the Rust engine can turn into one rule: a
+    non-empty `games` list, a regex over log lines, a plain-text headline, and an
+    optional action from the UI's closed set. An empty list means valid.
+    """
+    if not isinstance(sig, dict):
+        return ["a crash signature is a JSON object"]
+
+    errors: list[str] = []
+    signature_id = sig.get("id")
+    if not isinstance(signature_id, str) or not _SIGNATURE_ID_RE.match(signature_id):
+        errors.append(
+            "`id` is a non-empty string of lower-case letters, digits, `.`, `_` or `-`"
+        )
+
+    name = sig.get("name")
+    if not isinstance(name, str) or not name.strip():
+        errors.append("`name` is a non-empty string")
+
+    games = sig.get("games")
+    if not isinstance(games, list) or not games:
+        errors.append("`games` is a non-empty list of game ids")
+    else:
+        for game in games:
+            if not isinstance(game, str) or not _SIGNATURE_ID_RE.match(game):
+                errors.append(
+                    f"game id {game!r} is not lower-case letters, digits, `.`, `_` or `-`"
+                )
+
+    pattern = sig.get("regex_pattern")
+    if not isinstance(pattern, str) or not pattern:
+        errors.append("`regex_pattern` is a non-empty string")
+
+    level = sig.get("level", "possible")
+    if level not in SIGNATURE_LEVELS:
+        errors.append(
+            f"`level` is one of {', '.join(SIGNATURE_LEVELS)}; got {level!r}"
+        )
+
+    cause = sig.get("cause", "other")
+    if cause not in SIGNATURE_CAUSES:
+        errors.append(
+            f"`cause` is one of {', '.join(SIGNATURE_CAUSES)}; got {cause!r}"
+        )
+
+    text = sig.get("text")
+    if not isinstance(text, str) or not text.strip():
+        errors.append("`text` is a non-empty plain-text headline")
+
+    action = sig.get("action")
+    if action is not None:
+        if not isinstance(action, dict):
+            errors.append("`action` is an object with a `kind`")
+        else:
+            kind = action.get("kind")
+            if kind not in SIGNATURE_ACTION_KINDS:
+                errors.append(
+                    f"`action.kind` is one of {', '.join(SIGNATURE_ACTION_KINDS)}; "
+                    f"got {kind!r}"
+                )
+            content_key = action.get("content_key")
+            if kind == "install_content":
+                if not isinstance(content_key, str) or not content_key.strip():
+                    errors.append(
+                        "`action.content_key` is required for `install_content`"
+                    )
+            elif content_key is not None:
+                errors.append("only `install_content` uses `action.content_key`")
+            label = action.get("label")
+            if label is not None and (
+                not isinstance(label, str) or not label.strip()
+            ):
+                errors.append("`action.label` is a non-empty string when present")
+
+    return errors
+
+
+def _rust_regex_problem(pattern: str) -> str | None:
+    """Why the app's Rust regex engine refuses a pattern Python accepts, if it does.
+
+    The catalogue is read by the Rust `regex` crate, which has no look-around,
+    backreferences, atomic groups, conditionals or recursion. Validating with
+    Python's `re` alone would publish a row the app can never run, so the
+    compiler refuses those constructs here instead.
+    """
+    for token, construct in (
+        ("(?=", "a look-ahead"),
+        ("(?!", "a negative look-ahead"),
+        ("(?<=", "a look-behind"),
+        ("(?<!", "a negative look-behind"),
+        ("(?>", "an atomic group"),
+        ("(?(", "a conditional group"),
+        ("(?#", "a comment group"),
+        ("(?P=", "a named backreference"),
+        ("(?R", "recursion"),
+        ("(?0", "recursion"),
+    ):
+        if token in pattern:
+            return f"it uses {construct}, which the app's Rust regex engine does not support"
+
+    index = 0
+    while index < len(pattern):
+        if pattern[index] != "\\" or index + 1 >= len(pattern):
+            index += 1
+            continue
+        following = pattern[index + 1]
+        if following.isdigit() and following != "0":
+            return (
+                "it uses a numeric backreference, which the app's Rust regex "
+                "engine does not support"
+            )
+        if following == "k" and index + 2 < len(pattern) and pattern[index + 2] in "<'":
+            return (
+                "it uses a named backreference, which the app's Rust regex "
+                "engine does not support"
+            )
+        if following == "Z":
+            return "it uses `\\Z`; the app's Rust regex engine spells end-of-text `\\z`"
+        index += 2
+    return None
+
+
 def insert_crash_signature(
     conn: sqlite3.Connection,
     sig: dict[str, Any],
     rejected: list[int],
 ) -> None:
-    """Insert a crash signature after validating its regex pattern.
+    """Insert a v2 crash signature after validating its shape and regex.
 
-    Validation per ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§2.4.1:
+    Validation per §2.4.1:
+    - The fields follow the v2 signature format (see `validate_crash_signature`).
     - Reject patterns longer than 256 characters.
     - Test each pattern against a 100 KB corpus with a 1 s timeout to catch
       catastrophic backtracking.
 
-    *rejected* is a one-element list used as a mutable counter so the caller
-    can track how many signatures were skipped.
+    A row that fails validation is skipped and logged, never silently stored;
+    *rejected* is a one-element list used as a mutable counter so the caller can
+    track how many signatures were skipped.
     """
+    errors = validate_crash_signature(sig)
+    if errors:
+        signature_id = sig.get("id", "<no id>") if isinstance(sig, dict) else "<no id>"
+        logger.error(
+            "Crash signature '%s' rejected: %s", signature_id, "; ".join(errors)
+        )
+        rejected[0] += 1
+        return
+
     name = sig.get("name", sig["id"])
-    raw_pattern = sig.get("regex_pattern", "")
+    raw_pattern = sig["regex_pattern"]
 
     # --- Length check ---
     if len(raw_pattern) > 256:
         logger.error("Crash signature '%s' rejected: pattern exceeds 256 characters (%d)", name, len(raw_pattern))
+        rejected[0] += 1
+        return
+
+    # --- Rust compatibility ---
+    if (problem := _rust_regex_problem(raw_pattern)) is not None:
+        logger.error("Crash signature '%s' rejected: %s", name, problem)
         rejected[0] += 1
         return
 
@@ -3416,21 +3136,48 @@ def insert_crash_signature(
         return
 
     # --- Insert ---
+    action = sig.get("action") or {}
     cursor = conn.cursor()
-    action_button = sig.get("action_button")
-    cursor.execute(
-        """
-        INSERT INTO crash_signatures (id, name, regex_pattern, solution_markdown, action_button_json)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (
+    duplicate = cursor.execute(
+        "SELECT 1 FROM crash_signatures WHERE id = ?", (sig["id"],)
+    ).fetchone()
+    if duplicate is not None:
+        logger.error(
+            "Crash signature '%s' rejected: another file already uses id '%s'",
+            name,
             sig["id"],
-            sig["name"],
-            sig["regex_pattern"],
-            sig["solution_markdown"],
-            json.dumps(action_button, separators=(",", ":")) if action_button else None,
-        ),
-    )
+        )
+        rejected[0] += 1
+        return
+    try:
+        cursor.execute(
+            """
+            INSERT INTO crash_signatures
+                (id, name, games_json, regex_pattern, level, cause, text,
+                 action_kind, action_content_key, action_label)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                sig["id"],
+                sig["name"],
+                json.dumps(sig["games"], separators=(",", ":")),
+                raw_pattern,
+                sig.get("level", "possible"),
+                sig.get("cause", "other"),
+                sig["text"],
+                action.get("kind"),
+                action.get("content_key"),
+                action.get("label"),
+            ),
+        )
+    except sqlite3.IntegrityError as exc:
+        logger.error(
+            "Crash signature '%s' rejected: it could not be stored (%s)",
+            name,
+            exc,
+        )
+        rejected[0] += 1
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -3462,28 +3209,53 @@ def _clean_version_window(raw) -> list:
     return out
 
 
-def load_known_conflicts(conn: sqlite3.Connection) -> int:
+def load_known_conflicts(conn: sqlite3.Connection, *, allow_partial: bool = False) -> int:
     """Ingest community-curated known conflicts from known_conflicts.json.
 
-    Returns the number of rows inserted.
+    The file is committed catalog data, so a missing or malformed copy stops
+    the compile rather than shipping a catalog whose conflict warnings have
+    silently disappeared. Returns the number of rows inserted.
     """
     path = REGISTRY_DIR / "governance" / "known_conflicts.json"
     try:
         with path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("Could not load known_conflicts.json (%s); skipping.", exc)
+        message = f"cannot read known conflicts {path}: {exc}"
+        if not allow_partial:
+            raise GovernanceError(message) from exc
+        logger.warning("%s; continuing because partial governance is allowed.", message)
         return 0
 
     if not isinstance(data, list):
-        logger.warning("known_conflicts.json is not a JSON array; skipping.")
+        message = f"malformed known conflicts {path}: expected a JSON array"
+        if not allow_partial:
+            raise GovernanceError(message)
+        logger.warning("%s; continuing because partial governance is allowed.", message)
         return 0
 
     cursor = conn.cursor()
     count = 0
-    for entry in data:
+    for index, entry in enumerate(data, 1):
+        if not isinstance(entry, dict):
+            message = (
+                f"malformed known conflicts {path}: entry {index} must be a JSON object"
+            )
+            if not allow_partial:
+                raise GovernanceError(message)
+            logger.warning("%s; continuing because partial governance is allowed.", message)
+            continue
         a = str(entry.get("a", "")).strip().lower()
         b = str(entry.get("b", "")).strip().lower()
+        if not a or not b:
+            message = (
+                f"malformed known conflicts {path}: entry {index} needs "
+                "non-empty 'a' and 'b'"
+            )
+            if not allow_partial:
+                raise GovernanceError(message)
+            logger.warning("%s; continuing because partial governance is allowed.", message)
+            continue
         severity = str(entry.get("severity", "")).strip().lower()
         mitigated_by = entry.get("mitigated_by")
         if not isinstance(mitigated_by, list):
@@ -3762,6 +3534,257 @@ PLACEHOLDER_SIGNATURE = (
 
 
 # ---------------------------------------------------------------------------
+# Signed catalog bundle
+# ---------------------------------------------------------------------------
+
+CATALOG_BUNDLE_MAGIC = b"AGORA-CATALOG-V1"
+CATALOG_HEADER_DOMAIN = b"AGORA-CATALOG-HEADER-V1\n"
+CATALOG_BUNDLE_FORMAT = 1
+CATALOG_DEFAULT_VALIDITY_DAYS = 90
+
+
+def catalog_key_id(public_key: bytes) -> str:
+    """The same id the client derives: the first 16 hex characters of SHA-256."""
+    return hashlib.sha256(public_key).hexdigest()[:16]
+
+
+def _load_key_certificates() -> list[dict[str, Any]]:
+    """Optional key certificates for rotation.
+
+    ``AGORA_REGISTRY_KEY_CERTIFICATES`` names a JSON file holding an array of
+    certificates; ``AGORA_REGISTRY_KEY_CERTIFICATE`` holds one object. A
+    certificate is only a statement, so the compiler checks its shape and that
+    its id matches its public key. The client verifies the signature against a
+    key it already trusts.
+    """
+    path = os.environ.get("AGORA_REGISTRY_KEY_CERTIFICATES")
+    if path:
+        raw: Any = json.loads(Path(path).read_text(encoding="utf-8"))
+    elif os.environ.get("AGORA_REGISTRY_KEY_CERTIFICATE"):
+        raw = json.loads(os.environ["AGORA_REGISTRY_KEY_CERTIFICATE"])
+    else:
+        return []
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raise ValueError("key certificates must be a JSON object or array")
+    certificates: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("each key certificate must be an object")
+        for field in ("key_id", "public_key", "role", "signed_by", "signature"):
+            if not isinstance(item.get(field), str) or not item[field].strip():
+                raise ValueError(f"key certificate is missing {field}")
+        if item["role"] not in ("primary", "recovery"):
+            raise ValueError("a key certificate role must be primary or recovery")
+        if catalog_key_id(bytes.fromhex(item["public_key"])) != item["key_id"]:
+            raise ValueError("key certificate id does not match its public key")
+        certificates.append(
+            {
+                key: item[key]
+                for key in ("key_id", "public_key", "role", "signed_by", "signature")
+            }
+        )
+    return certificates
+
+
+def _load_revocations() -> list[dict[str, str]]:
+    """Optional revocation statements signed by the offline recovery key.
+
+    ``AGORA_REGISTRY_REVOCATIONS`` names a JSON file holding an array;
+    ``AGORA_REGISTRY_REVOCATION`` holds one object. The compiler only checks the
+    shape: the client verifies each signature against a trusted recovery key.
+    A bare list of key ids is not accepted.
+    """
+    if os.environ.get("AGORA_REGISTRY_REVOKED_KEY_IDS"):
+        raise ValueError(
+            "AGORA_REGISTRY_REVOKED_KEY_IDS is no longer accepted: a revocation "
+            "must be a statement signed by a recovery key. Use "
+            "AGORA_REGISTRY_REVOCATIONS."
+        )
+    path = os.environ.get("AGORA_REGISTRY_REVOCATIONS")
+    if path:
+        raw: Any = json.loads(Path(path).read_text(encoding="utf-8"))
+    elif os.environ.get("AGORA_REGISTRY_REVOCATION"):
+        raw = json.loads(os.environ["AGORA_REGISTRY_REVOCATION"])
+    else:
+        return []
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raise ValueError("revocations must be a JSON object or array")
+    revocations: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("each revocation must be an object")
+        for field in ("revoked_key_id", "signed_by", "signature"):
+            if not isinstance(item.get(field), str) or not item[field].strip():
+                raise ValueError(f"revocation is missing {field}")
+        if item["revoked_key_id"] == item["signed_by"]:
+            raise ValueError("a key may not revoke itself")
+        revocations.append(
+            {
+                key: item[key]
+                for key in ("revoked_key_id", "signed_by", "signature")
+            }
+        )
+    return revocations
+
+
+def _read_built_at(db_path: Path) -> str | None:
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            row = conn.execute(
+                "SELECT value_json FROM system_config WHERE key = 'built_at'"
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    try:
+        value = json.loads(row[0])
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, str) and value else None
+
+
+def build_catalog_bundle(db_path: Path, db_bytes: bytes, *, skip_sign: bool) -> bytes:
+    """Wrap the database in one signed file.
+
+    The header is signed over its exact serialized bytes, so the Rust client can
+    verify without re-canonicalizing the JSON. ``registry.db.sig`` remains for
+    older clients and the web export; the launcher reads ``registry.bundle``.
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        validity_days = int(
+            os.environ.get("AGORA_REGISTRY_VALIDITY_DAYS", CATALOG_DEFAULT_VALIDITY_DAYS)
+        )
+    except ValueError as exc:
+        raise ValueError("AGORA_REGISTRY_VALIDITY_DAYS must be an integer") from exc
+    if not 1 <= validity_days <= 3650:
+        raise ValueError("AGORA_REGISTRY_VALIDITY_DAYS must be between 1 and 3650")
+    expires = now + timedelta(days=validity_days)
+    tag = os.environ.get("AGORA_REGISTRY_TAG") or f"registry-{now:%Y-%m-%d}"
+    built_at = _read_built_at(db_path) or now.isoformat()
+
+    key = None if skip_sign else get_signing_key()
+    if not skip_sign and (key is None or nacl is None):
+        raise RuntimeError("no signing key available for the catalog bundle")
+    if key is not None and nacl is not None:
+        public_key = key.verify_key.encode(encoder=nacl.encoding.RawEncoder)
+        key_id = catalog_key_id(public_key)
+    else:
+        key_id = "0" * 16
+
+    header: dict[str, Any] = {
+        "format": CATALOG_BUNDLE_FORMAT,
+        "key_id": key_id,
+        "schema_version": SCHEMA_VERSION,
+        "tag": tag,
+        "built_at": built_at,
+        "issued_at": now.isoformat(),
+        "expires_at": expires.isoformat(),
+        "db_len": len(db_bytes),
+        "db_sha256": hashlib.sha256(db_bytes).hexdigest(),
+    }
+    certificates = _load_key_certificates()
+    if certificates:
+        header["certificates"] = certificates
+    revocations = _load_revocations()
+    if revocations:
+        header["revocations"] = revocations
+
+    header_bytes = json.dumps(
+        header, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    if key is not None and nacl is not None:
+        signature = key.sign(
+            CATALOG_HEADER_DOMAIN + header_bytes,
+            encoder=nacl.encoding.RawEncoder,
+        )[:64]
+    else:
+        signature = b"\0" * 64
+
+    return b"".join(
+        (
+            CATALOG_BUNDLE_MAGIC,
+            len(header_bytes).to_bytes(4, "little"),
+            header_bytes,
+            signature,
+            db_bytes,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Audit log (§4.6, §24.1)
+# ---------------------------------------------------------------------------
+
+
+def _read_json_strict(path: Path, what: str) -> Any:
+    """Read a JSON file, failing with a clear message instead of starting over.
+
+    The audit log is append-only; a file that cannot be read must stop the
+    compile so nobody silently replaces the record with an empty one.
+    """
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"cannot read the {what} at {path} ({exc}); fix or restore it from git "
+            "before compiling, the compiler will not start a new one over it"
+        ) from exc
+
+
+def _write_json_atomic(path: Path, data: Any) -> None:
+    """Write JSON through a temporary file and rename, so a crash never leaves half a file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def _read_audit_log(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"log_format_version": 1, "entries": []}
+    data = _read_json_strict(path, "audit log")
+    if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
+        raise ValueError(f"audit log {path} has no 'entries' list; refusing to rewrite it")
+    data.setdefault("log_format_version", 1)
+    return data
+
+
+def _governance_event_audit_rows(state_path: Path | None) -> list[tuple[str, str, str]]:
+    """Audit rows for the governance events recorded in the state file."""
+    if state_path is None or not state_path.exists():
+        return []
+    state = _read_json_strict(state_path, "governance state")
+    rows: list[tuple[str, str, str]] = []
+    for event in state.get("events", []) if isinstance(state, dict) else []:
+        if not isinstance(event, dict):
+            continue
+        timestamp = event.get("detected_at")
+        if not isinstance(timestamp, str) or not timestamp:
+            continue
+        event_type = str(event.get("event_type") or "governance_event")
+        reactions = event.get("affected_reactions") or []
+        details = (
+            f"{event.get('item_id', '?')}: {event.get('status', 'pending')}, "
+            f"{len(reactions)} reaction(s) held back (event {event.get('event_id', '?')})"
+        )
+        rows.append((timestamp, event_type, details))
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Main compile routine
 # ---------------------------------------------------------------------------
 
@@ -3776,11 +3799,28 @@ def compile_registry(
     registry_root: str | None = None,
     state_in_path: Path | None = None,
     state_out_path: Path | None = None,
+    official_fetcher: Callable[[str], bytes] | None = _fetch_official_package,
+    allow_partial_governance: bool = False,
 ) -> None:
-    """Build the SQLite registry database at *output_path*."""
+    """Build the SQLite registry database at *output_path*.
+
+    ``official_fetcher`` downloads each official plugin package so its URL,
+    size and sha256 can be checked. Tests pass their own fetcher, or ``None``
+    when the test is not about the asset.
+    """
     global REGISTRY_DIR
     if registry_root:
         REGISTRY_DIR = Path(registry_root).resolve()
+    if not allow_partial_governance:
+        allow_partial_governance = os.environ.get(
+            "AGORA_GOVERNANCE_ALLOW_PARTIAL", ""
+        ).strip().lower() in {"1", "true", "yes"}
+    if allow_partial_governance:
+        logger.warning(
+            "Partial governance is allowed (--allow-partial-governance or "
+            "AGORA_GOVERNANCE_ALLOW_PARTIAL); a failed read will be logged "
+            "and skipped instead of stopping the compile."
+        )
     logger.info("Starting nightly compile")
 
     conn = sqlite3.connect(":memory:")
@@ -3809,6 +3849,14 @@ def compile_registry(
     all_items: list[tuple[Path, dict[str, Any]]] = []
     for dir_name in CONTENT_DIRS:
         all_items.extend(load_json_files(REGISTRY_DIR / dir_name))
+    # Entries for other games (registry/games/<game>/mods/), §26.8. They are kept
+    # apart from the Minecraft items: hydration, governance and the Minecraft
+    # tables never see them, and they land in game_catalog_items instead.
+    game_declarations = load_game_declarations()
+    game_items = load_game_manifests(game_declarations)
+    # Official plugins (registry/official-plugins/): read up front so a malformed
+    # entry stops the compile before any slow work, and written to their own table.
+    official_plugins = load_official_plugins(official_fetcher)
 
     # Identity must be normalized before hydration and governance. Keep the
     # legacy alias readable for existing registries, but never let downstream
@@ -3824,6 +3872,28 @@ def compile_registry(
                 "%s uses deprecated top-level pack_id; migrate to id + content_type='pack'.",
                 path,
             )
+
+    # Which game each entry is for, and the fields that game allows. Runs
+    # before download sources are normalized so every error names its file.
+    for path, item in all_items:
+        check_game_scope(path, item, game_declarations)
+    for path, item in game_items:
+        check_game_scope(path, item, game_declarations)
+
+    # Item ids are global across games: one id, one entry.
+    seen_ids: dict[str, Path] = {}
+    for path, item in all_items + game_items:
+        item_id = str(item.get("id", ""))
+        if item_id in seen_ids:
+            raise SystemExit(f"Duplicate catalog id {item_id!r}: {seen_ids[item_id]} and {path}")
+        seen_ids[item_id] = path
+
+    for path, item in game_items:
+        try:
+            normalize_download_sources(item)
+        except SystemExit:
+            logger.error("Invalid download sources in %s", path)
+            raise
 
     # Download sources must be normalized before hydration: the hydrators pick
     # a Modrinth project id off download_strategy/modrinth_id, and both of
@@ -3859,23 +3929,21 @@ def compile_registry(
         logger.warning("Version changelog hydration failed: %s", exc)
         _pending_changelog_rows = []
 
-    # Governance pipeline (replaces legacy Pass 1/2/3).
+    # Governance pipeline. There is exactly one implementation
+    # (compiler/governance.py); this adapter only resolves paths and options.
     # v1 safety: GitHub reads only; NEVER mutates GitHub in any mode.
-    # When governance mode is set explicitly (read-only/monitor), legacy Pass 1/2 are skipped.
-    # When mode is None (unspecified), legacy Pass 1/2 runs. Explicit OFF skips everything.
-    _governance_mode: GovernanceMode | None = None
+    _governance_mode: GovernanceMode = GovernanceMode.OFF
     _governance_policy: GovernancePolicy = GovernancePolicy.PRODUCTION
     if governance_mode_str:
         try:
             _governance_mode = GovernanceMode(governance_mode_str)
-        except ValueError:
-            logger.warning("Unknown governance mode '%s'; using production default.", governance_mode_str)
-            _governance_mode = None
+        except ValueError as exc:
+            raise ValueError(f"unknown governance mode {governance_mode_str!r}") from exc
     if governance_policy_str:
         try:
             _governance_policy = GovernancePolicy(governance_policy_str)
-        except ValueError:
-            logger.warning("Unknown governance policy '%s'; using production.", governance_policy_str)
+        except ValueError as exc:
+            raise ValueError(f"unknown governance policy {governance_policy_str!r}") from exc
 
     _gh_token = _load_github_token()
     _governance_repo = resolve_governance_repo(governance_repo_cli)
@@ -3886,12 +3954,14 @@ def compile_registry(
     _gov_state_in = state_in_path or (_gov_state_out if _gov_state_out.exists() else None)
     _quarantine_path = _registry_root_for_gov / "governance" / "quarantine_decisions.json"
     _discord_url = os.environ.get("DISCORD_WEBHOOK_URL")
-    _use_governance = _governance_mode is not None and _governance_mode != GovernanceMode.OFF
-    _mode_is_unspecified = _governance_mode is None
 
     _governance_results: dict[str, Any] = {}
-    if _use_governance and _gh_token:
-        _blacklist = _load_poll_blacklist()
+    if _governance_mode == GovernanceMode.OFF:
+        logger.info("Governance mode=off; zero governance reads.")
+    elif _gh_token:
+        _blacklist = _load_poll_blacklist(
+            allow_partial=allow_partial_governance,
+        )
         _governance_results = run_governance_pipeline(
             [item for _, item in all_items],
             mode=_governance_mode,
@@ -3904,28 +3974,18 @@ def compile_registry(
             governance_state_out_path=_gov_state_out,
             quarantine_decisions_path=_quarantine_path,
             discord_webhook_url=_discord_url,
+            allow_partial=allow_partial_governance,
         )
         logger.info(
             "Governance pipeline complete: mode=%s, policy=%s, results=%d items",
-            _governance_mode.value if _governance_mode else "unspecified",
+            _governance_mode.value,
             _governance_policy.value,
             len([k for k in _governance_results if not k.startswith("_")]),
         )
-    elif _use_governance:
-        logger.info("GITHUB_TOKEN not set; governance pipeline skipped.")
-    elif _governance_mode == GovernanceMode.OFF:
-        logger.info("Governance mode=off; legacy Pass 1/2 also skipped. Zero governance reads.")
     else:
-        logger.info("Governance mode unspecified; running legacy Pass 1/2.")
-
-    # Legacy Pass 1/2: only run when mode is None/unspecified (preserving original behavior).
-    if _mode_is_unspecified and _gh_token:
-        _hydrate_github_social_metrics([item for _, item in all_items])
-        _blacklist = _load_poll_blacklist()
-        _apply_trust_velocity_pass(
-            [item for _, item in all_items],
-            token=_gh_token,
-            blacklist=_blacklist,
+        raise GovernanceError(
+            "governance mode requires GITHUB_TOKEN; use --governance-mode off "
+            "for a catalog without governance data"
         )
 
     # Enrich items with governance scores before insertion.
@@ -3960,6 +4020,11 @@ def compile_registry(
             else:
                 other_count += 1
     logger.info("Inserted %d mod(s), %d pack(s), %d other item(s)", mod_count, pack_count, other_count)
+    for path, data in game_items:
+        insert_game_catalog_item(conn, data, path)
+    logger.info("Inserted %d entr(ies) for other games", len(game_items))
+    insert_official_plugins(conn, official_plugins)
+    logger.info("Inserted %d official plugin(s)", len(official_plugins))
 
     # Per-version changelogs — must run after registry_items so FK is satisfied.
     try:
@@ -3983,10 +4048,7 @@ def compile_registry(
     logger.info("Inserted %d crash signature(s), rejected %d", sig_count, rejected[0])
 
     # Known conflicts (mod pairs that conflict).
-    try:
-        load_known_conflicts(conn)
-    except Exception as exc:
-        logger.warning("Failed to load known conflicts: %s", exc)
+    load_known_conflicts(conn, allow_partial=allow_partial_governance)
 
     # Manual mod dependencies (from manifest ``mod_dependencies`` field).
     try:
@@ -4017,13 +4079,7 @@ def compile_registry(
     audit_log_path = REGISTRY_DIR / "governance" / "audit_log.json"
     total_items = mod_count + pack_count + other_count
     total_crash_sigs = sig_count
-    if audit_log_path.exists():
-        with audit_log_path.open("r", encoding="utf-8") as fh:
-            audit_data = json.load(fh)
-    else:
-        audit_data = {"log_format_version": 1, "entries": []}
-    if "log_format_version" not in audit_data:
-        audit_data["log_format_version"] = 1
+    audit_data = _read_audit_log(audit_log_path)
     if no_governance_write or (_governance_mode is not None and _governance_mode != GovernanceMode.MONITOR):
         logger.info("Governance audit log writes disabled; leaving audit log unchanged.")
     else:
@@ -4044,15 +4100,16 @@ def compile_registry(
             oldest_2000 = audit_data["entries"][:2000]
             audit_data["entries"] = audit_data["entries"][-8000:]
             if archive_path.exists():
-                with archive_path.open("r", encoding="utf-8") as fh:
-                    archive_data = json.load(fh)
+                archive_data = _read_json_strict(archive_path, "audit log archive")
+                if not isinstance(archive_data, list):
+                    raise ValueError(f"audit log archive {archive_path} is not a list; refusing to rewrite it")
                 archive_data.extend(oldest_2000)
             else:
                 archive_data = oldest_2000
-            with archive_path.open("w", encoding="utf-8") as fh:
-                json.dump(archive_data, fh, indent=2)
-        with audit_log_path.open("w", encoding="utf-8") as fh:
-            json.dump(audit_data, fh, indent=2)
+            # The archive is written before the shortened log, so a crash between
+            # the two writes duplicates entries rather than losing them.
+            _write_json_atomic(archive_path, archive_data)
+        _write_json_atomic(audit_log_path, audit_data)
         logger.info("Wrote audit log to %s", audit_log_path)
 
     # Register audit log path in system_config.
@@ -4082,10 +4139,16 @@ def compile_registry(
         "details TEXT)"
     )
     audit_conn.execute("DELETE FROM audit_log")
+    # The registry table is the public record `agora registry audit-log` shows:
+    # the compiler's own entries plus every governance event (vote surges and
+    # their resolution), which live in the governance state file.
     rows = [
         (e["timestamp"], e["action"], e.get("details"))
         for e in audit_data.get("entries", [])
     ]
+    _gov_state_for_audit = _gov_state_out if _gov_state_out.exists() else _gov_state_in
+    rows.extend(_governance_event_audit_rows(_gov_state_for_audit))
+    rows.sort(key=lambda row: row[0])
     audit_conn.executemany(
         "INSERT INTO audit_log (timestamp, action, details) VALUES (?, ?, ?)",
         rows,
@@ -4148,6 +4211,20 @@ def compile_registry(
             logger.info("Wrote signature to %s", sig_path)
         except RuntimeError as exc:
             logger.error("Signing failed: %s", exc)
+            sys.exit(1)
+
+    # One signed file carries the database and its signature. The separate
+    # .sig stays for older clients and the web export.
+    bundle_path = output_path.with_suffix(".bundle")
+    try:
+        bundle_bytes = build_catalog_bundle(output_path, db_bytes, skip_sign=skip_sign)
+        bundle_path.write_bytes(bundle_bytes)
+        logger.info("Wrote signed catalog bundle to %s", bundle_path)
+        if skip_sign:
+            logger.warning("--skip-sign: %s carries a placeholder signature", bundle_path)
+    except (ValueError, RuntimeError, OSError) as exc:
+        logger.error("Could not write the signed catalog bundle: %s", exc)
+        if not skip_sign:
             sys.exit(1)
 
     # ------------------------------------------------------------------
@@ -4367,6 +4444,12 @@ def main() -> None:
         help="Root directory for registry manifests (default: registry/)",
     )
     parser.add_argument(
+        "--skip-official-asset-check",
+        action="store_true",
+        help="Do not download official plugin packages to check their URL, size and sha256 "
+             "(local development and tests only; the catalog release must not use it)",
+    )
+    parser.add_argument(
         "--governance-repo",
         type=str,
         default=None,
@@ -4384,15 +4467,22 @@ def main() -> None:
         type=str,
         choices=["off", "read-only", "monitor"],
         default=None,
-        help="Governance mode: off (no reads), read-only (reads + state, no mutations, no Discord), "
-             "monitor (reads + state + Discord, no mutations). "
-             "Default (unspecified) preserves legacy production behavior.",
+        help="Governance mode: off (no reads), read-only (reads, no state writes, no Discord), "
+             "monitor (reads + state + Discord, no GitHub mutations). Default: off.",
+    )
+    parser.add_argument(
+        "--allow-partial-governance",
+        action="store_true",
+        help="Maintainer override: log and skip unreadable governance inputs or "
+             "failed GitHub reads instead of stopping the compile. Also enabled "
+             "by AGORA_GOVERNANCE_ALLOW_PARTIAL=1. Never use for a release build.",
     )
     parser.add_argument(
         "--governance-state-in",
         type=str,
         default=None,
-        help="Path to input governance-state.json (optional; missing = fresh state)",
+        help="Path to input governance-state.json (omit for fresh state; a named "
+             "file that cannot be read stops the run)",
     )
     parser.add_argument(
         "--governance-state-out",
@@ -4422,6 +4512,8 @@ def main() -> None:
         registry_root=args.registry_root,
         state_in_path=Path(args.governance_state_in) if args.governance_state_in else None,
         state_out_path=Path(args.governance_state_out) if args.governance_state_out else None,
+        official_fetcher=None if args.skip_official_asset_check else _fetch_official_package,
+        allow_partial_governance=args.allow_partial_governance,
     )
 
 

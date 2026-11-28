@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
+import { setSwitch } from './support/switches';
 
 /**
  * Appearance is a section of the settings rail with three sub-pages: colour
@@ -109,7 +110,7 @@ test('font, scale, border color, and reduced motion persist', async ({ page }) =
   // to the accent, and a custom pick overrides both.
   await openAppearance(page, 'Theme');
   await page.getByLabel('Toggle custom colors').click();
-  await page.getByLabel('Use custom border color').check();
+  await setSwitch(page.getByLabel('Use custom border color'), true);
   await page.getByLabel('Border color', { exact: true }).fill('#506478');
 
   await expect(page.locator('html')).toHaveAttribute('data-font', 'readable');
@@ -184,9 +185,9 @@ test('background, text, density, scale, corners, and fonts apply broadly', async
 
   await openAppearance(page, 'Theme');
   await page.getByLabel('Toggle custom colors').click();
-  await page.getByLabel('Use custom background', { exact: true }).check();
+  await setSwitch(page.getByLabel('Use custom background', { exact: true }), true);
   await page.getByLabel('Background color').fill('#102030');
-  await page.getByLabel('Use custom text color').check();
+  await setSwitch(page.getByLabel('Use custom text color'), true);
   await page.getByLabel('Block text color').fill('#f0e0d0');
   await expect.poll(() => page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--background').trim())).toBe('210 50% 13%');
   await expect.poll(() => page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--foreground').trim())).toBe('30 52% 88%');
@@ -194,13 +195,13 @@ test('background, text, density, scale, corners, and fonts apply broadly', async
 
 test('block, navigation, and background text colors have independent opacity-aware tokens', async ({ page }) => {
   await page.getByLabel('Toggle custom colors').click();
-  await page.getByLabel('Use custom block color').check();
+  await setSwitch(page.getByLabel('Use custom block color'), true);
   await page.getByLabel('Block color', { exact: true }).fill('#345678');
   await page.getByLabel('Block opacity').fill('0.65');
-  await page.getByLabel('Use custom navigation color').check();
+  await setSwitch(page.getByLabel('Use custom navigation color'), true);
   await page.getByLabel('Navigation color', { exact: true }).fill('#221144');
   await page.getByLabel('Navigation opacity').fill('0.55');
-  await page.getByLabel('Use custom background text color').check();
+  await setSwitch(page.getByLabel('Use custom background text color'), true);
   await page.getByLabel('Background text color', { exact: true }).fill('#abcdef');
 
   await expect.poll(() => page.evaluate(() => document.documentElement.style.getPropertyValue('--card'))).toBe('210 40% 34%');

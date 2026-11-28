@@ -1,0 +1,37 @@
+SkyrimSE v1.6.640
+trainwreck v1.2.1
+
+Unhandled exception "EXCEPTION_ACCESS_VIOLATION" at 0x7FF800001000 ExampleGame.exe+001000
+
+SYSTEM SPECS:
+    OS: Microsoft Windows 10 Home 22H2 19045.3803
+    CPU: InventedVendor Invented CPU 8000
+    GPU #1: Invented Graphics 8000
+    GPU #2: Microsoft Basic Render Driver
+    RAM: 6.00 GiB/16.00 GiB
+    PAGE FILE: 16.00 GiB/32.00 GiB
+
+PROBABLE CALL STACK:
+    [0 ] 0x7FF800001000             ExampleGame.exe+001000
+        mov rcx,[rax+10h]
+    [1 ] 0x7FF800002000 ExamplePlugin.dll+00002000 ExampleHook
+        ret
+
+REGISTERS:
+    RAX 0x0                (size_t)
+    RCX 0x1B600000000      (ExampleItem*)
+
+STACK:
+    [RSP+0   ] 0x2                (size_t)
+
+MODULES:
+    ExampleGame.exe
+        Address: 0x7FF800000000
+        SHA: CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
+    ExamplePlugin.dll
+        Address: 0x7FF800002000
+        SHA: DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD
+        Version: v1.2.0
+
+SCRIPT EXTENDER PLUGINS:
+    ExamplePlugin.dll v1.2.0

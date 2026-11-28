@@ -185,10 +185,7 @@ fn tilde_matches(version: &str, reference: &str) -> bool {
     }
     let v_minor = v_segs.get(1).copied().unwrap_or("0");
     let r_minor = r_segs.get(1).copied().unwrap_or("0");
-    if compare_segments(v_minor, r_minor) != Ordering::Equal {
-        return false;
-    }
-    true
+    compare_segments(v_minor, r_minor) == Ordering::Equal
 }
 
 fn caret_matches(version: &str, reference: &str) -> bool {

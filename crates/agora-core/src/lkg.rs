@@ -3,6 +3,7 @@
 //! Pure logic — no filesystem or process dependencies.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 
@@ -108,16 +109,22 @@ pub fn promotes_to_lkg(outcome: &LaunchOutcome) -> bool {
     matches!(outcome, LaunchOutcome::Success)
 }
 
-/// Read an instance's LKG pointer. Missing files produce the default state;
-/// malformed state is surfaced so callers never overwrite recovery metadata
-/// they could not understand.
+/// Read an instance's LKG pointer. Only a genuinely absent pointer produces the
+/// default state; a read or parse failure is surfaced so callers never evict
+/// recovery data they could not understand.
 pub fn read_lkg_state(instance_dir: &Path) -> Result<LkgState, String> {
     let path = instance_dir.join("lkg.json");
-    if !path.is_file() {
-        return Ok(LkgState::default());
-    }
-    let text =
-        std::fs::read_to_string(&path).map_err(|e| format!("failed to read LKG state: {e}"))?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        // Only a pointer that is not there means nothing was ever promoted. A path
+        // that exists but cannot be read (permissions, something else sitting on
+        // the name) must never be read as an empty recovery pointer, or retention
+        // would treat the last-known-good snapshot as an ordinary expendable one.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LkgState::default())
+        }
+        Err(error) => return Err(format!("failed to read LKG state: {error}")),
+    };
     serde_json::from_str(&text).map_err(|e| format!("failed to parse LKG state: {e}"))
 }
 
@@ -470,25 +477,115 @@ pub fn retention_plan_with_sizes(
 // Retention (moved from desktop commands.rs — core-owned)
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Default)]
+pub struct RetentionRoundReport {
+    /// Snapshots kept because their physical size could not be measured.
+    pub unmeasured_snapshots: BTreeMap<String, String>,
+    pub collection: Option<crate::content_store::collect::CollectReport>,
+}
+
+impl RetentionRoundReport {
+    pub fn summary(&self) -> String {
+        let mut lines = Vec::new();
+        for (id, reason) in &self.unmeasured_snapshots {
+            lines.push(format!(
+                "kept snapshot {id} because its size could not be measured ({reason})"
+            ));
+        }
+        if let Some(collection) = &self.collection {
+            lines.push(collection.summary());
+        }
+        lines.join(". ")
+    }
+}
+
 /// Run snapshot retention for an instance directory using default policy.
 /// Lists snapshots, cross-references LKG state, evicts those exceeding the
 /// configured category counts and size cap.
 pub fn run_retention(instance_dir: &Path) -> Result<(), String> {
+    if let Some(report) = run_retention_with_report(instance_dir)?
+        .filter(|report| !report.unmeasured_snapshots.is_empty())
+    {
+        eprintln!(
+            "snapshot retention for {}: {}",
+            instance_dir.display(),
+            report.summary()
+        );
+    }
+    Ok(())
+}
+
+/// Report any unmeasurable snapshots and the result of the round's collection.
+pub fn run_retention_with_report(
+    instance_dir: &Path,
+) -> Result<Option<RetentionRoundReport>, String> {
+    run_retention_round(instance_dir, &RetentionPolicy::default(), None, None)
+}
+
+fn run_retention_round(
+    instance_dir: &Path,
+    policy: &RetentionPolicy,
+    grace: Option<std::time::Duration>,
+    pause: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+) -> Result<Option<RetentionRoundReport>, String> {
+    // Retention is automatic housekeeping. Hold the content-store lock and then the locations lock
+    // once for the whole round, in the collector's order, so an instance cannot move between live
+    // and Recently deleted while we decide what to delete, and so each delete does not try to take
+    // a non-reentrant lock again. A collision that outlasts the short wait means another operation
+    // is in flight: skip this round, delete nothing, keep going.
+    let paths = crate::snapshot::snapshot_store_paths(instance_dir);
+    let manager = crate::lock_manager::LockManager::new(paths.locks_root());
+    // Held for the whole round, from the first listing to the last delete: the batch each delete
+    // removes and the one collection after it are one decision, and an instance move or another
+    // collection cannot slip between them.
+    let _store = match manager.acquire_with_timeout(
+        crate::lock_manager::LockResource::ContentStore,
+        "snapshot-retention",
+        std::time::Duration::from_secs(30),
+        None,
+    ) {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!(
+                "skipping snapshot retention for {}: the content store is busy: {error}",
+                instance_dir.display()
+            );
+            return Ok(None);
+        }
+    };
+    let _locations =
+        match crate::snapshot::lock_snapshot_locations(instance_dir, "snapshot-retention", true) {
+            Ok(guard) => guard,
+            Err(error) => {
+                eprintln!(
+                    "skipping snapshot retention for {}: {error}",
+                    instance_dir.display()
+                );
+                return Ok(None);
+            }
+        };
+
     let snapshots = crate::snapshot::list_snapshots(instance_dir)
         .map_err(|e| format!("list_snapshots: {e}"))?;
     if snapshots.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let lkg = read_lkg_state(instance_dir)?;
+    let mut report = RetentionRoundReport::default();
     let entries: Vec<RetentionEntry> = snapshots
         .iter()
         .map(|snapshot| {
             let measured = crate::snapshot::snapshot_storage_size(instance_dir, &snapshot.id);
-            let archive_size = if measured == 0 {
-                snapshot.size_estimate
-            } else {
-                measured
+            let unmeasured = measured.is_err();
+            let archive_size = match measured {
+                Ok(size) => size,
+                Err(error) => {
+                    report
+                        .unmeasured_snapshots
+                        .insert(snapshot.id.clone(), error);
+                    0
+                }
             };
             RetentionEntry {
                 id: snapshot.id.clone(),
@@ -506,16 +603,20 @@ pub fn run_retention(instance_dir: &Path) -> Result<(), String> {
                         .is_some_and(|label| label.starts_with("pre-restore-")),
                 is_loadout_undo: !snapshot.is_preserved()
                     && snapshot.label.as_deref() == Some(crate::loadout::UNDO_SNAPSHOT_LABEL),
-                is_preserved: snapshot.is_preserved(),
-                is_protected: snapshot
-                    .label
-                    .as_deref()
-                    .is_some_and(|label| label.starts_with("crash-doctor-")),
+                // A damaged snapshot is never evicted automatically: its
+                // contents cannot be judged, and silently deleting it would
+                // remove the only copy of something a person may still want.
+                is_preserved: snapshot.is_preserved() || snapshot.is_unreadable(),
+                is_protected: unmeasured
+                    || snapshot
+                        .label
+                        .as_deref()
+                        .is_some_and(|label| label.starts_with("crash-doctor-")),
             }
         })
         .collect();
-    let policy = RetentionPolicy::default();
-    let to_evict = retention_plan_with_sizes(&entries, &policy);
+    // Unmeasured snapshots stay protected and contribute zero to the measured total.
+    let to_evict = retention_plan_with_sizes(&entries, policy);
     let kept_manual_size: u64 = entries
         .iter()
         .filter(|entry| entry.is_preserved && !to_evict.contains(&entry.id))
@@ -530,21 +631,42 @@ pub fn run_retention(instance_dir: &Path) -> Result<(), String> {
         );
     }
 
+    // The whole batch goes first, then one collection over what is left: a collection between two
+    // evictions could free an object a later eviction in the same round still names, and a round is
+    // one decision (MASTER_SPEC §32.8).
     let mut errors = Vec::new();
+    let mut removed = 0usize;
     for id in &to_evict {
-        if let Err(error) = crate::snapshot::delete_snapshot(instance_dir, id) {
-            errors.push(format!("{id}: {error}"));
+        match crate::snapshot::delete_snapshot_records(instance_dir, id) {
+            Ok(()) => removed += 1,
+            Err(error) => errors.push(format!("{id}: {error}")),
         }
     }
-
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
+    if !errors.is_empty() {
+        return Err(format!(
             "snapshot retention could not remove: {}",
             errors.join("; ")
-        ))
+        ));
     }
+    if removed > 0 {
+        report.collection = Some(
+            crate::content_store::collect::collect_at_instance(
+                instance_dir,
+                &crate::content_store::collect::CollectRequest {
+                    store: crate::content_store::collect::LockRequest::Held,
+                    locations: crate::content_store::collect::LockRequest::Held,
+                    grace,
+                    ignore_unreadable_snapshots: false,
+                    pause,
+                },
+            )
+            .unwrap_or_else(|error| crate::content_store::collect::CollectReport {
+                refusals: vec![error],
+                ..Default::default()
+            }),
+        );
+    }
+    Ok((report.collection.is_some() || !report.unmeasured_snapshots.is_empty()).then_some(report))
 }
 
 // ---------------------------------------------------------------------------
@@ -554,11 +676,43 @@ pub fn run_retention(instance_dir: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tempfile::TempDir;
+
+    const TRACKED: &[&str] = &["mods", "config", "saves", "instance_manifest.json"];
+
+    /// An instance directory in the real layout, `<temp>/instances/<id>`, kept alive by the
+    /// temp dir it lives in.
+    ///
+    /// A bare `TempDir` must not be passed where an instance directory is expected:
+    /// `snapshot_app_root` walks from the instance directory to its parent, so a bare temp
+    /// folder resolves the app root — and with it the `locks/instance-locations.lock` and the
+    /// shared content store — to the *system* temp folder, which every test worker
+    /// shares. Under load, one worker's retention round then blocks another's past its short
+    /// wait, and the round reads as skipped. Through `path()` the tests keep addressing the
+    /// same directory they always did.
+    struct TempInstance {
+        _temp: TempDir,
+        dir: PathBuf,
+    }
+
+    fn temp_instance() -> TempInstance {
+        let root = TempDir::new().unwrap();
+        let dir = root.path().join("instances").join("lkg-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        TempInstance { _temp: root, dir }
+    }
+
+    impl TempInstance {
+        /// The instance directory, in the layout `snapshot_app_root` expects.
+        fn path(&self) -> &Path {
+            &self.dir
+        }
+    }
 
     fn create_test_snapshot(instance_dir: &Path, label: &str) -> String {
         std::fs::write(instance_dir.join("instance_manifest.json"), b"{}\n").unwrap();
-        crate::snapshot::create_snapshot(instance_dir, Some(label))
+        crate::snapshot::create_snapshot(instance_dir, Some(label), TRACKED)
             .unwrap()
             .id
     }
@@ -658,7 +812,7 @@ mod tests {
 
     #[test]
     fn test_success_records_exact_snapshot_as_lkg() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_instance();
         let snapshot_id = create_test_snapshot(tmp.path(), "known-good");
         let state = record_launch_outcome(
             tmp.path(),
@@ -681,7 +835,7 @@ mod tests {
 
     #[test]
     fn test_failed_launch_does_not_replace_current_lkg() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_instance();
         let known_good = create_test_snapshot(tmp.path(), "known-good");
         record_launch_outcome(
             tmp.path(),
@@ -706,7 +860,7 @@ mod tests {
 
     #[test]
     fn test_cancelled_launch_preserves_current_lkg() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_instance();
         let known_good = create_test_snapshot(tmp.path(), "known-good");
         record_launch_outcome(
             tmp.path(),
@@ -731,13 +885,13 @@ mod tests {
 
     #[test]
     fn test_read_missing_lkg_state_returns_default() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_instance();
         assert_eq!(read_lkg_state(tmp.path()).unwrap(), LkgState::default());
     }
 
     #[test]
     fn test_success_without_snapshot_fails_closed() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_instance();
         let error = record_launch_outcome(tmp.path(), None, "launch-1", LaunchOutcome::Success)
             .unwrap_err();
         assert!(error.contains("snapshot id"));
@@ -746,7 +900,7 @@ mod tests {
 
     #[test]
     fn test_success_with_missing_snapshot_fails_closed() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_instance();
         let error = record_launch_outcome(
             tmp.path(),
             Some("missing"),
@@ -972,7 +1126,7 @@ mod tests {
 ",
         )
         .unwrap();
-        crate::snapshot::create_snapshot_with_origin(instance_dir, Some(label), origin)
+        crate::snapshot::create_snapshot_with_origin(instance_dir, Some(label), TRACKED, origin)
             .unwrap()
             .id
     }
@@ -987,7 +1141,7 @@ mod tests {
 
     #[test]
     fn manual_snapshot_survives_later_automatic_snapshots() {
-        let temp = TempDir::new().unwrap();
+        let temp = temp_instance();
         let dir = temp.path();
         let manual = create_test_snapshot_as(
             dir,
@@ -1006,7 +1160,7 @@ mod tests {
 
     #[test]
     fn migration_snapshot_survives_a_manual_snapshot() {
-        let temp = TempDir::new().unwrap();
+        let temp = temp_instance();
         let dir = temp.path();
         let migration = create_test_snapshot_as(
             dir,
@@ -1028,7 +1182,7 @@ mod tests {
 
     #[test]
     fn automatic_snapshots_keep_the_last_five() {
-        let temp = TempDir::new().unwrap();
+        let temp = temp_instance();
         let dir = temp.path();
         let mut created = Vec::new();
         for i in 0..8 {
@@ -1044,7 +1198,7 @@ mod tests {
 
     #[test]
     fn automatic_retention_with_zero_or_one_snapshot_deletes_nothing() {
-        let temp = TempDir::new().unwrap();
+        let temp = temp_instance();
         let dir = temp.path();
         run_retention(dir).unwrap();
         assert!(remaining_ids(dir).is_empty());
@@ -1054,8 +1208,43 @@ mod tests {
     }
 
     #[test]
+    fn a_recovery_pointer_that_cannot_be_read_stops_the_retention_round() {
+        let temp = temp_instance();
+        let dir = temp.path();
+        // The oldest snapshot is promoted to the recovery pointer; with an empty
+        // pointer it counts as an ordinary automatic one and is evicted past the
+        // keep-5 window, so the read failing is observable either way.
+        let promoted = create_test_snapshot(dir, "pre-launch-0");
+        record_launch_outcome(dir, Some(&promoted), "launch-1", LaunchOutcome::Success).unwrap();
+        for i in 1..7 {
+            create_test_snapshot(dir, &format!("pre-launch-{i}"));
+        }
+
+        // Simulate a failing read: something exists at the pointer's path, but
+        // it cannot be read as the state file.
+        std::fs::remove_file(dir.join("lkg.json")).unwrap();
+        std::fs::create_dir(dir.join("lkg.json")).unwrap();
+
+        let result = run_retention(dir);
+        assert!(
+            result.as_ref().is_err_and(|error| error.contains("failed to read LKG state")),
+            "a failed recovery-pointer read must skip the round with a reason, not evict a blank state: {result:?}"
+        );
+        let remaining = remaining_ids(dir);
+        assert_eq!(
+            remaining.len(),
+            7,
+            "a skipped round keeps everything, including the recovery pointer's snapshot"
+        );
+        assert!(
+            remaining.contains(&promoted),
+            "the last-known-good snapshot is kept"
+        );
+    }
+
+    #[test]
     fn fifteen_manual_snapshots_are_all_kept_by_retention() {
-        let temp = TempDir::new().unwrap();
+        let temp = temp_instance();
         let dir = temp.path();
         let manual: Vec<String> = (0..15)
             .map(|i| {
@@ -1076,7 +1265,7 @@ mod tests {
 
     #[test]
     fn manual_snapshots_never_count_toward_the_automatic_five() {
-        let temp = TempDir::new().unwrap();
+        let temp = temp_instance();
         let dir = temp.path();
         let manual = create_test_snapshot_as(dir, "mine", crate::snapshot::SnapshotOrigin::User);
         for i in 0..7 {
@@ -1090,7 +1279,7 @@ mod tests {
 
     #[test]
     fn loadout_undo_points_do_not_evict_install_restore_points() {
-        let temp = TempDir::new().unwrap();
+        let temp = temp_instance();
         let dir = temp.path();
         let installs: Vec<String> = (0..5)
             .map(|i| create_test_snapshot(dir, &format!("install-{i:016x}")))
@@ -1117,7 +1306,7 @@ mod tests {
 
     #[test]
     fn loadout_undo_keeps_only_the_newest_point_and_never_a_manual_one() {
-        let temp = TempDir::new().unwrap();
+        let temp = temp_instance();
         let dir = temp.path();
         let manual = create_test_snapshot_as(
             dir,
@@ -1228,6 +1417,7 @@ mod tests {
                 file_count: 0,
                 size_estimate: 0,
                 origin: None,
+                unreadable: None,
             }
             .is_preserved()
         };
@@ -1249,7 +1439,7 @@ mod tests {
 
     #[test]
     fn run_retention_preserves_live_crash_doctor_snapshot() {
-        let temp = TempDir::new().unwrap();
+        let temp = temp_instance();
         let instance_dir = temp.path();
         let protected = create_test_snapshot(instance_dir, "crash-doctor-active");
         let _ = create_test_snapshot(instance_dir, "regular-old");
@@ -1272,7 +1462,7 @@ mod tests {
         // Labels are free text in the UI, so a person can type a pre-restore-
         // prefix. Pre-restore bucketing is by label only, so the manual
         // snapshot competes for the single undo slot and is evicted.
-        let temp = TempDir::new().unwrap();
+        let temp = temp_instance();
         let dir = temp.path();
         let manual = create_test_snapshot_as(
             dir,
@@ -1326,5 +1516,190 @@ mod tests {
         };
         let entries = vec![manual, retention("undo", 1, false, false, true)];
         assert!(retention_plan_with_sizes(&entries, &RetentionPolicy::default()).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    /// An instance folder in the layout `snapshot_store_paths` expects, so the object store lands
+    /// beside `instances/` and not in a temp folder. The manifest is readable, because a round of
+    /// retention now runs a collection, and a collection that cannot read an owner manifest keeps
+    /// every object and says so.
+    fn temp_instance() -> (TempDir, std::path::PathBuf) {
+        let root = TempDir::new().unwrap();
+        let dir = root.path().join("instances").join("batch-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = serde_json::json!({
+            "manifest_version": 2,
+            "instance_id": "batch-test",
+            "name": "batch-test",
+            "minecraft_version": "1.20.1",
+            "loader": "fabric",
+            "loader_version": "0.15.11",
+            "mods": [],
+            "resourcepacks": [],
+            "shaders": [],
+            "datapacks": [],
+            "worlds": [],
+            "game_data": { "game_id": "minecraft" }
+        });
+        std::fs::write(
+            dir.join("instance_manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        (root, dir)
+    }
+
+    #[test]
+    fn retention_reports_and_keeps_a_malformed_manifest_even_with_a_readable_zip() {
+        use std::io::Write;
+
+        let (_root, dir) = temp_instance();
+        let snapshot = crate::snapshot::create_snapshot(&dir, Some("old"), &[]).unwrap();
+        let manifest = crate::snapshot::snapshot_manifest_path(&dir, &snapshot.id);
+        let zip = crate::snapshot::snapshot_zip_path(&dir, &snapshot.id);
+        let mut archive = zip::ZipWriter::new(std::fs::File::create(&zip).unwrap());
+        archive
+            .start_file("manifest.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        archive
+            .write_all(&std::fs::read(&manifest).unwrap())
+            .unwrap();
+        archive.finish().unwrap();
+        std::fs::write(&manifest, b"{ malformed").unwrap();
+        assert!(crate::snapshot::list_snapshots(&dir)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.id == snapshot.id && !entry.is_unreadable()));
+        let healthy = crate::snapshot::create_snapshot(&dir, Some("healthy"), &[]).unwrap();
+        assert!(crate::snapshot::snapshot_storage_size(&dir, &healthy.id).unwrap() > 1);
+        let policy = RetentionPolicy {
+            size_cap_bytes: 1,
+            ..RetentionPolicy::default()
+        };
+
+        let report = run_retention_round(&dir, &policy, None, None)
+            .unwrap()
+            .expect("unmeasured snapshots belong in the round report");
+        let summary = report.summary();
+        assert!(summary.contains(&snapshot.id), "{summary}");
+        assert!(manifest.is_file() && zip.is_file());
+        assert!(!crate::snapshot::snapshot_manifest_path(&dir, &healthy.id).exists());
+    }
+
+    #[test]
+    fn retention_reports_and_keeps_a_snapshot_with_an_uninspectable_object() {
+        let (_root, dir) = temp_instance();
+        let bytes = b"snapshot object";
+        std::fs::create_dir_all(dir.join("mods")).unwrap();
+        std::fs::write(dir.join("mods/old.jar"), bytes).unwrap();
+        let snapshot = crate::snapshot::create_snapshot(&dir, Some("old"), &["mods"]).unwrap();
+        let paths = crate::snapshot::snapshot_store_paths(&dir);
+        let hash = crate::snapshot::snapshot_file_index(&dir, &snapshot.id).unwrap()[0]
+            .sha256
+            .clone();
+        let object = paths.content_object_path(&hash);
+        crate::content_store::protect::unprotect(&object).unwrap();
+        std::fs::remove_file(&object).unwrap();
+        std::fs::create_dir(&object).unwrap();
+
+        let report = run_retention_with_report(&dir)
+            .unwrap()
+            .expect("unmeasured snapshots belong in the round report");
+        let summary = report.summary();
+        assert!(summary.contains(&snapshot.id), "{summary}");
+        assert!(summary.contains(&hash), "{summary}");
+        assert!(crate::snapshot::snapshot_manifest_path(&dir, &snapshot.id).is_file());
+    }
+
+    /// A round of retention is one decision: it removes its whole batch, then collects once. A
+    /// collection between two evictions could free an object a later eviction in the same round
+    /// still names (MASTER_SPEC §32.8).
+    #[test]
+    fn a_round_of_retention_evicts_its_batch_and_then_collects_once() {
+        let (_root, dir) = temp_instance();
+        for index in 0..8 {
+            std::fs::create_dir_all(dir.join("mods")).unwrap();
+            std::fs::write(
+                dir.join("mods").join(format!("m{index}.jar")),
+                [index as u8; 32],
+            )
+            .unwrap();
+            crate::snapshot::create_snapshot(&dir, Some(&format!("auto-{index}")), &["mods"])
+                .unwrap();
+        }
+        let before = crate::snapshot::list_snapshots(&dir).unwrap().len();
+
+        let collections = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&collections);
+        run_retention_round(
+            &dir,
+            &RetentionPolicy::default(),
+            Some(std::time::Duration::ZERO),
+            Some(Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            })),
+        )
+        .unwrap();
+
+        let after = crate::snapshot::list_snapshots(&dir).unwrap().len();
+        assert!(
+            after < before,
+            "the round evicted something, so the count below means something ({before} -> {after})"
+        );
+        assert_eq!(
+            collections.load(Ordering::SeqCst),
+            1,
+            "a round of retention runs one collection for its whole batch"
+        );
+    }
+
+    /// Retention is automatic, so its report is not for a person to read: the round hands it back
+    /// to the caller that runs it, and a round that evicted nothing never collected (MASTER_SPEC
+    /// §32.8).
+    #[test]
+    fn a_round_of_retention_reports_what_its_one_collection_reclaimed() {
+        let (_root, dir) = temp_instance();
+        assert!(
+            run_retention_with_report(&dir).unwrap().is_none(),
+            "a round with no snapshots evicts nothing, so it has no collection to report"
+        );
+
+        // One file per snapshot, gone from the instance again once its snapshot is taken: each
+        // evicted snapshot is then the only record that names its own object, so the round has
+        // something to free.
+        std::fs::create_dir_all(dir.join("mods")).unwrap();
+        for index in 0..8 {
+            let file = dir.join("mods").join(format!("m{index}.jar"));
+            std::fs::write(&file, [index as u8; 32]).unwrap();
+            crate::snapshot::create_snapshot(&dir, Some(&format!("auto-{index}")), &["mods"])
+                .unwrap();
+            std::fs::remove_file(&file).unwrap();
+        }
+
+        let report = run_retention_round(
+            &dir,
+            &RetentionPolicy::default(),
+            Some(std::time::Duration::ZERO),
+            None,
+        )
+        .unwrap()
+        .expect("the round evicted snapshots, so it collected and has a report");
+        let outcome = report.collection.unwrap().outcome();
+        assert!(!outcome.refused, "{outcome:?}");
+        assert!(
+            outcome.reclaimed > 0,
+            "the objects only the evicted snapshots named are freed, and the round says how many: {outcome:?}"
+        );
+        assert!(
+            outcome.summary.starts_with("reclaimed "),
+            "the support log gets one line about what the round did: {outcome:?}"
+        );
     }
 }

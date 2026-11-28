@@ -112,6 +112,22 @@ pub fn registry_sig_path(app_data_dir: &Path) -> anyhow::Result<PathBuf> {
     Ok(AppPaths::from_root(app_data_dir.to_path_buf()).registry_signature())
 }
 
+pub fn registry_bundle_path(app_data_dir: &Path) -> anyhow::Result<PathBuf> {
+    Ok(AppPaths::from_root(app_data_dir.to_path_buf()).registry_bundle())
+}
+
+pub fn registry_bundle_previous_path(app_data_dir: &Path) -> anyhow::Result<PathBuf> {
+    Ok(AppPaths::from_root(app_data_dir.to_path_buf()).registry_bundle_previous())
+}
+
+pub fn registry_bundle_staged_path(app_data_dir: &Path) -> anyhow::Result<PathBuf> {
+    Ok(AppPaths::from_root(app_data_dir.to_path_buf()).registry_bundle_staged())
+}
+
+pub fn registry_trust_state_path(app_data_dir: &Path) -> anyhow::Result<PathBuf> {
+    Ok(AppPaths::from_root(app_data_dir.to_path_buf()).registry_trust_state())
+}
+
 /// Path to the mutable local state database.
 pub fn local_state_db_path(app_data_dir: &Path) -> anyhow::Result<PathBuf> {
     Ok(AppPaths::from_root(app_data_dir.to_path_buf()).local_state_db())

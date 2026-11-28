@@ -44,13 +44,17 @@ static GITHUB_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
             .get(crate::http_client::ClientCategory::GitHub)
             .clone(),
         Err(_) => {
-            // Fallback: minimal client if TLS init fails unexpectedly.
-            reqwest::Client::builder()
-                .user_agent("AgoraLauncher/1.0")
-                .timeout(Duration::from_secs(30))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .expect("failed to build GitHub HTTP client")
+            // Fallback: minimal client if TLS init fails unexpectedly. It
+            // still honours the proxy setting, so a fallback cannot bypass it.
+            crate::http_client::apply_proxy(
+                reqwest::Client::builder()
+                    .user_agent("AgoraModManager/1.0")
+                    .timeout(Duration::from_secs(30))
+                    .redirect(reqwest::redirect::Policy::none()),
+            )
+            .expect("failed to prepare the fallback GitHub HTTP client")
+            .build()
+            .expect("failed to build GitHub HTTP client")
         }
     }
 });

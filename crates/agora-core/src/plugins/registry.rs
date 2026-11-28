@@ -36,6 +36,10 @@ pub enum PluginStatus {
     DependencyCycle { cycle: Vec<String> },
     /// Activation failed the last time it was tried.
     Failed { message: String },
+    /// An official plugin, or a plugin using an official plugin's id, that does
+    /// not verify against the signed registry. It does not run and none of its
+    /// contributions load, whatever the plugin switch says.
+    Blocked { reason: String },
 }
 
 impl PluginStatus {
@@ -60,6 +64,9 @@ impl PluginStatus {
                 format!("Dependency cycle: {}", cycle.join(" \u{2192} "))
             }
             PluginStatus::Failed { message } => format!("Failed to start: {message}"),
+            PluginStatus::Blocked { reason } => {
+                format!("Blocked: {reason}. Update, roll back or reinstall the official plugin.")
+            }
         }
     }
 }
@@ -119,6 +126,18 @@ impl Resolution {
 /// `records` may include tombstones from an uninstall that kept data; they are
 /// dropped here rather than by every caller.
 pub fn resolve(records: Vec<PluginRecord>, host_api: &semver::Version) -> Resolution {
+    resolve_with_blocks(records, host_api, &BTreeMap::new())
+}
+
+/// [`resolve`], with plugins the caller has verified must not run.
+///
+/// `blocked` maps a plugin id to the reason. Still a pure function: the caller
+/// did the verifying, this only records the outcome.
+pub fn resolve_with_blocks(
+    records: Vec<PluginRecord>,
+    host_api: &semver::Version,
+    blocked: &BTreeMap<String, String>,
+) -> Resolution {
     let mut records: Vec<PluginRecord> = records
         .into_iter()
         .filter(|record| !store::is_tombstone(record))
@@ -141,7 +160,12 @@ pub fn resolve(records: Vec<PluginRecord>, host_api: &semver::Version) -> Resolu
     //    checked any further: the user turning something off should not
     //    produce a wall of complaints about it.
     for record in &records {
-        let status = if !record.enabled {
+        let status = if let Some(reason) = blocked.get(record.id().as_str()) {
+            // Ahead of "turned off": the reason is the useful thing to show.
+            PluginStatus::Blocked {
+                reason: reason.clone(),
+            }
+        } else if !record.enabled {
             PluginStatus::Disabled
         } else if let Some(message) = &record.last_error {
             PluginStatus::Failed {

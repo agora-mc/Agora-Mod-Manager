@@ -1,0 +1,84 @@
+{
+  "contract": 1,
+  "games": ["minecraft"],
+  "sources": [
+    {
+      "id": "crash_report",
+      "where": { "root": "instance", "path": "crash-reports" },
+      "match": { "glob": "crash-*.txt" },
+      "format": "jvm_log",
+      "bind": [{ "time": { "before_s": 5, "after_s": 30 } }],
+      "role": "primary"
+    },
+    {
+      "id": "latest_log",
+      "where": { "root": "instance", "path": "logs" },
+      "match": { "glob": "latest.log" },
+      "format": "jvm_log",
+      "copy": "head_tail"
+    }
+  ],
+  "parsers": [
+    {
+      "id": "jvm_log",
+      "entry": { "script": { "export": "parseJvmLog" } },
+      "detect": { "any": ["(?m)^---- .* Crash Report ----$", "(?m)^\\[\\d\\d:\\d\\d:\\d\\d\\] \\["] }
+    }
+  ],
+  "ref_maps": [
+    { "kind": "mod_id", "lookup": { "index": "mod_id" }, "match": "exact" },
+    { "kind": "class", "lookup": { "index": "java_package" }, "match": "prefix_dot" }
+  ],
+  "roles": [
+    { "kind": "class", "value": "java", "match": "prefix_dot", "role": "system" },
+    { "kind": "class", "value": "net.minecraft", "match": "prefix_dot", "role": "platform" },
+    { "kind": "class", "value": "org.spongepowered", "match": "prefix_dot", "role": "framework" }
+  ],
+  "rules": [
+    {
+      "id": "mixin_failed_and_named_its_mod",
+      "version": 1,
+      "scope": { "producer": { "format": "jvm_log" } },
+      "when": {
+        "fact": {
+          "kind": "minecraft.mixin_failure",
+          "where": { "severity": "critical" },
+          "ref": { "kind": "mod_id", "bind": "failing" },
+          "bind": { "target": "target" }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "root_cause",
+            "level": "very_likely",
+            "candidate": { "owner_of": "failing" },
+            "family": "decisive_verdict",
+            "weight": 16
+          }
+        }
+      ],
+      "text": {
+        "headline": { "en": "{owner:failing} failed to attach to {target}. It may be built for another game version." },
+        "why_not_sure": { "en": "The loader names the mod, but a clash with another mod can make an innocent mod's patch fail." }
+      },
+      "repairs": [{ "disable_content": { "key": { "owner_of": "failing" } } }],
+      "next_step": "confirm_experiment"
+    },
+    {
+      "id": "signature_from_an_old_text_pattern",
+      "version": 1,
+      "when": {
+        "text": {
+          "section": "exception",
+          "regex": "(?i)could not initiali[sz]e class (?P<cls>[\\w.$]+)",
+          "refs": { "cls": "class" }
+        }
+      },
+      "effects": [
+        { "signal": { "family": "known_signature", "candidate": { "owner_of": "cls" }, "weight": 6 } }
+      ],
+      "text": { "headline": { "en": "A class failed to start up, which is possible evidence against {owner:cls}." } }
+    }
+  ]
+}

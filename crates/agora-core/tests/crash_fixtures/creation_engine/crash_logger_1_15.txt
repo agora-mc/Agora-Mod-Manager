@@ -1,0 +1,45 @@
+Skyrim SSE v1.6.640
+CrashLoggerSSE v1-15-0-0 Jan  1 2025 00:00:00
+
+Unhandled exception "EXCEPTION_ACCESS_VIOLATION" at 0x7FF600001000 ExampleGame.dll+001000	mov rax, [rcx]
+Exception Flags: 0x00000000
+Number of Parameters: 2
+Access Violation: Tried to write memory at 0x000000000000
+
+SYSTEM SPECS:
+	OS: Microsoft Windows 11 Home v10.0.26100
+	CPU: InventedVendor Invented CPU 9100
+	CPU Cores: 8 logical, 4 physical, 1 packages
+	GPU #1: Invented Graphics 9100
+	GPU #2: Microsoft Basic Render Driver
+	PHYSICAL MEMORY: 8.00 GB/16.00 GB
+	GPU MEMORY: 2.00/8.00 GB
+
+PROBABLE CALL STACK:
+	[ 0] 0x7FF600001000                   ExampleGame.dll+001000 -> 22222+0x10	mov rax, [rcx]
+	[ 1] 0x7FF600002000                   ExampleGame.dll+002000 -> 22223+0x20	test al, al
+	[ 2] 0x7FF600003000                   ExamplePlugin.dll+003000
+
+REGISTERS:
+	RAX 0x0                (size_t) [0]
+	RDX 0x1F000000000      (ExampleForm*)
+		File: "ExampleBase.esm"
+		FormID: 0x00012345
+
+STACK:
+	[RSP+0   ] 0x0                (size_t)
+	[RSP+8   ] 0x1F000000100      (ExampleTriShape*)
+		RTTIName: "ExampleTriShape"
+
+MODULES:
+	ExampleGame.dll                    0x7FF600000000
+	ExamplePlugin.dll                  0x7FF600004000
+
+SKSE PLUGINS:
+	ExamplePlugin.dll v1.5
+
+PLUGINS:
+	Light: 1	Regular: 2	Total: 3
+	[ 0]     ExampleBase.esm
+	[ 1]     ExamplePatch.esp
+	[FE:  0] ExampleLight.esl

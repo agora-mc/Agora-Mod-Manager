@@ -1,0 +1,37 @@
+CRASH TIME: 2026-01-02 12:00:00
+Skyrim SSE v1.6.1170
+CrashLoggerSSE v1-16-0-0 Jan  1 2026 00:00:00
+
+Unhandled exception "EXCEPTION_ACCESS_VIOLATION" at 0x7FF700001000 ExampleGame.exe+001000	mov rax, [rcx]
+Exception Flags: 0x00000000 (Continuable)
+Number of Parameters: 2
+Exception Thread ID: 4242
+Access Violation: Tried to read memory at 0x000000000010
+
+PROCESS INFO:
+	Process ID: 9004
+	Crash Thread ID: 4242
+	Process Uptime: 00:01:50 (110886ms)
+	Working Directory: C:\Games\Invented Game
+	Command Line: "C:\Games\Invented Game\ExampleGame.exe"
+
+SYSTEM SPECS:
+	OS: Microsoft Windows 11 Pro v10.0.26200
+	CPU: InventedVendor Invented CPU 9200
+	GPU #1: Invented Graphics 9200
+	PHYSICAL MEMORY: 9.00 GB/16.00 GB
+
+PROBABLE CALL STACK:
+	[ 0] 0x7FF700001000 ExampleGame.exe+001000 -> 33333+0x3A	mov rax, [rcx]
+
+REGISTERS:
+	RAX 0x0                (size_t) [0]
+
+STACK:
+	[RSP+0   ] 0x0                (size_t)
+
+MODULES:
+	ExampleGame.exe                                    0x7FF700000000
+
+SKSE PLUGINS:
+	ExamplePlugin.dll v1.6.1

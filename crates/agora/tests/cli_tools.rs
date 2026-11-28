@@ -150,6 +150,7 @@ fn create_instance(data_dir: &Path, id: &str, mods: &[ModFixture]) {
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     agora_core::db::upsert_instance(
         &conn,
+        "minecraft",
         &agora_core::models::InstanceRow {
             instance_id: id.to_string(),
             name: id.to_string(),

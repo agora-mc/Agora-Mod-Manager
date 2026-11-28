@@ -9,15 +9,15 @@ use std::io::{IsTerminal, Write};
 
 use agora_core::ctx::Ctx;
 use agora_core::dependency_ops::Requirement;
-use agora_core::dependency_service::DependencyService;
 use agora_core::error::LauncherError;
-use agora_core::gc::GcSelection;
-use agora_core::health::{HealthReport, HealthScore};
-use agora_core::instance_service::{CaptureTemplateRequest, InstanceService};
-use agora_core::loader_service::LoaderService;
 use agora_core::models::InstanceRow;
 use agora_core::snapshot_service::SnapshotService;
-use agora_core::template_service::TemplateJvm;
+use agora_game_minecraft::dependency_service::DependencyService;
+use agora_game_minecraft::gc::GcSelection;
+use agora_game_minecraft::health::{HealthReport, HealthScore};
+use agora_game_minecraft::instance_service::{CaptureTemplateRequest, InstanceService};
+use agora_game_minecraft::loader_service::LoaderService;
+use agora_game_minecraft::template_service::TemplateJvm;
 use clap::Subcommand;
 
 use crate::{print_table, OutputFormat};
@@ -605,11 +605,12 @@ pub async fn run_instance_tools(
                     }
                 );
                 if let Some(requested) = memory {
-                    if requested != row.jvm_memory_mb {
-                        eprintln!(
-                            "[WARN] Memory was set to {} MB. Agora keeps heap sizes between 2048 and 32768 MB.",
-                            row.jvm_memory_mb
-                        );
+                    let total_ram_mb =
+                        agora_game_minecraft::gc::SystemResources::detect().total_ram_mb;
+                    for warning in
+                        agora_game_minecraft::gc::memory_warnings(requested, total_ram_mb)
+                    {
+                        eprintln!("[WARN] {warning}");
                     }
                 }
             }
@@ -658,14 +659,14 @@ pub async fn run_instance_tools(
             env,
             clear,
         } => {
-            let current = |service: &InstanceService| -> anyhow::Result<agora_core::launch_service::LaunchHooks> {
+            let current = |service: &InstanceService| -> anyhow::Result<agora_game_minecraft::launch_service::LaunchHooks> {
                 let detail = service
                     .get(&instance)?
                     .ok_or_else(|| anyhow::anyhow!("Instance '{instance}' not found"))?;
                 Ok(detail
                     .manifest
                     .as_ref()
-                    .map(agora_core::launch_service::LaunchHooks::from_manifest)
+                    .map(agora_game_minecraft::launch_service::LaunchHooks::from_manifest)
                     .unwrap_or_default())
             };
             if clear {
@@ -788,7 +789,7 @@ pub async fn run_instance_tools(
                 .and_then(|manifest| {
                     manifest
                         .user_preferences
-                        .get(agora_core::instance_service::NOTES_KEY)
+                        .get(agora_game_minecraft::instance_service::NOTES_KEY)
                 })
                 .and_then(|value| value.as_str())
                 .map(str::to_string);
@@ -841,8 +842,8 @@ pub async fn run_instance_tools(
             let current = detail.manifest.as_ref().and_then(|manifest| {
                 manifest
                     .user_preferences
-                    .get(agora_core::launch_service::WINDOW_SIZE_KEY)
-                    .and_then(agora_core::launch_service::parse_window_size)
+                    .get(agora_game_minecraft::launch_service::WINDOW_SIZE_KEY)
+                    .and_then(agora_game_minecraft::launch_service::parse_window_size)
             });
             if json {
                 println!(
@@ -911,6 +912,8 @@ pub enum TemplateCmd {
         #[arg(long, help = "Delete without asking")]
         yes: bool,
     },
+    /// Change a template's name, description, or JVM settings.
+    Update(crate::cli_misc_parity::TemplateUpdateArgs),
     /// Copy a template's files and JVM settings onto an existing instance.
     /// Agora takes an undo snapshot first.
     Apply {
@@ -938,7 +941,7 @@ pub fn run_template_command(
     match action {
         TemplateCmd::List => {
             let templates =
-                agora_core::template_service::list_templates(&ctx.paths.templates_root())
+                agora_game_minecraft::template_service::list_templates(&ctx.paths.templates_root())
                     .map_err(template_error)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&templates)?);
@@ -1042,6 +1045,9 @@ pub fn run_template_command(
             } else {
                 println!("Deleted template '{template}'.");
             }
+        }
+        TemplateCmd::Update(args) => {
+            crate::cli_misc_parity::run_template_update(ctx, args, output_fmt)?
         }
         TemplateCmd::Apply { template, instance } => {
             let outcome = InstanceService::new(ctx.clone()).apply_template(

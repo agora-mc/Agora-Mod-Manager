@@ -9,13 +9,15 @@ import {
  * Resolve a Technic pack by slug and install it via the tier-appropriate path.
  *
  * Extracted from the old standalone Technic panel so the unified Browse list can
- * install a Technic card without duplicating the tier logic. Core re-checks
- * consent on both entry points, so the `allowUnverifiedPacks` guard here is a
- * fast, friendly failure rather than the actual gate.
+ * install a Technic card without duplicating the tier logic. A zip pack has no
+ * integrity information: core refuses it with `ERR_LOW_SECURITY_DISABLED`
+ * unless `allowUnverified` (the user's answer for this install) or the *Allow
+ * low security downloads* setting says yes. Callers wrap this in
+ * `withUnverifiedConsent`.
  */
 export async function installTechnicPack(
   slug: string,
-  allowUnverifiedPacks: boolean,
+  allowUnverified: boolean,
   /** Resolves the new instance's name once the pack's title is known; `null` cancels. */
   chooseName?: (title: string) => Promise<string | undefined | null>,
 ): Promise<ImportResult | null> {
@@ -32,9 +34,6 @@ export async function installTechnicPack(
     return installTechnicSolderPack(detail.slug, solder, build, instanceName);
   }
 
-  if (!allowUnverifiedPacks) {
-    throw new Error('Enable "Allow low security downloads" in Settings to install zip packs.');
-  }
   const downloadUrl = detail.download_url;
   if (!downloadUrl) {
     throw new Error('This zip pack does not report a download URL.');
@@ -47,5 +46,6 @@ export async function installTechnicPack(
     '',
     '',
     instanceName,
+    allowUnverified,
   );
 }

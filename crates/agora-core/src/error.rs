@@ -1,3 +1,60 @@
+use crate::artifact_hash::HashOrigin;
+use crate::error_code::ErrorCode;
+
+/// A download whose bytes differ from an expectation the user has to confirm:
+/// the curator's pin for that release file, the hash recorded when it was
+/// installed before, or the hash a modpack lists for it. See [`crate::artifact_hash`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HashConfirmation {
+    /// The file that did not match, as the instance would name it.
+    pub file: String,
+    /// The release tag it was published under, when it came from a release.
+    pub release: Option<String>,
+    /// The SHA-256 the expectation named.
+    pub expected: String,
+    /// The SHA-256 of the bytes that were downloaded.
+    pub actual: String,
+    /// Where the expectation came from.
+    pub expected_from: HashOrigin,
+    /// Further expectations the bytes also failed (a pack hash and a curator pin
+    /// can both be unmet). "Install anyway" overrides all of them, so all are shown.
+    #[serde(default)]
+    pub also_unmet: Box<[crate::artifact_hash::ConfirmableHash]>,
+}
+
+impl std::fmt::Display for HashConfirmation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let file = match &self.release {
+            Some(release) => format!("{} from release {release}", self.file),
+            None => self.file.clone(),
+        };
+        let origin = match self.expected_from {
+            HashOrigin::CuratorPin => "pinned curator",
+            HashOrigin::PreviousInstall => "previously installed",
+            HashOrigin::PackPin => "modpack",
+        };
+        write!(
+            f,
+            "{file} does not match the {origin} hash: expected {}, downloaded {}.",
+            self.expected, self.actual
+        )?;
+        for other in &self.also_unmet {
+            let origin = match other.origin {
+                HashOrigin::CuratorPin => "pinned curator",
+                HashOrigin::PreviousInstall => "previously installed",
+                HashOrigin::PackPin => "modpack",
+            };
+            write!(
+                f,
+                " It also differs from the {origin} hash {}.",
+                other.sha256
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// Standardized launcher error codes matching the human-centric taxonomy.
 #[derive(Debug, Clone)]
 pub enum LauncherError {
@@ -21,6 +78,10 @@ pub enum LauncherError {
     OverrideSecurityViolation,
     /// ERR_HASH_MISMATCH — Downloaded file does not match its expected hash.
     HashMismatch,
+    /// ERR_HASH_CONFIRMATION_REQUIRED — The download does not match a curator
+    /// pin or a hash recorded on an earlier install. Install only after the
+    /// user confirms, which retries with the install-anyway override.
+    HashConfirmationRequired(Box<HashConfirmation>),
     /// ERR_UNTRUSTED_SOURCE — Download rejected: URL is not from an allowed source.
     UntrustedSource,
     /// ERR_DISKFULL — Not enough disk space to complete this operation.
@@ -65,14 +126,14 @@ pub enum LauncherError {
     LoaderProfileNotFound,
     /// ERR_PROFILE_MISSING — The loader profile JSON is missing from the
     /// Mojang launcher's version directory.
-    ProfileMissing(crate::installed_profile::ProfileIssue),
+    ProfileMissing(ProfileIssue),
     /// ERR_PROFILE_UNSUPPORTED_METADATA — The installed profile is structurally
     /// valid but contains metadata or artifacts that this launcher version
     /// does not support (unknown rules, unverifiable generated libraries, etc.).
-    ProfileUnsupportedMetadata(crate::installed_profile::ProfileIssue),
+    ProfileUnsupportedMetadata(ProfileIssue),
     /// ERR_PROFILE_CORRUPT — The installed profile is malformed, corrupted,
     /// or fails security validation.
-    ProfileCorrupt(crate::installed_profile::ProfileIssue),
+    ProfileCorrupt(ProfileIssue),
     /// ERR_JAVA_INCOMPATIBLE — The selected Java runtime is older than the
     /// major version required by this Minecraft version's metadata.
     JavaIncompatible,
@@ -152,74 +213,94 @@ impl LauncherError {
         }
     }
 
+    /// The machine-readable code this error reports: the string the registry
+    /// ([`crate::error_code`]) declares for it, so a code cannot be written in
+    /// two places and drift.
     pub fn code(&self) -> String {
-        match self {
-            LauncherError::NetworkOffline | LauncherError::NetworkUnavailable { .. } => {
-                "ERR_NETWORK_OFFLINE".to_string()
-            }
-            LauncherError::RegistryDownloadFailed => "ERR_REGISTRY_DOWNLOAD_FAILED".to_string(),
-            LauncherError::RegistrySignatureInvalid => "ERR_REGISTRY_SIGNATURE_INVALID".to_string(),
-            LauncherError::SchemaTooNew => "ERR_SCHEMA_TOO_NEW".to_string(),
-            LauncherError::ZipBomb => "ERR_ZIP_BOMB".to_string(),
-            LauncherError::OverrideSecurityViolation => {
-                "ERR_OVERRIDE_SECURITY_VIOLATION".to_string()
-            }
-            LauncherError::HashMismatch => "ERR_HASH_MISMATCH".to_string(),
-            LauncherError::UntrustedSource => "ERR_UNTRUSTED_SOURCE".to_string(),
-            LauncherError::DiskFull => "ERR_DISKFULL".to_string(),
-            LauncherError::AuthExpired => "ERR_AUTH_EXPIRED".to_string(),
-            LauncherError::AuthRequired => "ERR_AUTH_REQUIRED".to_string(),
-            LauncherError::MsaAuthRequired => "ERR_MSA_AUTH_REQUIRED".to_string(),
-            LauncherError::ModrinthDisabled => "ERR_MODRINTH_DISABLED".to_string(),
-            LauncherError::InstanceLocked => "ERR_INSTANCE_LOCKED".to_string(),
-            LauncherError::SandboxUnavailable => "ERR_SANDBOX_UNAVAILABLE".to_string(),
-            LauncherError::MojangNotFound => "ERR_MOJANG_NOT_FOUND".to_string(),
-            LauncherError::LaunchFailed => "ERR_LAUNCH_FAILED".to_string(),
-            LauncherError::GameCrash => "ERR_GAME_CRASH".to_string(),
-            LauncherError::LocalStateFailed => "ERR_LOCAL_STATE_FAILED".to_string(),
-            LauncherError::InstanceCreateFailed => "ERR_INSTANCE_CREATE_FAILED".to_string(),
-            LauncherError::ProfileWriteFailed => "ERR_PROFILE_WRITE_FAILED".to_string(),
-            LauncherError::RegistryMissing => "ERR_REGISTRY_MISSING".to_string(),
-            LauncherError::UnsupportedLoader => "ERR_UNSUPPORTED_LOADER".to_string(),
-
-            LauncherError::VersionNotFound => "ERR_VERSION_NOT_FOUND".to_string(),
-            LauncherError::GameVersionNotFound => "ERR_GAME_VERSION_NOT_FOUND".to_string(),
-            LauncherError::LoaderProfileNotFound => "ERR_LOADER_PROFILE_NOT_FOUND".to_string(),
-            LauncherError::ProfileMissing(..) => "ERR_PROFILE_MISSING".to_string(),
-            LauncherError::ProfileUnsupportedMetadata(..) => {
-                "ERR_PROFILE_UNSUPPORTED_METADATA".to_string()
-            }
-            LauncherError::ProfileCorrupt(..) => "ERR_PROFILE_CORRUPT".to_string(),
-            LauncherError::JavaIncompatible => "ERR_JAVA_INCOMPATIBLE".to_string(),
-            LauncherError::JavaRuntimeMissing { .. } => "ERR_JAVA_RUNTIME_MISSING".to_string(),
-            LauncherError::JavaRuntimeCatalogMissing { .. } => {
-                "ERR_JAVA_RUNTIME_CATALOG_MISSING".to_string()
-            }
-            LauncherError::UnresolvedPlaceholder => "ERR_UNRESOLVED_PLACEHOLDER".to_string(),
-            LauncherError::DependencyMissing => "ERR_DEPENDENCY_MISSING".to_string(),
-            LauncherError::McpTooManyRequests => "ERR_MCP_TOO_MANY_REQUESTS".to_string(),
-            LauncherError::McpDenied => "ERR_MCP_DENIED".to_string(),
-            LauncherError::McpUnauthorized => "ERR_MCP_UNAUTHORIZED".to_string(),
-            LauncherError::NetworkMojangMetadataDisabled => {
-                "ERR_NETWORK_MOJANG_METADATA_DISABLED".to_string()
-            }
-            LauncherError::NetworkMojangContentDisabled => {
-                "ERR_NETWORK_MOJANG_CONTENT_DISABLED".to_string()
-            }
-            LauncherError::NetworkLoaderDisabled => "ERR_NETWORK_LOADER_DISABLED".to_string(),
-            LauncherError::NetworkMsaDisabled => "ERR_NETWORK_MSA_DISABLED".to_string(),
-            LauncherError::NetworkJavaDisabled => "ERR_NETWORK_JAVA_DISABLED".to_string(),
-            LauncherError::MavenDescriptor => "ERR_MAVEN_DESCRIPTOR".to_string(),
-            LauncherError::MigrationConflict { .. } => "ERR_MIGRATION_CONFLICT".to_string(),
-            LauncherError::MigrationFailed { .. } => "ERR_MIGRATION_FAILED".to_string(),
-            LauncherError::ProcessCaptureFailed { .. } => "ERR_PROCESS_CAPTURE_FAILED".to_string(),
-            LauncherError::ProcessStale { .. } => "ERR_PROCESS_STALE".to_string(),
-            LauncherError::UserDecisionRequired => "ERR_USER_DECISION_REQUIRED".to_string(),
-            LauncherError::JavaRuntimeCancelled { .. } => "ERR_JAVA_RUNTIME_CANCELLED".to_string(),
+        let code = match self {
+            // `Generic` keeps free text until D1 gives its call sites a
+            // typed variant; it is the one code no declaration holds.
+            LauncherError::Generic { code, .. } => return code.clone(),
+            LauncherError::AuthExpired => ErrorCode::AuthExpired,
+            LauncherError::AuthRequired => ErrorCode::AuthRequired,
+            LauncherError::DependencyMissing => ErrorCode::DependencyMissing,
+            LauncherError::DiskFull => ErrorCode::Diskfull,
+            LauncherError::GameCrash => ErrorCode::GameCrash,
+            LauncherError::GameVersionNotFound => ErrorCode::GameVersionNotFound,
+            LauncherError::HashConfirmationRequired(_) => ErrorCode::HashConfirmationRequired,
+            LauncherError::HashMismatch => ErrorCode::HashMismatch,
+            LauncherError::InstanceCreateFailed => ErrorCode::InstanceCreateFailed,
+            LauncherError::InstanceLocked => ErrorCode::InstanceLocked,
+            LauncherError::JavaIncompatible => ErrorCode::JavaIncompatible,
+            LauncherError::JavaRuntimeCancelled { .. } => ErrorCode::JavaRuntimeCancelled,
+            LauncherError::JavaRuntimeCatalogMissing { .. } => ErrorCode::JavaRuntimeCatalogMissing,
             LauncherError::JavaRuntimeDownloadDisabled { .. } => {
-                "ERR_JAVA_RUNTIME_DOWNLOAD_DISABLED".to_string()
+                ErrorCode::JavaRuntimeDownloadDisabled
             }
-            LauncherError::Generic { code, .. } => code.clone(),
+            LauncherError::JavaRuntimeMissing { .. } => ErrorCode::JavaRuntimeMissing,
+            LauncherError::LaunchFailed => ErrorCode::LaunchFailed,
+            LauncherError::LoaderProfileNotFound => ErrorCode::LoaderProfileNotFound,
+            LauncherError::LocalStateFailed => ErrorCode::LocalStateFailed,
+            LauncherError::MavenDescriptor => ErrorCode::MavenDescriptor,
+            LauncherError::McpDenied => ErrorCode::McpDenied,
+            LauncherError::McpTooManyRequests => ErrorCode::McpTooManyRequests,
+            LauncherError::McpUnauthorized => ErrorCode::McpUnauthorized,
+            LauncherError::MigrationConflict { .. } => ErrorCode::MigrationConflict,
+            LauncherError::MigrationFailed { .. } => ErrorCode::MigrationFailed,
+            LauncherError::ModrinthDisabled => ErrorCode::ModrinthDisabled,
+            LauncherError::MojangNotFound => ErrorCode::MojangNotFound,
+            LauncherError::MsaAuthRequired => ErrorCode::MsaAuthRequired,
+            LauncherError::NetworkJavaDisabled => ErrorCode::NetworkJavaDisabled,
+            LauncherError::NetworkLoaderDisabled => ErrorCode::NetworkLoaderDisabled,
+            LauncherError::NetworkMojangContentDisabled => ErrorCode::NetworkMojangContentDisabled,
+            LauncherError::NetworkMojangMetadataDisabled => {
+                ErrorCode::NetworkMojangMetadataDisabled
+            }
+            LauncherError::NetworkMsaDisabled => ErrorCode::NetworkMsaDisabled,
+            LauncherError::NetworkOffline | LauncherError::NetworkUnavailable { .. } => {
+                ErrorCode::NetworkOffline
+            }
+            LauncherError::OverrideSecurityViolation => ErrorCode::OverrideSecurityViolation,
+            LauncherError::ProcessCaptureFailed { .. } => ErrorCode::ProcessCaptureFailed,
+            LauncherError::ProcessStale { .. } => ErrorCode::ProcessStale,
+            LauncherError::ProfileCorrupt(..) => ErrorCode::ProfileCorrupt,
+            LauncherError::ProfileMissing(..) => ErrorCode::ProfileMissing,
+            LauncherError::ProfileUnsupportedMetadata(..) => ErrorCode::ProfileUnsupportedMetadata,
+            LauncherError::ProfileWriteFailed => ErrorCode::ProfileWriteFailed,
+            LauncherError::RegistryDownloadFailed => ErrorCode::RegistryDownloadFailed,
+            LauncherError::RegistryMissing => ErrorCode::RegistryMissing,
+            LauncherError::RegistrySignatureInvalid => ErrorCode::RegistrySignatureInvalid,
+            LauncherError::SandboxUnavailable => ErrorCode::SandboxUnavailable,
+            LauncherError::SchemaTooNew => ErrorCode::SchemaTooNew,
+            LauncherError::UnresolvedPlaceholder => ErrorCode::UnresolvedPlaceholder,
+            LauncherError::UnsupportedLoader => ErrorCode::UnsupportedLoader,
+            LauncherError::UntrustedSource => ErrorCode::UntrustedSource,
+            LauncherError::UserDecisionRequired => ErrorCode::UserDecisionRequired,
+            LauncherError::VersionNotFound => ErrorCode::VersionNotFound,
+            LauncherError::ZipBomb => ErrorCode::ZipBomb,
+        };
+        code.as_str().to_string()
+    }
+
+    /// The registry entry for this error's [`code`](Self::code).
+    ///
+    /// A [`LauncherError::Generic`] built from a declared code answers with
+    /// that entry; one built from a string no declaration holds answers `None`,
+    /// which callers that must not guess treat as unclassified rather than as
+    /// a category of their own choosing.
+    pub fn error_code(&self) -> Option<ErrorCode> {
+        ErrorCode::from_code(&self.code())
+    }
+
+    /// A [`LauncherError::Generic`] carrying a declared code.
+    ///
+    /// Build a `Generic` this way from now on: the compiler and the registry
+    /// check the code, where a raw string was checked by nothing. It stays until
+    /// MASTER_SPEC 32.10's D1 step gives every call site a typed variant.
+    pub fn generic(code: ErrorCode, message: impl Into<String>) -> Self {
+        LauncherError::Generic {
+            code: code.as_str().to_string(),
+            message: message.into(),
         }
     }
 }
@@ -476,6 +557,7 @@ impl std::fmt::Display for LauncherError {
                      Enable runtime downloads in Privacy settings or choose a local Java installation."
                 )
             }
+            LauncherError::HashConfirmationRequired(confirmation) => write!(f, "{confirmation}"),
             LauncherError::Generic { message, .. } => write!(f, "{}", message),
         }
     }
@@ -589,6 +671,25 @@ impl serde::Serialize for LauncherError {
                 });
                 map.serialize_entry("details", &details)?;
             }
+            LauncherError::HashConfirmationRequired(confirmation) => {
+                let details = serde_json::json!({
+                    "file": confirmation.file,
+                    "release": confirmation.release,
+                    "expected": confirmation.expected,
+                    "actual": confirmation.actual,
+                    "expected_from": confirmation.expected_from.as_str(),
+                    "also_unmet": confirmation
+                        .also_unmet
+                        .iter()
+                        .map(|other| serde_json::json!({
+                            "expected_from": other.origin.as_str(),
+                            "expected": other.sha256,
+                        }))
+                        .collect::<Vec<_>>(),
+                    "suggested_actions": ["install_anyway", "cancel"],
+                });
+                map.serialize_entry("details", &details)?;
+            }
             _ => {
                 map.serialize_entry("details", &None::<String>)?;
             }
@@ -602,6 +703,95 @@ impl serde::Serialize for LauncherError {
 impl std::error::Error for LauncherError {}
 
 pub type LauncherResult<T> = Result<T, LauncherError>;
+
+/// Suggested action strings returned in serialized profile errors.
+const SUGGEST_REINSTALL: &str = "reinstall_loader";
+const SUGGEST_DELEGATED: &str = "use_delegated_launch";
+const SUGGEST_DISMISS: &str = "dismiss";
+
+// The structured payload of the ERR_PROFILE_* errors. It lives with the error
+// because the frontend reads it (`details.recoverable_issue`); the Minecraft
+// package, which detects these issues, re-exports it.
+
+/// The kind of profile issue encountered during adoption.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ProfileIssueKind {
+    /// The profile JSON (or the base version JSON) does not exist on disk.
+    MissingProfile,
+    /// The profile metadata is structurally valid but contains values that
+    /// this launcher version does not support (unknown rules, unverifiable
+    /// generated artifacts without a receipt, etc.).
+    UnsupportedProfileMetadata,
+    /// The profile JSON is malformed, corrupted, fails security checks, or
+    /// violates structural invariants.
+    CorruptProfile,
+}
+
+/// A structured error returned during profile adoption.
+///
+/// Contains enough information to give the user a targeted recovery action
+/// (reinstall the loader, switch to delegated launch via Mojang, or dismiss).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProfileIssue {
+    pub kind: ProfileIssueKind,
+    /// The absolute path to the profile JSON that caused the issue (if known).
+    pub profile_path: Option<std::path::PathBuf>,
+    /// Human-readable diagnostic reasons.
+    pub reasons: Vec<String>,
+}
+
+impl ProfileIssue {
+    pub fn missing(path: Option<std::path::PathBuf>, reason: impl Into<String>) -> Self {
+        Self {
+            kind: ProfileIssueKind::MissingProfile,
+            profile_path: path,
+            reasons: vec![reason.into()],
+        }
+    }
+
+    pub fn corrupt(path: Option<std::path::PathBuf>, reason: impl Into<String>) -> Self {
+        Self {
+            kind: ProfileIssueKind::CorruptProfile,
+            profile_path: path,
+            reasons: vec![reason.into()],
+        }
+    }
+
+    pub fn unsupported(path: Option<std::path::PathBuf>, reasons: Vec<String>) -> Self {
+        Self {
+            kind: ProfileIssueKind::UnsupportedProfileMetadata,
+            profile_path: path,
+            reasons,
+        }
+    }
+
+    /// Return the standard suggested actions for this kind of issue.
+    pub fn suggested_actions(&self) -> Vec<&'static str> {
+        match self.kind {
+            ProfileIssueKind::MissingProfile => {
+                vec![SUGGEST_REINSTALL, SUGGEST_DELEGATED]
+            }
+            ProfileIssueKind::UnsupportedProfileMetadata => {
+                vec![SUGGEST_REINSTALL, SUGGEST_DELEGATED, SUGGEST_DISMISS]
+            }
+            ProfileIssueKind::CorruptProfile => {
+                vec![SUGGEST_REINSTALL, SUGGEST_DELEGATED, SUGGEST_DISMISS]
+            }
+        }
+    }
+}
+
+impl From<ProfileIssue> for LauncherError {
+    fn from(issue: ProfileIssue) -> Self {
+        match issue.kind {
+            ProfileIssueKind::MissingProfile => LauncherError::ProfileMissing(issue),
+            ProfileIssueKind::UnsupportedProfileMetadata => {
+                LauncherError::ProfileUnsupportedMetadata(issue)
+            }
+            ProfileIssueKind::CorruptProfile => LauncherError::ProfileCorrupt(issue),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -671,101 +861,242 @@ mod tests {
         assert_eq!(code, "ERR_RT");
     }
 
+    /// One sample of every [`LauncherError`] variant, with the code it reported
+    /// before the registry existed.
+    ///
+    /// The macro builds an exhaustive `match` over the same patterns, so adding
+    /// a variant stops this module compiling until its sample and code are
+    /// written here: the serialization test cannot quietly cover less than the
+    /// whole enum.
+    macro_rules! every_variant {
+        ($($pat:pat => ($sample:expr, $code:literal $(,)?)),* $(,)?) => {{
+            fn covers_every_variant(err: &LauncherError) {
+                match err {
+                    $( $pat => {} ),*
+                }
+            }
+            let samples: Vec<(LauncherError, &'static str)> = vec![$(($sample, $code)),*];
+            for (err, _) in &samples {
+                covers_every_variant(err);
+            }
+            samples
+        }};
+    }
+
+    fn profile_issue(kind: ProfileIssueKind) -> ProfileIssue {
+        ProfileIssue {
+            kind,
+            profile_path: None,
+            reasons: vec!["test".into()],
+        }
+    }
+
+    fn all_variants() -> Vec<(LauncherError, &'static str)> {
+        every_variant![
+            LauncherError::NetworkOffline => (LauncherError::NetworkOffline, "ERR_NETWORK_OFFLINE"),
+            LauncherError::NetworkUnavailable { .. } => (
+                LauncherError::NetworkUnavailable {
+                    action: "download the catalog".into(),
+                },
+                "ERR_NETWORK_OFFLINE",
+            ),
+            LauncherError::RegistryDownloadFailed => (
+                LauncherError::RegistryDownloadFailed,
+                "ERR_REGISTRY_DOWNLOAD_FAILED",
+            ),
+            LauncherError::RegistrySignatureInvalid => (
+                LauncherError::RegistrySignatureInvalid,
+                "ERR_REGISTRY_SIGNATURE_INVALID",
+            ),
+            LauncherError::SchemaTooNew => (LauncherError::SchemaTooNew, "ERR_SCHEMA_TOO_NEW"),
+            LauncherError::ZipBomb => (LauncherError::ZipBomb, "ERR_ZIP_BOMB"),
+            LauncherError::OverrideSecurityViolation => (
+                LauncherError::OverrideSecurityViolation,
+                "ERR_OVERRIDE_SECURITY_VIOLATION",
+            ),
+            LauncherError::HashMismatch => (LauncherError::HashMismatch, "ERR_HASH_MISMATCH"),
+            LauncherError::HashConfirmationRequired(_) => (
+                LauncherError::HashConfirmationRequired(Box::new(HashConfirmation {
+                    file: "sodium.jar".into(),
+                    release: None,
+                    expected: "0".repeat(64),
+                    actual: "1".repeat(64),
+                    expected_from: HashOrigin::CuratorPin,
+                    also_unmet: Box::new([]),
+                })),
+                "ERR_HASH_CONFIRMATION_REQUIRED",
+            ),
+            LauncherError::UntrustedSource => (LauncherError::UntrustedSource, "ERR_UNTRUSTED_SOURCE"),
+            LauncherError::DiskFull => (LauncherError::DiskFull, "ERR_DISKFULL"),
+            LauncherError::AuthExpired => (LauncherError::AuthExpired, "ERR_AUTH_EXPIRED"),
+            LauncherError::AuthRequired => (LauncherError::AuthRequired, "ERR_AUTH_REQUIRED"),
+            LauncherError::MsaAuthRequired => (LauncherError::MsaAuthRequired, "ERR_MSA_AUTH_REQUIRED"),
+            LauncherError::ModrinthDisabled => (LauncherError::ModrinthDisabled, "ERR_MODRINTH_DISABLED"),
+            LauncherError::InstanceLocked => (LauncherError::InstanceLocked, "ERR_INSTANCE_LOCKED"),
+            LauncherError::SandboxUnavailable => (LauncherError::SandboxUnavailable, "ERR_SANDBOX_UNAVAILABLE"),
+            LauncherError::MojangNotFound => (LauncherError::MojangNotFound, "ERR_MOJANG_NOT_FOUND"),
+            LauncherError::LaunchFailed => (LauncherError::LaunchFailed, "ERR_LAUNCH_FAILED"),
+            LauncherError::GameCrash => (LauncherError::GameCrash, "ERR_GAME_CRASH"),
+            LauncherError::LocalStateFailed => (LauncherError::LocalStateFailed, "ERR_LOCAL_STATE_FAILED"),
+            LauncherError::InstanceCreateFailed => (
+                LauncherError::InstanceCreateFailed,
+                "ERR_INSTANCE_CREATE_FAILED",
+            ),
+            LauncherError::ProfileWriteFailed => (
+                LauncherError::ProfileWriteFailed,
+                "ERR_PROFILE_WRITE_FAILED",
+            ),
+            LauncherError::RegistryMissing => (LauncherError::RegistryMissing, "ERR_REGISTRY_MISSING"),
+            LauncherError::UnsupportedLoader => (
+                LauncherError::UnsupportedLoader,
+                "ERR_UNSUPPORTED_LOADER",
+            ),
+            LauncherError::VersionNotFound => (LauncherError::VersionNotFound, "ERR_VERSION_NOT_FOUND"),
+            LauncherError::GameVersionNotFound => (
+                LauncherError::GameVersionNotFound,
+                "ERR_GAME_VERSION_NOT_FOUND",
+            ),
+            LauncherError::LoaderProfileNotFound => (
+                LauncherError::LoaderProfileNotFound,
+                "ERR_LOADER_PROFILE_NOT_FOUND",
+            ),
+            LauncherError::ProfileMissing(..) => (
+                LauncherError::ProfileMissing(profile_issue(ProfileIssueKind::MissingProfile)),
+                "ERR_PROFILE_MISSING",
+            ),
+            LauncherError::ProfileUnsupportedMetadata(..) => (
+                LauncherError::ProfileUnsupportedMetadata(profile_issue(
+                    ProfileIssueKind::UnsupportedProfileMetadata,
+                )),
+                "ERR_PROFILE_UNSUPPORTED_METADATA",
+            ),
+            LauncherError::ProfileCorrupt(..) => (
+                LauncherError::ProfileCorrupt(profile_issue(ProfileIssueKind::CorruptProfile)),
+                "ERR_PROFILE_CORRUPT",
+            ),
+            LauncherError::JavaIncompatible => (LauncherError::JavaIncompatible, "ERR_JAVA_INCOMPATIBLE"),
+            LauncherError::JavaRuntimeMissing { .. } => (
+                LauncherError::JavaRuntimeMissing {
+                    major: 21,
+                    component: "client".into(),
+                },
+                "ERR_JAVA_RUNTIME_MISSING",
+            ),
+            LauncherError::JavaRuntimeCatalogMissing { .. } => (
+                LauncherError::JavaRuntimeCatalogMissing {
+                    major: 21,
+                    os: "linux".into(),
+                    arch: "x64".into(),
+                },
+                "ERR_JAVA_RUNTIME_CATALOG_MISSING",
+            ),
+            LauncherError::UnresolvedPlaceholder => (
+                LauncherError::UnresolvedPlaceholder,
+                "ERR_UNRESOLVED_PLACEHOLDER",
+            ),
+            LauncherError::DependencyMissing => (
+                LauncherError::DependencyMissing,
+                "ERR_DEPENDENCY_MISSING",
+            ),
+            LauncherError::McpTooManyRequests => (
+                LauncherError::McpTooManyRequests,
+                "ERR_MCP_TOO_MANY_REQUESTS",
+            ),
+            LauncherError::McpDenied => (LauncherError::McpDenied, "ERR_MCP_DENIED"),
+            LauncherError::McpUnauthorized => (LauncherError::McpUnauthorized, "ERR_MCP_UNAUTHORIZED"),
+            LauncherError::NetworkMojangMetadataDisabled => (
+                LauncherError::NetworkMojangMetadataDisabled,
+                "ERR_NETWORK_MOJANG_METADATA_DISABLED",
+            ),
+            LauncherError::NetworkMojangContentDisabled => (
+                LauncherError::NetworkMojangContentDisabled,
+                "ERR_NETWORK_MOJANG_CONTENT_DISABLED",
+            ),
+            LauncherError::NetworkLoaderDisabled => (
+                LauncherError::NetworkLoaderDisabled,
+                "ERR_NETWORK_LOADER_DISABLED",
+            ),
+            LauncherError::NetworkMsaDisabled => (
+                LauncherError::NetworkMsaDisabled,
+                "ERR_NETWORK_MSA_DISABLED",
+            ),
+            LauncherError::NetworkJavaDisabled => (
+                LauncherError::NetworkJavaDisabled,
+                "ERR_NETWORK_JAVA_DISABLED",
+            ),
+            LauncherError::JavaRuntimeCancelled { .. } => (
+                LauncherError::JavaRuntimeCancelled {
+                    major: 21,
+                    component: "client".into(),
+                },
+                "ERR_JAVA_RUNTIME_CANCELLED",
+            ),
+            LauncherError::JavaRuntimeDownloadDisabled { .. } => (
+                LauncherError::JavaRuntimeDownloadDisabled {
+                    major: 21,
+                    component: "client".into(),
+                },
+                "ERR_JAVA_RUNTIME_DOWNLOAD_DISABLED",
+            ),
+            LauncherError::MavenDescriptor => (LauncherError::MavenDescriptor, "ERR_MAVEN_DESCRIPTOR"),
+            LauncherError::MigrationConflict { .. } => (
+                LauncherError::MigrationConflict {
+                    message: "conflict".into(),
+                },
+                "ERR_MIGRATION_CONFLICT",
+            ),
+            LauncherError::MigrationFailed { .. } => (
+                LauncherError::MigrationFailed {
+                    message: "failed".into(),
+                },
+                "ERR_MIGRATION_FAILED",
+            ),
+            LauncherError::ProcessCaptureFailed { .. } => (
+                LauncherError::ProcessCaptureFailed {
+                    pid: 42,
+                    detail: "test".into(),
+                },
+                "ERR_PROCESS_CAPTURE_FAILED",
+            ),
+            LauncherError::ProcessStale { .. } => (
+                LauncherError::ProcessStale {
+                    pid: 42,
+                    detail: "test".into(),
+                },
+                "ERR_PROCESS_STALE",
+            ),
+            LauncherError::UserDecisionRequired => (
+                LauncherError::UserDecisionRequired,
+                "ERR_USER_DECISION_REQUIRED",
+            ),
+            LauncherError::Generic { .. } => (
+                LauncherError::Generic {
+                    code: "ERR_X".into(),
+                    message: "x".into(),
+                },
+                "ERR_X",
+            ),
+        ]
+    }
+
+    /// Every variant, including the ones the code registry knows nothing about:
+    /// a variant that serialized no code, or a different one, would reach the
+    /// UI and the CLI as an unfamiliar error.
     #[test]
     fn test_all_variants_serialize_without_panic() {
-        let variants: Vec<LauncherError> = vec![
-            LauncherError::NetworkOffline,
-            LauncherError::RegistryDownloadFailed,
-            LauncherError::RegistrySignatureInvalid,
-            LauncherError::SchemaTooNew,
-            LauncherError::ZipBomb,
-            LauncherError::OverrideSecurityViolation,
-            LauncherError::HashMismatch,
-            LauncherError::UntrustedSource,
-            LauncherError::DiskFull,
-            LauncherError::AuthExpired,
-            LauncherError::AuthRequired,
-            LauncherError::MsaAuthRequired,
-            LauncherError::ModrinthDisabled,
-            LauncherError::InstanceLocked,
-            LauncherError::SandboxUnavailable,
-            LauncherError::MojangNotFound,
-            LauncherError::LaunchFailed,
-            LauncherError::GameCrash,
-            LauncherError::LocalStateFailed,
-            LauncherError::InstanceCreateFailed,
-            LauncherError::ProfileWriteFailed,
-            LauncherError::RegistryMissing,
-            LauncherError::UnsupportedLoader,
-            LauncherError::VersionNotFound,
-            LauncherError::GameVersionNotFound,
-            LauncherError::LoaderProfileNotFound,
-            LauncherError::JavaIncompatible,
-            LauncherError::JavaRuntimeMissing {
-                major: 21,
-                component: "client".into(),
-            },
-            LauncherError::JavaRuntimeCatalogMissing {
-                major: 21,
-                os: "linux".into(),
-                arch: "x64".into(),
-            },
-            LauncherError::UnresolvedPlaceholder,
-            LauncherError::DependencyMissing,
-            LauncherError::McpTooManyRequests,
-            LauncherError::McpDenied,
-            LauncherError::McpUnauthorized,
-            LauncherError::NetworkMojangMetadataDisabled,
-            LauncherError::NetworkMojangContentDisabled,
-            LauncherError::NetworkLoaderDisabled,
-            LauncherError::NetworkMsaDisabled,
-            LauncherError::NetworkJavaDisabled,
-            LauncherError::JavaRuntimeCancelled {
-                major: 21,
-                component: "client".into(),
-            },
-            LauncherError::JavaRuntimeDownloadDisabled {
-                major: 21,
-                component: "client".into(),
-            },
-            LauncherError::MavenDescriptor,
-            LauncherError::ProcessCaptureFailed {
-                pid: 42,
-                detail: "test".into(),
-            },
-            LauncherError::ProcessStale {
-                pid: 42,
-                detail: "test".into(),
-            },
-            LauncherError::ProfileMissing(crate::installed_profile::ProfileIssue {
-                kind: crate::installed_profile::ProfileIssueKind::MissingProfile,
-                profile_path: None,
-                reasons: vec!["test".into()],
-            }),
-            LauncherError::ProfileUnsupportedMetadata(crate::installed_profile::ProfileIssue {
-                kind: crate::installed_profile::ProfileIssueKind::UnsupportedProfileMetadata,
-                profile_path: None,
-                reasons: vec!["test".into()],
-            }),
-            LauncherError::ProfileCorrupt(crate::installed_profile::ProfileIssue {
-                kind: crate::installed_profile::ProfileIssueKind::CorruptProfile,
-                profile_path: None,
-                reasons: vec!["test".into()],
-            }),
-            LauncherError::Generic {
-                code: "ERR_X".into(),
-                message: "x".into(),
-            },
-        ];
-        for err in variants {
-            let val = serde_json::to_value(err).unwrap();
-            assert!(val.get("code").is_some());
+        for (err, expected) in all_variants() {
+            let value = serde_json::to_value(&err).unwrap();
+            assert_eq!(
+                value.get("code").and_then(serde_json::Value::as_str),
+                Some(expected),
+                "{err:?} no longer serializes the code it reported before the registry"
+            );
         }
     }
 
     #[test]
     fn test_serialize_profile_missing_structured_details() {
-        use crate::installed_profile::{ProfileIssue, ProfileIssueKind};
+        use {ProfileIssue, ProfileIssueKind};
 
         let issue = ProfileIssue {
             kind: ProfileIssueKind::MissingProfile,
@@ -806,7 +1137,7 @@ mod tests {
 
     #[test]
     fn test_serialize_profile_unsupported_structured_details() {
-        use crate::installed_profile::{ProfileIssue, ProfileIssueKind};
+        use {ProfileIssue, ProfileIssueKind};
 
         let issue = ProfileIssue {
             kind: ProfileIssueKind::UnsupportedProfileMetadata,
@@ -835,7 +1166,7 @@ mod tests {
 
     #[test]
     fn test_serialize_profile_corrupt_structured_details() {
-        use crate::installed_profile::{ProfileIssue, ProfileIssueKind};
+        use {ProfileIssue, ProfileIssueKind};
 
         let issue = ProfileIssue {
             kind: ProfileIssueKind::CorruptProfile,
@@ -863,7 +1194,7 @@ mod tests {
 
     #[test]
     fn test_profile_missing_suggested_actions() {
-        use crate::installed_profile::{ProfileIssue, ProfileIssueKind};
+        use {ProfileIssue, ProfileIssueKind};
         let issue = ProfileIssue {
             kind: ProfileIssueKind::MissingProfile,
             profile_path: None,
@@ -882,7 +1213,7 @@ mod tests {
 
     #[test]
     fn test_profile_unsupported_suggested_actions() {
-        use crate::installed_profile::{ProfileIssue, ProfileIssueKind};
+        use {ProfileIssue, ProfileIssueKind};
         let issue = ProfileIssue {
             kind: ProfileIssueKind::UnsupportedProfileMetadata,
             profile_path: None,
@@ -967,7 +1298,7 @@ mod tests {
 
     #[test]
     fn test_profile_corrupt_suggested_actions_includes_delegated() {
-        use crate::installed_profile::{ProfileIssue, ProfileIssueKind};
+        use {ProfileIssue, ProfileIssueKind};
         let issue = ProfileIssue {
             kind: ProfileIssueKind::CorruptProfile,
             profile_path: None,

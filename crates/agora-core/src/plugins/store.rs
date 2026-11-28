@@ -22,7 +22,7 @@ use agora_plugin_api::distribution::PublicKey;
 use agora_plugin_api::manifest::{PluginId, PluginManifest};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Which kind of stored value a key belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,7 +87,7 @@ pub struct PluginRecord {
 
 /// The publisher URL, keys, and anti-replay state recorded for an installed
 /// plugin's update channel.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustRecord {
     pub url: String,
     pub keys: Vec<PublicKey>,
@@ -124,6 +124,46 @@ fn db_error(error: impl std::fmt::Display) -> LauncherError {
         code: "ERR_LOCAL_STATE_FAILED".into(),
         message: error.to_string(),
     }
+}
+
+/// Reserve the next SQLite write while a reader opens package files. An existing
+/// writer has already published its journal before moving files. A new writer
+/// cannot publish one and start moving files until this guard is released.
+pub(super) fn guard_package_reads(conn: &Connection) -> LauncherResult<rusqlite::Transaction<'_>> {
+    rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .map_err(db_error)
+}
+
+pub(super) fn journal_ids(conn: &Connection) -> LauncherResult<Vec<String>> {
+    let mut stmt = conn
+        .prepare("SELECT plugin_id FROM plugin_install_journal ORDER BY plugin_id")
+        .map_err(db_error)?;
+    let rows = stmt.query_map([], |row| row.get(0)).map_err(db_error)?;
+    rows.collect::<rusqlite::Result<_>>().map_err(db_error)
+}
+
+pub(crate) struct PluginLoadSnapshot<'a> {
+    pub guard: rusqlite::Transaction<'a>,
+    pub records: Vec<PluginRecord>,
+    pub pending: std::collections::BTreeMap<String, String>,
+}
+
+pub(crate) fn load_snapshot(conn: &Connection) -> LauncherResult<PluginLoadSnapshot<'_>> {
+    let guard = guard_package_reads(conn)?;
+    let pending = journal_ids(&guard)?
+        .into_iter()
+        .map(|id| {
+            let reason =
+                format!("Plugin {id} is being installed, being removed, or needs recovery.");
+            (id, reason)
+        })
+        .collect();
+    let records = list(&guard)?;
+    Ok(PluginLoadSnapshot {
+        guard,
+        records,
+        pending,
+    })
 }
 
 /// Every installed plugin, in id order.
@@ -195,6 +235,187 @@ pub fn get(conn: &Connection, plugin_id: &PluginId) -> LauncherResult<Option<Plu
         .find(|record| record.id() == plugin_id))
 }
 
+/// Declarations in manifest order with their paths. Keep raw JSON so templates and
+/// inherited store products can still be resolved when a plugin's files are in flight.
+pub(crate) type GamePackageDeclarations = Vec<(String, serde_json::Value)>;
+
+pub(crate) fn committed_game_packages(
+    conn: &Connection,
+    id: &PluginId,
+) -> LauncherResult<GamePackageDeclarations> {
+    let text = conn
+        .query_row(
+            "SELECT game_packages_json FROM plugin_installs WHERE plugin_id = ?1",
+            params![id.as_str()],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(db_error)?
+        .flatten();
+    match text {
+        Some(text) => serde_json::from_str(&text).map_err(db_error),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn encode_game_packages(manifest: &PluginManifest, folder: &Path) -> LauncherResult<String> {
+    let mut packages = GamePackageDeclarations::new();
+    for contribution in &manifest.contributions.game_packages {
+        // Regular startup reports invalid declarations. They have no loadable game claims.
+        if let Ok(package) =
+            crate::game_registry::inherit::read_game_package(folder, &contribution.path)
+        {
+            packages.push((contribution.path.clone(), package));
+        }
+    }
+    serde_json::to_string(&packages).map_err(db_error)
+}
+
+/// An install from before schema 30 still has its committed files at the start
+/// of its first change. Save its declarations before publishing the journal.
+pub(super) fn backfill_game_packages(conn: &Connection, id: &PluginId) -> LauncherResult<()> {
+    let Some(record) = install_row(conn, id)? else {
+        return Ok(());
+    };
+    if record.game_packages_json.is_some() || record.install_dir.is_empty() {
+        return Ok(());
+    }
+    let manifest = serde_json::from_str(&record.manifest_json).map_err(db_error)?;
+    let json = encode_game_packages(&manifest, Path::new(&record.install_dir))?;
+    conn.execute(
+        "UPDATE plugin_installs SET game_packages_json = ?2 WHERE plugin_id = ?1",
+        params![id.as_str(), json],
+    )
+    .map_err(db_error)?;
+    Ok(())
+}
+
+/// The exact install row, including grants and state that cannot be reconstructed from a manifest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct InstallRow {
+    pub version: String,
+    pub install_dir: String,
+    manifest_json: String,
+    granted_capabilities: String,
+    source_kind: String,
+    source_path: Option<String>,
+    enabled: i64,
+    installed_at: String,
+    updated_at: String,
+    data_version: i64,
+    last_error: Option<String>,
+    #[serde(default)]
+    game_packages_json: Option<String>,
+}
+
+pub(super) fn install_row(conn: &Connection, id: &PluginId) -> LauncherResult<Option<InstallRow>> {
+    conn.query_row(
+        "SELECT version, install_dir, manifest_json, granted_capabilities, source_kind,
+                source_path, enabled, installed_at, updated_at, data_version, last_error, game_packages_json
+         FROM plugin_installs WHERE plugin_id = ?1",
+        params![id.as_str()],
+        |row| {
+            Ok(InstallRow {
+                version: row.get(0)?,
+                install_dir: row.get(1)?,
+                manifest_json: row.get(2)?,
+                granted_capabilities: row.get(3)?,
+                source_kind: row.get(4)?,
+                source_path: row.get(5)?,
+                enabled: row.get(6)?,
+                installed_at: row.get(7)?,
+                updated_at: row.get(8)?,
+                data_version: row.get(9)?,
+                last_error: row.get(10)?,
+                game_packages_json: row.get(11)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(db_error)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct InstallSnapshot {
+    pub record: InstallRow,
+    trust: Option<TrustRecord>,
+    consent: Option<(i64, String, Option<String>)>,
+    #[serde(default)]
+    official: Option<OfficialProvenance>,
+}
+
+impl InstallSnapshot {
+    pub fn capture(conn: &Connection, id: &PluginId) -> LauncherResult<Option<Self>> {
+        let Some(record) = install_row(conn, id)? else {
+            return Ok(None);
+        };
+        let consent = conn.query_row(
+            "SELECT allowed, decided_at, code_hash FROM plugin_script_consent WHERE plugin_id = ?1",
+            params![id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional().map_err(db_error)?;
+        Ok(Some(Self {
+            record,
+            consent,
+            trust: get_trust(conn, id)?,
+            official: get_official(conn, id)?,
+        }))
+    }
+
+    pub fn restore(&self, conn: &Connection, id: &PluginId) -> LauncherResult<()> {
+        let record = &self.record;
+        let updated = conn
+            .execute(
+                "UPDATE plugin_installs SET version = ?2, install_dir = ?3, manifest_json = ?4,
+                 granted_capabilities = ?5, source_kind = ?6, source_path = ?7, enabled = ?8,
+                 installed_at = ?9, updated_at = ?10, data_version = ?11, last_error = ?12,
+                 game_packages_json = ?13
+             WHERE plugin_id = ?1",
+                params![
+                    id.as_str(),
+                    record.version,
+                    record.install_dir,
+                    record.manifest_json,
+                    record.granted_capabilities,
+                    record.source_kind,
+                    record.source_path,
+                    record.enabled,
+                    record.installed_at,
+                    record.updated_at,
+                    record.data_version,
+                    record.last_error,
+                    record.game_packages_json
+                ],
+            )
+            .map_err(db_error)?;
+        if updated != 1 {
+            return Err(db_error(format!(
+                "plugin {id} has no install row to restore"
+            )));
+        }
+        if let Some(trust) = &self.trust {
+            put_trust(conn, id, &trust.url, &trust.keys)?;
+            conn.execute(
+                "UPDATE plugin_trust SET highest_sequence = ?2, last_checked_at = ?3, last_result = ?4
+                 WHERE plugin_id = ?1",
+                params![id.as_str(), trust.highest_sequence, trust.last_checked_at, trust.last_result],
+            ).map_err(db_error)?;
+        } else {
+            clear_trust(conn, id)?;
+        }
+        if let Some((allowed, decided_at, hash)) = &self.consent {
+            set_script_consent(conn, id, *allowed != 0, hash.as_deref(), decided_at)?;
+        } else {
+            clear_script_consent(conn, id)?;
+        }
+        match &self.official {
+            Some(provenance) => set_official(conn, id, provenance)?,
+            None => clear_official(conn, id)?,
+        }
+        Ok(())
+    }
+}
+
 /// Insert or replace an install record.
 #[allow(clippy::too_many_arguments)]
 pub fn upsert(
@@ -207,6 +428,7 @@ pub fn upsert(
     now: &str,
 ) -> LauncherResult<()> {
     let manifest_json = serde_json::to_string(manifest).map_err(db_error)?;
+    let game_packages_json = encode_game_packages(manifest, install_dir)?;
     let granted_json = serde_json::to_string(
         &granted
             .iter()
@@ -222,8 +444,8 @@ pub fn upsert(
     conn.execute(
         "INSERT INTO plugin_installs
              (plugin_id, version, manifest_json, granted_capabilities, source_kind, source_path,
-              install_dir, enabled, installed_at, updated_at, data_version, last_error)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, NULL)
+              install_dir, enabled, installed_at, updated_at, data_version, last_error, game_packages_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, NULL, ?11)
          ON CONFLICT(plugin_id) DO UPDATE SET
              version = excluded.version,
              manifest_json = excluded.manifest_json,
@@ -234,7 +456,8 @@ pub fn upsert(
              enabled = excluded.enabled,
              updated_at = excluded.updated_at,
              data_version = excluded.data_version,
-             last_error = NULL",
+             last_error = NULL,
+             game_packages_json = excluded.game_packages_json",
         params![
             manifest.id.as_str(),
             manifest.version.to_string(),
@@ -246,10 +469,216 @@ pub fn upsert(
             enabled as i64,
             now,
             manifest.data_version as i64,
+            game_packages_json,
+        ],
+    )
+    .map_err(db_error)?;
+    // Clear the previous package's standing. A verified replacement pins its own
+    // provenance in the same transaction.
+    clear_official(conn, &manifest.id)?;
+    Ok(())
+}
+
+/// Record whether the user allowed this plugin's code to run. Per plugin; one
+/// plugin's answer never touches another's.
+pub fn set_script_consent(
+    conn: &Connection,
+    plugin_id: &PluginId,
+    allowed: bool,
+    code_hash: Option<&str>,
+    now: &str,
+) -> LauncherResult<()> {
+    conn.execute(
+        "INSERT INTO plugin_script_consent (plugin_id, allowed, decided_at, code_hash)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(plugin_id) DO UPDATE SET
+             allowed = excluded.allowed,
+             decided_at = excluded.decided_at,
+             code_hash = excluded.code_hash",
+        params![plugin_id.as_str(), allowed as i64, now, code_hash],
+    )
+    .map_err(db_error)?;
+    Ok(())
+}
+
+/// The code digest the stored answer was given for, if any.
+pub fn script_consent_code_hash(
+    conn: &Connection,
+    plugin_id: &PluginId,
+) -> LauncherResult<Option<String>> {
+    conn.query_row(
+        "SELECT code_hash FROM plugin_script_consent WHERE plugin_id = ?1",
+        params![plugin_id.as_str()],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .map(|row| row.flatten())
+    .map_err(db_error)
+}
+
+/// Forget the answer. Used when the installed version has no code: consent
+/// belongs to code, and a later version that brings code must ask again.
+pub fn clear_script_consent(conn: &Connection, plugin_id: &PluginId) -> LauncherResult<()> {
+    conn.execute(
+        "DELETE FROM plugin_script_consent WHERE plugin_id = ?1",
+        params![plugin_id.as_str()],
+    )
+    .map_err(db_error)?;
+    Ok(())
+}
+
+/// The user's answer for this plugin, or `None` if it has never been given one
+/// (which is not permission).
+pub fn script_consent(conn: &Connection, plugin_id: &PluginId) -> LauncherResult<Option<bool>> {
+    conn.query_row(
+        "SELECT allowed FROM plugin_script_consent WHERE plugin_id = ?1",
+        params![plugin_id.as_str()],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .map(|answer| answer.map(|allowed| allowed != 0))
+    .map_err(db_error)
+}
+
+/// Every digest an answer was given for, keyed by plugin id. A row with no
+/// digest is recorded as `None`, which is not the same as no row at all.
+pub fn list_script_consent_code_hashes(
+    conn: &Connection,
+) -> LauncherResult<std::collections::BTreeMap<String, Option<String>>> {
+    let mut stmt = conn
+        .prepare("SELECT plugin_id, code_hash FROM plugin_script_consent")
+        .map_err(db_error)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(db_error)?;
+    let mut out = std::collections::BTreeMap::new();
+    for row in rows {
+        let (id, hash) = row.map_err(db_error)?;
+        out.insert(id, hash);
+    }
+    Ok(out)
+}
+
+/// Every recorded answer, keyed by plugin id.
+pub fn list_script_consent(
+    conn: &Connection,
+) -> LauncherResult<std::collections::BTreeMap<String, bool>> {
+    let mut stmt = conn
+        .prepare("SELECT plugin_id, allowed FROM plugin_script_consent")
+        .map_err(db_error)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0))
+        })
+        .map_err(db_error)?;
+    let mut out = std::collections::BTreeMap::new();
+    for row in rows {
+        let (id, allowed) = row.map_err(db_error)?;
+        out.insert(id, allowed);
+    }
+    Ok(out)
+}
+
+/// Where an installed plugin came from, when it came from a signed registry
+/// entry: the entry that was matched, the package hash that entry pinned, and a
+/// digest of the files as they were written, so a later edit is noticed.
+///
+/// This is a record of an installation, not a verdict. Whether the plugin is
+/// *still* official is decided against the signed registry each time it matters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfficialProvenance {
+    pub entry_id: String,
+    pub entry_version: String,
+    /// SHA-256 of the package zip, as pinned by the signed entry.
+    pub entry_sha256: String,
+    /// Digest of the extracted files; see `official::tree_digest`.
+    pub tree_sha256: String,
+    pub recorded_at: String,
+}
+
+/// Record that this plugin's current files came from a signed registry entry.
+pub fn set_official(
+    conn: &Connection,
+    plugin_id: &PluginId,
+    provenance: &OfficialProvenance,
+) -> LauncherResult<()> {
+    conn.execute(
+        "INSERT INTO plugin_official
+             (plugin_id, entry_id, entry_version, entry_sha256, tree_sha256, recorded_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(plugin_id) DO UPDATE SET
+             entry_id = excluded.entry_id,
+             entry_version = excluded.entry_version,
+             entry_sha256 = excluded.entry_sha256,
+             tree_sha256 = excluded.tree_sha256,
+             recorded_at = excluded.recorded_at",
+        params![
+            plugin_id.as_str(),
+            provenance.entry_id,
+            provenance.entry_version,
+            provenance.entry_sha256,
+            provenance.tree_sha256,
+            provenance.recorded_at,
         ],
     )
     .map_err(db_error)?;
     Ok(())
+}
+
+/// Forget any official provenance for this plugin.
+pub fn clear_official(conn: &Connection, plugin_id: &PluginId) -> LauncherResult<()> {
+    conn.execute(
+        "DELETE FROM plugin_official WHERE plugin_id = ?1",
+        params![plugin_id.as_str()],
+    )
+    .map_err(db_error)?;
+    Ok(())
+}
+
+fn get_official(conn: &Connection, id: &PluginId) -> LauncherResult<Option<OfficialProvenance>> {
+    conn.query_row(
+        "SELECT entry_id, entry_version, entry_sha256, tree_sha256, recorded_at
+         FROM plugin_official WHERE plugin_id = ?1",
+        params![id.as_str()],
+        |row| read_provenance(row, 0),
+    )
+    .optional()
+    .map_err(db_error)
+}
+
+fn read_provenance(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<OfficialProvenance> {
+    Ok(OfficialProvenance {
+        entry_id: row.get(offset)?,
+        entry_version: row.get(offset + 1)?,
+        entry_sha256: row.get(offset + 2)?,
+        tree_sha256: row.get(offset + 3)?,
+        recorded_at: row.get(offset + 4)?,
+    })
+}
+
+/// Every recorded official provenance, keyed by plugin id.
+pub fn list_official(
+    conn: &Connection,
+) -> LauncherResult<std::collections::BTreeMap<String, OfficialProvenance>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT plugin_id, entry_id, entry_version, entry_sha256, tree_sha256, recorded_at
+             FROM plugin_official",
+        )
+        .map_err(db_error)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, read_provenance(row, 1)?))
+        })
+        .map_err(db_error)?;
+    let mut out = std::collections::BTreeMap::new();
+    for row in rows {
+        let (id, provenance) = row.map_err(db_error)?;
+        out.insert(id, provenance);
+    }
+    Ok(out)
 }
 
 pub fn set_enabled(
@@ -392,6 +821,14 @@ pub fn remove(conn: &Connection, plugin_id: &PluginId, purge_data: bool) -> Laun
         "UPDATE plugin_installs
          SET enabled = 0, install_dir = '', last_error = 'uninstalled; data retained'
          WHERE plugin_id = ?1",
+        params![plugin_id.as_str()],
+    )
+    .map_err(db_error)?;
+    // The files are gone, so whatever vouched for them no longer applies, and
+    // so does permission to run them: a reinstall asks again, like the grants.
+    clear_official(conn, plugin_id)?;
+    conn.execute(
+        "DELETE FROM plugin_script_consent WHERE plugin_id = ?1",
         params![plugin_id.as_str()],
     )
     .map_err(db_error)?;

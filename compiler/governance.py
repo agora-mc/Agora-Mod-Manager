@@ -35,6 +35,11 @@ from typing import Any
 
 logger = logging.getLogger("compiler.governance")
 
+
+class GovernanceError(RuntimeError):
+    """A governance input or GitHub read failed; no catalog may be trusted."""
+
+
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
@@ -67,6 +72,12 @@ PRODUCTION_RAID_THRESHOLD = 5
 PRODUCTION_RAID_WINDOW_MINUTES = 360
 SANDBOX_RAID_THRESHOLD = 3
 SANDBOX_RAID_WINDOW_MINUTES = 10
+
+# Safety rail, not a data cap: every page is followed until GitHub stops
+# returning a full page. Hitting this limit means the result would be
+# truncated, so the run stops and names it.
+MAX_GITHUB_PAGES = 100
+GITHUB_PER_PAGE = 100
 
 # ---------------------------------------------------------------------------
 # Repo resolution
@@ -170,51 +181,83 @@ INJECTED_FETCH_ISSUES = None
 INJECTED_FETCH_REACTIONS = None
 INJECTED_USER_PROFILES: dict[str, dict] | None = None
 
+def _github_get(url: str, *, headers: dict[str, str], params: dict[str, Any]):
+    """One GitHub GET. Tests replace this; production uses requests."""
+    import requests
+    return requests.get(url, headers=headers, params=params, timeout=60)
+
+
+def _paginate_json(
+    url: str,
+    *,
+    headers: dict[str, str],
+    params: dict[str, Any],
+    source: str,
+) -> list[dict[str, Any]]:
+    """Follow every page of a GitHub list endpoint or fail loudly.
+
+    A full page means there may be more; a short page means this was the last
+    one. If the safety limit is reached while pages are still full the result
+    would be truncated, so raise instead of returning partial data.
+    """
+    out: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        if page > MAX_GITHUB_PAGES:
+            raise GovernanceError(
+                f"GitHub API {source} reached the {MAX_GITHUB_PAGES}-page "
+                "pagination limit; refusing to continue with a truncated result"
+            )
+        page_params = dict(params)
+        page_params.update({"per_page": GITHUB_PER_PAGE, "page": page})
+        try:
+            resp = _github_get(url, headers=headers, params=page_params)
+        except GovernanceError:
+            raise
+        except Exception as exc:
+            raise GovernanceError(f"GitHub API {source} fetch failed on page {page}: {exc}") from exc
+        if resp.status_code != 200:
+            raise GovernanceError(
+                f"GitHub API {source} returned HTTP {resp.status_code} on page {page}"
+            )
+        try:
+            batch = resp.json()
+        except Exception as exc:
+            raise GovernanceError(
+                f"GitHub API {source} returned invalid JSON on page {page}: {exc}"
+            ) from exc
+        if not isinstance(batch, list):
+            raise GovernanceError(
+                f"GitHub API {source} returned {type(batch).__name__} on page "
+                f"{page}, expected a list"
+            )
+        out.extend(batch)
+        if len(batch) < GITHUB_PER_PAGE:
+            return out
+        page += 1
+
+
 def _fetch_issues(owner: str, repo: str, *, token: str) -> list[dict[str, Any]]:
     if INJECTED_FETCH_ISSUES is not None:
         return INJECTED_FETCH_ISSUES(owner, repo, token=token)
-    import requests
-    headers = _gh_headers(token)
-    out: list[dict[str, Any]] = []
-    page = 1
-    while page <= 10:
-        resp = requests.get(
-            f"https://api.github.com/repos/{owner}/{repo}/issues",
-            headers=headers, params={"state": "all", "per_page": 100, "page": page}, timeout=60,
-        )
-        if resp.status_code not in (200,):
-            raise RuntimeError(f"GitHub API /issues returned {resp.status_code}")
-        batch = resp.json()
-        if not isinstance(batch, list):
-            break
-        out.extend(batch)
-        if len(batch) < 100:
-            break
-        page += 1
-    return out
+    return _paginate_json(
+        f"https://api.github.com/repos/{owner}/{repo}/issues",
+        headers=_gh_headers(token),
+        params={"state": "all"},
+        source="/issues",
+    )
+
 
 def _fetch_reactions(owner: str, repo: str, issue_number: int, *, token: str) -> list[dict[str, Any]]:
     if INJECTED_FETCH_REACTIONS is not None:
         return INJECTED_FETCH_REACTIONS(owner, repo, issue_number, token=token)
-    import requests
-    headers = _gh_headers(token)
-    out: list[dict[str, Any]] = []
-    page = 1
-    while page <= 5:
-        resp = requests.get(
-            f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/reactions",
-            headers=headers, params={"per_page": 100, "page": page}, timeout=60,
-        )
-        if resp.status_code not in (200,):
-            raise RuntimeError(f"GitHub API /reactions returned {resp.status_code}")
-        batch = resp.json()
-        if not isinstance(batch, list):
-            break
-        out.extend(batch)
-        if len(batch) < 100:
-            break
-        page += 1
-    return out
+    return _paginate_json(
+        f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/reactions",
+        headers=_gh_headers(token),
+        params={},
+        source=f"/issues/{issue_number}/reactions",
+    )
+
 
 def _fetch_user_profile(login: str, *, token: str) -> dict[str, Any] | None:
     if INJECTED_USER_PROFILES is not None:
@@ -225,11 +268,15 @@ def _fetch_user_profile(login: str, *, token: str) -> dict[str, Any] | None:
             f"https://api.github.com/users/{login}",
             headers=_gh_headers(token), timeout=30,
         )
-        if resp.status_code == 200:
-            return resp.json()
+    except requests.RequestException as exc:
+        raise GovernanceError(f"GitHub API /users/{login} fetch failed: {exc}") from exc
+    if resp.status_code == 404:
         return None
-    except Exception:
-        return None
+    if resp.status_code != 200:
+        raise GovernanceError(
+            f"GitHub API /users/{login} returned HTTP {resp.status_code}"
+        )
+    return resp.json()
 
 def _gh_headers(token: str) -> dict[str, str]:
     return {
@@ -370,13 +417,23 @@ def _parse_gh_ts(ts: str | None) -> datetime | None:
 
 def check_user_eligibility(
     login: str, policy: PolicyConfig, *, token: str, cache: dict[str, bool],
-    now: datetime | None = None,
+    now: datetime | None = None, allow_partial: bool = False,
 ) -> bool:
     if login in cache:
         return cache[login]
     if now is None:
         now = datetime.now(timezone.utc)
-    profile = _fetch_user_profile(login, token=token)
+    try:
+        profile = _fetch_user_profile(login, token=token)
+    except GovernanceError as exc:
+        if not allow_partial:
+            raise
+        logger.warning(
+            "Treating '%s' as ineligible because its profile could not be "
+            "read and partial governance is allowed: %s", login, exc,
+        )
+        cache[login] = False
+        return False
     if profile is None:
         cache[login] = False
         return False
@@ -447,33 +504,70 @@ def governance_state_semantic_view(state: dict[str, Any]) -> dict[str, Any]:
         "events": state.get("events", []),
     }
 
-def load_vote_issues(path: Path) -> dict[str, Any]:
-    try:
-        with path.open("r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return {"schema_version": 1, "items": {}}
+def _partial_or_raise(
+    message: str, *, allow_partial: bool, fallback: dict[str, Any]
+) -> dict[str, Any]:
+    if not allow_partial:
+        raise GovernanceError(message)
+    logger.warning("%s; continuing because partial governance is allowed.", message)
+    return fallback
 
-def load_governance_state(path: Path | None, *, governance_repo: str | None = None, policy: str | None = None) -> dict[str, Any]:
-    if path is None:
-        return {"schema_version": 1, "events": []}
+def load_vote_issues(path: Path, *, allow_partial: bool = False) -> dict[str, Any]:
+    fallback = {"schema_version": 1, "items": {}}
     try:
         with path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return {"schema_version": 1, "events": []}
+    except (OSError, json.JSONDecodeError) as exc:
+        return _partial_or_raise(
+            f"cannot read vote-issues file {path}: {exc}",
+            allow_partial=allow_partial, fallback=fallback,
+        )
+    if not isinstance(data, dict) or not isinstance(data.get("items", {}), dict):
+        return _partial_or_raise(
+            f"malformed vote-issues file {path}: expected an object with an 'items' object",
+            allow_partial=allow_partial, fallback=fallback,
+        )
+    data.setdefault("items", {})
+    return data
+
+def load_governance_state(path: Path | None, *, governance_repo: str | None = None, policy: str | None = None, allow_partial: bool = False) -> dict[str, Any]:
+    fallback = {"schema_version": 1, "events": []}
+    if path is None:
+        return fallback
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        return _partial_or_raise(
+            f"cannot read governance state {path}: {exc}",
+            allow_partial=allow_partial, fallback=fallback,
+        )
     if not isinstance(data, dict):
-        return {"schema_version": 1, "events": []}
+        return _partial_or_raise(
+            f"malformed governance state {path}: expected a JSON object",
+            allow_partial=allow_partial, fallback=fallback,
+        )
     stored_repo = data.get("governance_repository")
     stored_policy = data.get("policy")
     if stored_repo and governance_repo and stored_repo != governance_repo:
-        logger.warning("State governance_repository '%s' != expected '%s'; ignoring mismatched state.", stored_repo, governance_repo)
-        return {"schema_version": 1, "events": []}
+        return _partial_or_raise(
+            f"governance state {path} belongs to repository '{stored_repo}', "
+            f"not the configured '{governance_repo}'",
+            allow_partial=allow_partial, fallback=fallback,
+        )
     if stored_policy and policy and stored_policy != policy:
-        logger.warning("State policy '%s' != expected '%s'; ignoring mismatched state.", stored_policy, policy)
-        return {"schema_version": 1, "events": []}
+        return _partial_or_raise(
+            f"governance state {path} uses policy '{stored_policy}', "
+            f"not the configured '{policy}'",
+            allow_partial=allow_partial, fallback=fallback,
+        )
     if "events" not in data:
         data["events"] = []
+    if not isinstance(data["events"], list):
+        return _partial_or_raise(
+            f"malformed governance state {path}: 'events' must be a list",
+            allow_partial=allow_partial, fallback=fallback,
+        )
     return data
 
 def save_governance_state(path: Path, data: dict[str, Any]) -> bool:
@@ -498,12 +592,24 @@ def save_governance_state(path: Path, data: dict[str, Any]) -> bool:
     logger.info("Governance state saved to %s", path)
     return True
 
-def load_quarantine_decisions(path: Path) -> dict[str, Any]:
+def load_quarantine_decisions(path: Path, *, allow_partial: bool = False) -> dict[str, Any]:
+    fallback = {"schema_version": 1, "decisions": []}
     try:
         with path.open("r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return {"schema_version": 1, "decisions": []}
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        return _partial_or_raise(
+            f"cannot read curator decisions {path}: {exc}",
+            allow_partial=allow_partial, fallback=fallback,
+        )
+    if not isinstance(data, dict) or not isinstance(data.get("decisions", []), list):
+        return _partial_or_raise(
+            f"malformed curator decisions {path}: expected an object with a "
+            "'decisions' list",
+            allow_partial=allow_partial, fallback=fallback,
+        )
+    data.setdefault("decisions", [])
+    return data
 
 # ---------------------------------------------------------------------------
 # Discord embed builder
@@ -589,22 +695,26 @@ def run_governance_pipeline(
     governance_state_out_path: Path,
     quarantine_decisions_path: Path,
     discord_webhook_url: str | None,
+    allow_partial: bool = False,
 ) -> dict[str, Any]:
     if mode == GovernanceMode.OFF:
         logger.info("Governance mode=off.")
         return {}
     if not token:
-        logger.warning("GITHUB_TOKEN not set.")
-        return {}
+        raise GovernanceError(
+            "governance requires GITHUB_TOKEN; use --governance-mode off for "
+            "a catalog without governance data"
+        )
     if not governance_repo:
-        logger.warning("Governance repo not resolved.")
-        return {}
+        raise GovernanceError(
+            "governance repo is not resolved; pass --governance-repo or set "
+            "AGORA_GOVERNANCE_REPO/AGORA_REGISTRY_REPO/GITHUB_REPOSITORY"
+        )
     owner, _, repo_name = governance_repo.partition("/")
     if not owner or not repo_name:
-        logger.warning("Governance repo '%s' invalid.", governance_repo)
-        return {}
+        raise GovernanceError(f"governance repo '{governance_repo}' is not owner/repo")
 
-    vi = load_vote_issues(vote_issues_path)
+    vi = load_vote_issues(vote_issues_path, allow_partial=allow_partial)
     item_issue_map: dict[str, int] = {}
     for item_id, entry in vi.get("items", {}).items():
         issue_n = entry.get("issue_number") if isinstance(entry, dict) else entry
@@ -624,9 +734,14 @@ def run_governance_pipeline(
 
     try:
         all_issues = _fetch_issues(owner, repo_name, token=token)
-    except RuntimeError as exc:
-        logger.warning("Failed to fetch issues: %s", exc)
-        return {}
+    except GovernanceError as exc:
+        if not allow_partial:
+            raise
+        logger.warning(
+            "Proceeding without GitHub issues because partial governance is "
+            "allowed: %s", exc,
+        )
+        all_issues = []
 
     # Extract reviews for ALL registry items, not just vote-issue-mapped ones.
     known_mod_id_set = all_registry_ids
@@ -648,7 +763,10 @@ def run_governance_pipeline(
     }
 
     # Load previous state and curator decisions
-    state_data = load_governance_state(governance_state_in_path, governance_repo=governance_repo, policy=policy.value)
+    state_data = load_governance_state(
+        governance_state_in_path, governance_repo=governance_repo,
+        policy=policy.value, allow_partial=allow_partial,
+    )
     prev_events: list[dict[str, Any]] = state_data.get("events", [])
     prev_event_map: dict[str, dict[str, Any]] = {}
     for ev in prev_events:
@@ -656,7 +774,9 @@ def run_governance_pipeline(
         if eid:
             prev_event_map[eid] = ev
 
-    qd = load_quarantine_decisions(quarantine_decisions_path)
+    qd = load_quarantine_decisions(
+        quarantine_decisions_path, allow_partial=allow_partial,
+    )
     curator_decisions: dict[str, str] = {}
     for d in qd.get("decisions", []):
         eid = d.get("event_id", "")
@@ -737,7 +857,13 @@ def run_governance_pipeline(
             continue
         try:
             reactions = _fetch_reactions(owner, repo_name, issue_number, token=token)
-        except RuntimeError:
+        except GovernanceError as exc:
+            if not allow_partial:
+                raise
+            logger.warning(
+                "Proceeding without reactions for item '%s' issue #%s because "
+                "partial governance is allowed: %s", item_id, issue_number, exc,
+            )
             reactions = []
 
         tally = tally_item_votes(reactions, blacklist)
@@ -785,7 +911,7 @@ def run_governance_pipeline(
         eligible_up = 0
         eligible_down = 0
         for user in tally["non_conflict_pool"]:
-            if not check_user_eligibility(user, policy_cfg, token=token, cache=eligible_cache):
+            if not check_user_eligibility(user, policy_cfg, token=token, cache=eligible_cache, allow_partial=allow_partial):
                 continue
             if user in tally["user_up_ids"]:
                 eligible_up += 1
@@ -851,7 +977,7 @@ def run_governance_pipeline(
         quarantined_down = 0
 
         for user in tally["non_conflict_pool"]:
-            if not check_user_eligibility(user, policy_cfg, token=token, cache=eligible_cache):
+            if not check_user_eligibility(user, policy_cfg, token=token, cache=eligible_cache, allow_partial=allow_partial):
                 continue
             is_up = user in tally["user_up_ids"]
             is_down = user in tally["user_down_ids"]
@@ -1013,7 +1139,7 @@ def run_governance_pipeline(
                     "before_score": f"{eligible_up - eligible_down}",
                     "user_count": len(set(
                         u for u in tally["non_conflict_pool"]
-                        if check_user_eligibility(u, policy_cfg, token=token, cache=eligible_cache)
+                        if check_user_eligibility(u, policy_cfg, token=token, cache=eligible_cache, allow_partial=allow_partial)
                     )),
                     "event_id": stable_event_id,
                 }
@@ -1031,7 +1157,7 @@ def run_governance_pipeline(
                     "before_score": f"{eligible_up - eligible_down}",
                     "user_count": len(set(
                         u for u in tally["non_conflict_pool"]
-                        if check_user_eligibility(u, policy_cfg, token=token, cache=eligible_cache)
+                        if check_user_eligibility(u, policy_cfg, token=token, cache=eligible_cache, allow_partial=allow_partial)
                     )),
                     "event_id": stable_event_id,
                 }

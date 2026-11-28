@@ -1,0 +1,16 @@
+[package]
+name = "loot-host"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "A tiny wasmtime host used only to prove the LOOT module's output."
+
+# Proof harness only: kept out of the repository workspace, like the module.
+[workspace]
+
+[dependencies]
+wasmtime = "=50.0.1"
+wasmtime-wasi = "=50.0.1"
+
+[profile.release]
+opt-level = 3

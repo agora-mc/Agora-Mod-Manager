@@ -167,19 +167,145 @@ impl AppPaths {
         self.root.join("local_state.db")
     }
 
+    /// The short-lived record `games instance launch` leaves for `games wrap` to pick up.
+    pub fn pending_launch_path(&self) -> PathBuf {
+        self.root.join("pending-launch.json")
+    }
+
     /// Path to the cached read-only registry SQLite database.
     pub fn registry_db(&self) -> PathBuf {
         self.root.join("registry.db")
     }
 
     /// Path to the registry Ed25519 signature sidecar.
+    ///
+    /// Kept for reading a cache written before signed bundles. New installs
+    /// carry the signature inside [`Self::registry_bundle`].
     pub fn registry_signature(&self) -> PathBuf {
         self.root.join("registry.db.sig")
+    }
+
+    /// The signed catalog bundle: the database and its signature as one file.
+    pub fn registry_bundle(&self) -> PathBuf {
+        self.root.join("registry.bundle")
+    }
+
+    /// The previous verified bundle, kept so a crash during replacement leaves a
+    /// usable catalog behind.
+    pub fn registry_bundle_previous(&self) -> PathBuf {
+        self.root.join("registry.bundle.prev")
+    }
+
+    /// A verified catalog bundle written durably before it is published over
+    /// [`Self::registry_bundle`]. Its presence after a crash is how an
+    /// interrupted install is finished instead of being lost.
+    pub fn registry_bundle_staged(&self) -> PathBuf {
+        self.root.join("registry.bundle.staged")
+    }
+
+    /// The trust this client has learned from verified catalogs: introduced
+    /// keys and revocations. It only ever grows.
+    pub fn registry_trust_state(&self) -> PathBuf {
+        self.root.join("registry.trust")
     }
 
     /// Root directory for all instances (`instances/`).
     pub fn instances_root(&self) -> PathBuf {
         self.root.join("instances")
+    }
+
+    /// Root directory for pinned bases when placed in the data folder (`bases/`).
+    pub fn bases_dir(&self) -> PathBuf {
+        self.root.join("bases")
+    }
+
+    /// Directory for pinned base manifests (`bases/manifests/`).
+    pub fn base_manifests_dir(&self) -> PathBuf {
+        self.root.join("bases").join("manifests")
+    }
+
+    /// The bases roots outside the data folder that Agora created (`bases/roots.json`). Removal
+    /// only deletes base folders directly inside one of these or `bases_dir`.
+    pub fn base_roots_file(&self) -> PathBuf {
+        self.root.join("bases").join("roots.json")
+    }
+
+    /// Manifest path for a specific pinned base (`bases/manifests/<base_id>.json`).
+    pub fn base_manifest_path(&self, base_id: &str) -> PathBuf {
+        self.base_manifests_dir().join(format!("{base_id}.json"))
+    }
+
+    /// Root directory for the content store (`content/`).
+    pub fn content_root(&self) -> PathBuf {
+        self.root.join("content")
+    }
+
+    /// Root directory for content objects (`content/objects/`).
+    pub fn content_objects_dir(&self) -> PathBuf {
+        self.content_root().join("objects")
+    }
+
+    /// Path to a specific content object (`content/objects/<hh>/<sha256>`).
+    pub fn content_object_path(&self, sha256: &str) -> PathBuf {
+        let prefix = if sha256.len() >= 2 {
+            &sha256[..2]
+        } else {
+            "xx"
+        };
+        self.content_objects_dir().join(prefix).join(sha256)
+    }
+
+    /// Root directory for content item manifests (`content/items/`).
+    pub fn content_items_dir(&self) -> PathBuf {
+        self.content_root().join("items")
+    }
+
+    /// Path to a specific content item manifest (`content/items/<item_id>.json`).
+    pub fn content_item_path(&self, item_id: &str) -> PathBuf {
+        self.content_items_dir().join(format!("{item_id}.json"))
+    }
+
+    /// Root directory for content extraction staging (`content/staging/`).
+    pub fn content_staging_dir(&self) -> PathBuf {
+        self.content_root().join("staging")
+    }
+
+    /// Directory for the records an in-flight operation writes before it reuses or adds an object
+    /// (`content/pending/`), so a collection keeps those objects until the operation's own record
+    /// is published (MASTER_SPEC §32.8).
+    pub fn content_pending_dir(&self) -> PathBuf {
+        self.content_root().join("pending")
+    }
+
+    /// Root directory for user-file journaled swaps (`user-files/`).
+    pub fn user_files_root(&self) -> PathBuf {
+        self.root.join("user-files")
+    }
+
+    /// Session directory for a specific game and store (`user-files/<game>_<store>/`).
+    pub fn user_files_dir(&self, game: &str, store: &str) -> PathBuf {
+        self.user_files_root().join(format!("{game}_{store}"))
+    }
+
+    /// Journal path for a specific game and store (`user-files/<game>_<store>/journal.json`).
+    pub fn user_files_journal_path(&self, game: &str, store: &str) -> PathBuf {
+        self.user_files_dir(game, store).join("journal.json")
+    }
+
+    /// Backup directory for a specific game and store (`user-files/<game>_<store>/backup/`).
+    pub fn user_files_backup_dir(&self, game: &str, store: &str) -> PathBuf {
+        self.user_files_dir(game, store).join("backup")
+    }
+
+    /// Swap journals of tools that run on the real install folder (`tool-swaps/`).
+    pub fn tool_swaps_root(&self) -> PathBuf {
+        self.root.join("tool-swaps")
+    }
+
+    /// The swap journal of one game and store (`tool-swaps/<game>_<store>.json`), present only while
+    /// a tool run has the real install's `Data` folder swapped (MASTER_SPEC §26.9).
+    pub fn tool_swap_journal_path(&self, game: &str, store: &str) -> PathBuf {
+        self.tool_swaps_root().join(format!("{game}_{store}.json"))
     }
 
     /// Content-addressed cache of verified downloads shared by plan-time and
@@ -240,9 +366,16 @@ impl AppPaths {
         self.root.join("recently-deleted")
     }
 
+    /// Agora-managed holding area for deleted generic game instances
+    /// (`recently-deleted-games/`). Kept apart from Minecraft's area so each
+    /// list can be shown and cleaned up without knowing the other's entries.
+    pub fn recently_deleted_games_root(&self) -> PathBuf {
+        self.root.join("recently-deleted-games")
+    }
+
     /// Root directory for reusable instance templates (`templates/`).
     pub fn templates_root(&self) -> PathBuf {
-        crate::template_service::templates_root(&self.root)
+        self.root.join("templates")
     }
 
     /// Shared screenshot folder (`screenshots/`).
@@ -614,6 +747,19 @@ mod tests {
         assert_eq!(p.snapshots_root(), Path::new("/base/snapshots"));
         assert_eq!(p.locks_root(), Path::new("/base/locks"));
         assert_eq!(p.staging_root(), Path::new("/base/staging"));
+        assert_eq!(p.user_files_root(), Path::new("/base/user-files"));
+        assert_eq!(
+            p.user_files_dir("skyrim-se", "steam"),
+            Path::new("/base/user-files/skyrim-se_steam")
+        );
+        assert_eq!(
+            p.user_files_journal_path("skyrim-se", "steam"),
+            Path::new("/base/user-files/skyrim-se_steam/journal.json")
+        );
+        assert_eq!(
+            p.user_files_backup_dir("skyrim-se", "steam"),
+            Path::new("/base/user-files/skyrim-se_steam/backup")
+        );
     }
 
     // ------------------------------------------------------------------

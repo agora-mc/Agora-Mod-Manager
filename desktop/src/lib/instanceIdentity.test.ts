@@ -8,7 +8,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { instanceInitials, instanceTint, loaderHue } from './instanceIdentity';
+import { instanceFamilyHue, instanceInitials, instanceTint, loaderHue } from './instanceIdentity';
 
 /** Shortest arc between two hues on the colour wheel. */
 function hueDistance(a: number, b: number): number {
@@ -86,5 +86,27 @@ describe('instanceInitials', () => {
   it('falls back rather than rendering nothing', () => {
     expect(instanceInitials('')).toBe('?');
     expect(instanceInitials('---')).toBe('?');
+  });
+});
+
+describe('instanceFamilyHue', () => {
+  it('replaces the loader family, so instances of one game do not all share a colour', () => {
+    // Every instance of another game has no loader; before, they were all the teal fallback.
+    const seeds = ['skyrim-1', 'skyrim-2', 'skyrim-3', 'skyrim-4', 'skyrim-5', 'skyrim-6'];
+    const families = seeds.map(instanceFamilyHue);
+    expect(new Set(families).size).toBe(seeds.length);
+    const spread = Math.max(...families) - Math.min(...families);
+    expect(spread).toBeGreaterThan(90);
+  });
+
+  it('keeps the tile inside the family it gives, and stable', () => {
+    const family = instanceFamilyHue('grounded-1');
+    expect(family).toBe(instanceFamilyHue('grounded-1'));
+    expect(hueDistance(instanceTint('grounded-1', null, family).hueA, family)).toBeLessThanOrEqual(11);
+  });
+
+  it('leaves Minecraft tiles unchanged when no family is given', () => {
+    expect(instanceTint('inst-abc', 'fabric', undefined)).toEqual(instanceTint('inst-abc', 'fabric'));
+    expect(instanceTint('inst-abc', 'fabric', null)).toEqual(instanceTint('inst-abc', 'fabric'));
   });
 });

@@ -39,6 +39,8 @@ import { LoaderChooser } from './LoaderChooser';
 import { DatapackWorldsNote } from './DatapackWorldsNote';
 import { useControllerLayer } from '@/features/controller/useControllerLayer';
 import { cn, formatDateTime } from '@/lib/utils';
+import { useConfirm } from '@/components/ui/confirm';
+import { askUnverifiedInstall, LOW_SECURITY_CODE } from '@/lib/unverifiedConsent';
 
 // ---------------------------------------------------------------------------
 // User choices model
@@ -284,6 +286,7 @@ export function InstallFlow({
   const [state, dispatch] = useReducer(flowReducer, { phase: 'closed' } as FlowState);
   const panelRef = useRef<HTMLElement>(null);
   const [resolutionIntent, setResolutionIntent] = useState(intent);
+  const { confirm } = useConfirm();
   const [settingAutoConfirmClean, setSettingAutoConfirmClean] = useState(false);
   const [settingAlwaysAutoConfirm, setSettingAlwaysAutoConfirm] = useState(false);
   const initialPlanRef = useRef<ResolvedInstallPlan | null>(initialPlan ?? null);
@@ -644,6 +647,16 @@ export function InstallFlow({
           outcome={state.outcome}
           instanceId={intent.targetInstance}
           onOpenInstance={() => onOpenInstance?.(intent.targetInstance)}
+          onInstallAnyway={() => {
+            setResolutionIntent((current) => ({
+              ...current,
+              overrides: {
+                ...current.overrides,
+                acceptHashConfirmation: true,
+              },
+            }));
+            dispatch({ type: 'retry' });
+          }}
           onClose={handleClose}
           focusPrimary={resultFocusInPanel}
         />;
@@ -655,6 +668,15 @@ export function InstallFlow({
           retryable={state.retryable}
           onRetry={() => dispatch({ type: 'retry' })}
           canTryClosest={state.code === 'ERR_VERSION_NOT_FOUND'}
+          canInstallUnverified={state.code === LOW_SECURITY_CODE}
+          onInstallUnverified={async () => {
+            if (!await askUnverifiedInstall(confirm, state.message)) return;
+            setResolutionIntent((current) => ({
+              ...current,
+              overrides: { ...current.overrides, allowUnverified: true },
+            }));
+            dispatch({ type: 'retry' });
+          }}
           canSkip={Boolean(skippedItemId)}
           onSkip={() => {
             if (!skippedItemId) return;
@@ -1516,10 +1538,12 @@ function installPhaseLabel(phase: ProgressEvent['phase']): string {
   }
 }
 
-function ResultView({ outcome, instanceId, onOpenInstance, onClose, focusPrimary }: {
+function ResultView({ outcome, instanceId, onOpenInstance, onInstallAnyway, onClose, focusPrimary }: {
   outcome: InstallOutcome;
   instanceId: string;
   onOpenInstance: () => void;
+  /** Retry the plan with the user's confirmation for a download that did not match its pin. */
+  onInstallAnyway: () => void;
   onClose: () => void;
   /** Focus was in the panel the install ran in: keep it there, on the primary action. */
   focusPrimary: boolean;
@@ -1632,6 +1656,31 @@ function ResultView({ outcome, instanceId, onOpenInstance, onClose, focusPrimary
       {outcome.type === 'failed' && (
         <>
           <div className="rounded-lg bg-destructive/10 p-3 text-sm text-red-700 dark:text-red-300">{outcome.error}</div>
+          {outcome.hashConfirmation && (
+            <div className="space-y-2 rounded-lg border border-amber-500/50 p-3 text-sm">
+              <p>
+                {outcome.hashConfirmation.file}
+                {outcome.hashConfirmation.release ? ` (release ${outcome.hashConfirmation.release})` : ''} does not match the{' '}
+                {outcome.hashConfirmation.expectedFrom === 'curator_pin'
+                  ? 'checksum its curator pinned'
+                  : 'checksum recorded when it was installed before'}.
+              </p>
+              <p className="break-all font-mono text-xs text-muted-foreground">
+                expected {outcome.hashConfirmation.expected}
+                <br />
+                downloaded {outcome.hashConfirmation.actual}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                Install it only if you have checked where it came from.
+              </p>
+              <button
+                onClick={onInstallAnyway}
+                className="rounded-lg border border-amber-500/60 px-3 py-1.5 text-sm font-medium hover:bg-amber-500/10"
+              >
+                Install anyway
+              </button>
+            </div>
+          )}
           {outcome.rollbackPerformed && (
             <p className="text-xs text-muted-foreground">The recovery snapshot was restored automatically.</p>
           )}
@@ -1679,7 +1728,7 @@ function ResultView({ outcome, instanceId, onOpenInstance, onClose, focusPrimary
   );
 }
 
-function ErrorView({ message, retryable, onRetry, canTryClosest, onTryClosest, canSkip, onSkip, onClose }: {
+function ErrorView({ message, retryable, onRetry, canTryClosest, onTryClosest, canSkip, onSkip, canInstallUnverified, onInstallUnverified, onClose }: {
   message: string;
   retryable: boolean;
   onRetry: () => void;
@@ -1687,6 +1736,9 @@ function ErrorView({ message, retryable, onRetry, canTryClosest, onTryClosest, c
   onTryClosest: () => void;
   canSkip: boolean;
   onSkip: () => void;
+  /** Core asked whether to install files with no integrity information. */
+  canInstallUnverified: boolean;
+  onInstallUnverified: () => void;
   onClose: () => void;
 }) {
   return (
@@ -1702,6 +1754,11 @@ function ErrorView({ message, retryable, onRetry, canTryClosest, onTryClosest, c
         {canSkip && (
           <button onClick={onSkip} className="rounded-lg border border-input px-4 py-2 text-sm font-medium hover:bg-accent">
             Skip This Mod
+          </button>
+        )}
+        {canInstallUnverified && (
+          <button onClick={onInstallUnverified} className="rounded-lg border border-destructive px-4 py-2 text-sm font-medium text-destructive hover:bg-destructive/10">
+            Install Anyway
           </button>
         )}
         {retryable && <button onClick={onRetry} className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">Retry</button>}

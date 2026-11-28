@@ -6,6 +6,9 @@ use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
 
+use crate::app_paths::AppPaths;
+use crate::lock_manager::{LockGuard, LockManager, LockResource};
+
 use sha2::Digest;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -35,54 +38,6 @@ const SNAPSHOT_SCOPE_SCHEMA_VERSION: u32 = 4;
 const LIVE_METADATA_FINGERPRINT_SCHEMA_VERSION: u32 = 4;
 const LIVE_FILE_INDEX_SCHEMA_VERSION: u32 = 1;
 
-pub(crate) const TRACKED_ENTRIES: &[&str] = &[
-    "mods",
-    "config",
-    // Pack overrides and instance templates write these, so a rollback that
-    // did not capture them left the failed operation's partial writes in place
-    // while reporting a clean restore.
-    "defaultconfigs",
-    "kubejs",
-    "resourcepacks",
-    "shaderpacks",
-    "datapacks",
-    "saves",
-    "options.txt",
-    "instance_manifest.json",
-];
-
-/// Tracked entries captured by the mandatory pre-launch snapshot.
-///
-/// World data (`saves/`) is deliberately excluded: it changes on every game
-/// session, so including it forced the pre-launch path to re-walk and re-hash
-/// potentially gigabytes of world files each launch.  Pre-launch recovery
-/// points therefore cover the mod/config/layout state that actually causes
-/// launch failures; world data remains protected by the full snapshots taken
-/// by install, import, and explicit backup operations.
-const PRELAUNCH_TRACKED_ENTRIES: &[&str] = &[
-    "mods",
-    "config",
-    "defaultconfigs",
-    "kubejs",
-    "resourcepacks",
-    "shaderpacks",
-    "datapacks",
-    "options.txt",
-    "instance_manifest.json",
-];
-
-/// The tracked-entry set captured by mandatory pre-launch snapshots
-/// (everything except `saves/`).
-pub fn prelaunch_tracked_entries() -> &'static [&'static str] {
-    PRELAUNCH_TRACKED_ENTRIES
-}
-
-/// The full tracked-entry set, the starting point for an operation's recovery
-/// scope. See [`recovery_scope_for_writes`].
-pub fn default_tracked_entries() -> &'static [&'static str] {
-    TRACKED_ENTRIES
-}
-
 /// Stable identity for the exact roots covered by a snapshot receipt.
 ///
 /// The scope is part of the reuse contract: a full backup that includes
@@ -108,6 +63,11 @@ pub struct Snapshot {
     /// were recorded; [`Snapshot::effective_origin`] infers those from the label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<SnapshotOrigin>,
+    /// Why this entry could not be read, when it was found on disk but its
+    /// manifest (or legacy ZIP) is damaged. Such an entry is listed so a person
+    /// can see and delete it; it is never treated as a usable snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreadable: Option<String>,
 }
 
 /// Why a snapshot was taken. Retention uses it so a rotation of automatic
@@ -168,6 +128,11 @@ impl Snapshot {
             self.effective_origin(),
             SnapshotOrigin::User | SnapshotOrigin::Migration | SnapshotOrigin::Lock
         )
+    }
+
+    /// A snapshot found on disk whose manifest or archive cannot be read.
+    pub fn is_unreadable(&self) -> bool {
+        self.unreadable.is_some()
     }
 }
 
@@ -327,11 +292,15 @@ fn ensure_mutation_journal(instance_dir: &Path) -> Result<u64, String> {
 
 /// Whether a snapshot recorded by the mandatory pre-launch path can be reused
 /// without any filesystem walk.  O(1): a receipt read plus a journal read.
-pub fn prelaunch_snapshot_is_reusable(instance_dir: &Path, snapshot_id: &str) -> bool {
+pub fn prelaunch_snapshot_is_reusable(
+    instance_dir: &Path,
+    snapshot_id: &str,
+    prelaunch_entries: &[&str],
+) -> bool {
     let Some(validated) = read_snapshot_reuse_receipt(instance_dir, snapshot_id) else {
         return false;
     };
-    let expected_scope = snapshot_scope_id(PRELAUNCH_TRACKED_ENTRIES);
+    let expected_scope = snapshot_scope_id(prelaunch_entries);
     if validated.scope_id.as_deref() != Some(expected_scope.as_str()) {
         return false;
     }
@@ -372,6 +341,24 @@ struct SnapshotManifest {
     /// "covered and empty". See [`RestoreCoverage`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     scope: Option<Vec<SnapshotRoot>>,
+    /// Content-store item ids the captured state names, so removing an item
+    /// from the store can refuse while a snapshot still needs it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    content_refs: Vec<String>,
+    /// State that is not a file, written into the snapshot as data. Generic
+    /// game instances use it for their load-after rules, which live in the
+    /// database rather than in the instance folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state: Option<serde_json::Value>,
+}
+
+/// Data a snapshot records beside its files.
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotAux {
+    /// Content-store item ids the captured state names.
+    pub content_refs: Vec<String>,
+    /// State that is not a file (for example, database rows).
+    pub state: Option<serde_json::Value>,
 }
 
 /// What a covered root looked like when the snapshot was taken.
@@ -461,6 +448,15 @@ pub struct RestoreOutcome {
     /// preserved rather than deleted, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preserved_recovery_dir: Option<String>,
+    /// The snapshot taken just before the restore (a generic game instance
+    /// takes one), so the restore itself can be undone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undo_snapshot_id: Option<String>,
+    /// Things the person restoring should know about what the restore did, in words they can read.
+    /// A folder the snapshot covers but the game no longer declares is restored anyway and named
+    /// here (MASTER_SPEC §32.7), never restored quietly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -476,6 +472,19 @@ struct SnapshotFileEntry {
     /// store instead of duplicating them in every snapshot archive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     blob_sha256: Option<String>,
+    /// A declared state file that did not exist when the snapshot was taken.
+    /// Restoring removes it, rather than leaving a file the snapshot says was
+    /// absent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub absent: bool,
+}
+
+/// One state file a game-instance snapshot records as data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotInputFile {
+    pub relative_path: String,
+    /// `None` means the file did not exist.
+    pub contents: Option<Vec<u8>>,
 }
 
 fn legacy_snapshot_schema_version() -> u32 {
@@ -517,22 +526,128 @@ struct LiveFileIndexEntry {
 /// root. Tests and callers that pass a standalone directory still get a
 /// sibling object store, while normal instances resolve to `<app>/snapshot-objects`.
 pub(crate) fn snapshot_objects_dir(instance_dir: &Path) -> PathBuf {
+    crate::content_store::migrate::legacy_root(&snapshot_store_paths(instance_dir))
+}
+
+/// The app data root a live instance belongs to. Shared stores and the trash
+/// roots are siblings of `instances/`, so the same derivation serves every scan
+/// that starts from an instance directory alone.
+fn snapshot_app_root(instance_dir: &Path) -> PathBuf {
     let instances_root = instance_dir.parent().unwrap_or(instance_dir);
-    let app_root = if instances_root
+    if instances_root
         .file_name()
         .is_some_and(|name| name == "instances")
     {
-        instances_root.parent().unwrap_or(instances_root)
-    } else {
         instances_root
-    };
-    app_root.join("snapshot-objects")
+            .parent()
+            .unwrap_or(instances_root)
+            .to_path_buf()
+    } else {
+        instances_root.to_path_buf()
+    }
 }
 
+/// The paths a capture writes through: the shared object store, the lock files and the owner
+/// records all belong to the app data root the instance is in.
+pub(crate) fn snapshot_store_paths(instance_dir: &Path) -> AppPaths {
+    AppPaths::from_root(snapshot_app_root(instance_dir))
+}
+
+/// The legacy `snapshot-objects` location of one blob. Nothing writes here any more: it is read
+/// until B3b has moved what is here into the content store.
 pub(crate) fn snapshot_blob_path(instance_dir: &Path, hash: &str) -> PathBuf {
     snapshot_objects_dir(instance_dir)
         .join(&hash[..2.min(hash.len())])
         .join(hash)
+}
+
+/// Where a snapshot blob's bytes are: the one content store first, then the legacy
+/// `snapshot-objects` store until it has been migrated (MASTER_SPEC §32.8).
+///
+/// A location counts only when it can be trusted. The content store is judged by its own rule — an
+/// object it protected, of the recorded size — which is the rule `content_store::read_object_bytes`
+/// applies; the legacy store is judged by its receipt or a full hash, exactly as before. A caller
+/// that reads the bytes then verifies them again as it always has, so this only chooses the place.
+pub(crate) fn snapshot_blob_source(
+    instance_dir: &Path,
+    hash: &str,
+    size: u64,
+) -> Result<Option<PathBuf>, String> {
+    let paths = snapshot_store_paths(instance_dir);
+    let canonical_hash = hash.to_ascii_lowercase();
+    let content = paths.content_object_path(&canonical_hash);
+    if content_blob_is_trustworthy(&content, size, &canonical_hash)? {
+        return Ok(Some(content));
+    }
+    if crate::content_store::migrate::legacy_store_active(&paths) {
+        let legacy = snapshot_blob_path(instance_dir, hash);
+        if legacy_blob_metadata(&paths, &legacy)?.is_some() {
+            let receipt_path = crate::artifact_receipt::receipt_path(&legacy);
+            let receipt =
+                snapshot_object_check(&receipt_path, fs::symlink_metadata(&receipt_path))?
+                    .is_some_and(|entry| {
+                        entry.is_file() && !agora_game_api::is_a_reparse_point(&entry)
+                    })
+                    && crate::artifact_receipt::is_verified(
+                        &legacy,
+                        "sha256",
+                        hash,
+                        i64::try_from(size).ok(),
+                    );
+            if receipt
+                || snapshot_object_check(&legacy, check_blob_file(&legacy, hash, size))?
+                    == Some(true)
+            {
+                return Ok(Some(legacy));
+            }
+        }
+    }
+    // Migration may have published the object after the first lookup.
+    Ok(content_blob_is_trustworthy(&content, size, &canonical_hash)?.then_some(content))
+}
+
+fn content_blob_is_trustworthy(path: &Path, size: u64, hash: &str) -> Result<bool, String> {
+    use crate::content_store::ContentError;
+
+    match crate::content_store::object_is_trustworthy(path, size, hash) {
+        Ok(verified) => Ok(verified),
+        Err(ContentError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "could not check snapshot object {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn snapshot_object_check<T>(path: &Path, result: std::io::Result<T>) -> Result<Option<T>, String> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "could not check snapshot object {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn legacy_blob_metadata(paths: &AppPaths, blob: &Path) -> Result<Option<fs::Metadata>, String> {
+    let root = crate::content_store::migrate::legacy_root(paths);
+    let Some(shard) = blob.parent() else {
+        return Ok(None);
+    };
+    if crate::content_store::migrate::object_name(&root, blob).is_none() {
+        return Ok(None);
+    }
+    for directory in [root.as_path(), shard] {
+        let Some(entry) = snapshot_object_check(directory, fs::symlink_metadata(directory))? else {
+            return Ok(None);
+        };
+        if !entry.is_dir() || agora_game_api::is_a_reparse_point(&entry) {
+            return Ok(None);
+        }
+    }
+    Ok(snapshot_object_check(blob, fs::symlink_metadata(blob))?
+        .filter(|entry| entry.is_file() && !agora_game_api::is_a_reparse_point(entry)))
 }
 
 /// Legacy v1/v2 snapshots are retained as ZIPs and remain readable.
@@ -561,6 +676,9 @@ pub fn snapshot_file_index(
         let mut result = Vec::with_capacity(manifest.files.len());
         let mut seen = HashSet::new();
         for indexed in &manifest.files {
+            if indexed.absent {
+                continue;
+            }
             validate_relative_path(&indexed.relative_path)?;
             if !seen.insert(indexed.relative_path.clone()) {
                 return Err(format!(
@@ -644,11 +762,110 @@ pub fn snapshot_file_index(
     Ok(result)
 }
 
+/// One file a snapshot records, including a declared file the instance did not
+/// have. Backup export needs the absent entries: restoring them is what removes
+/// a file the captured state did not contain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotFileView {
+    pub relative_path: String,
+    pub size: u64,
+    pub sha256: Option<String>,
+    pub absent: bool,
+}
+
+/// Every file entry a snapshot records, absent ones included, in path order.
+pub fn snapshot_file_entries(
+    instance_dir: &Path,
+    snapshot_id: &str,
+) -> Result<Vec<SnapshotFileView>, String> {
+    validate_snapshot_id(snapshot_id)?;
+    let manifest_path = snapshot_manifest_path(instance_dir, snapshot_id);
+    if manifest_path.is_file() {
+        let manifest = read_manifest_file(&manifest_path, snapshot_id)?;
+        let mut result = Vec::with_capacity(manifest.files.len());
+        let mut seen = HashSet::new();
+        for indexed in &manifest.files {
+            validate_relative_path(&indexed.relative_path)?;
+            if !seen.insert(indexed.relative_path.clone()) {
+                return Err(format!(
+                    "snapshot manifest contains duplicate path {}",
+                    indexed.relative_path
+                ));
+            }
+            if !indexed.absent {
+                let hash = indexed
+                    .blob_sha256
+                    .as_deref()
+                    .or(indexed.sha256.as_deref())
+                    .ok_or_else(|| {
+                        format!(
+                            "snapshot manifest has no content hash for {}",
+                            indexed.relative_path
+                        )
+                    })?;
+                validate_blob_hash(hash)?;
+            }
+            result.push(SnapshotFileView {
+                relative_path: indexed.relative_path.clone(),
+                size: indexed.size,
+                sha256: indexed
+                    .sha256
+                    .clone()
+                    .or_else(|| indexed.blob_sha256.clone()),
+                absent: indexed.absent,
+            });
+        }
+        result.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+        return Ok(result);
+    }
+
+    // Legacy ZIP snapshots cannot record an absent file: every entry in the
+    // archive is a file that existed.
+    snapshot_file_index(instance_dir, snapshot_id).map(|entries| {
+        entries
+            .into_iter()
+            .map(|entry| SnapshotFileView {
+                relative_path: entry.path,
+                size: entry.size,
+                sha256: Some(entry.sha256),
+                absent: false,
+            })
+            .collect()
+    })
+}
+
+/// The non-file state a snapshot recorded, and the content-store item ids its
+/// captured state names. A legacy ZIP or an older manifest records neither.
+pub fn snapshot_aux(instance_dir: &Path, snapshot_id: &str) -> Result<SnapshotAux, String> {
+    validate_snapshot_id(snapshot_id)?;
+    let manifest_path = snapshot_manifest_path(instance_dir, snapshot_id);
+    if manifest_path.is_file() {
+        let manifest = read_manifest_file(&manifest_path, snapshot_id)?;
+        return Ok(SnapshotAux {
+            content_refs: manifest.content_refs,
+            state: manifest.state,
+        });
+    }
+    let zip_path = snapshot_zip_path(instance_dir, snapshot_id);
+    let file = fs::File::open(&zip_path)
+        .map_err(|e| format!("failed to open snapshot {snapshot_id}: {e}"))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| format!("failed to read snapshot zip: {e}"))?;
+    let manifest = read_manifest(&mut archive, snapshot_id)?;
+    Ok(SnapshotAux {
+        content_refs: manifest.content_refs,
+        state: manifest.state,
+    })
+}
+
 /// Scan the current live state using the exact same tracked paths as snapshot
 /// creation.  Paths always use forward slashes, even on Windows.
-pub fn live_file_index(instance_dir: &Path) -> Result<Vec<crate::lkg::FileEntry>, String> {
+pub fn live_file_index(
+    instance_dir: &Path,
+    entries: &[&str],
+) -> Result<Vec<crate::lkg::FileEntry>, String> {
     let mut result = Vec::new();
-    for entry_name in TRACKED_ENTRIES {
+    for entry_name in entries {
         let path = instance_dir.join(entry_name);
         if path.is_file() {
             let contents =
@@ -669,8 +886,8 @@ pub fn live_file_index(instance_dir: &Path) -> Result<Vec<crate::lkg::FileEntry>
 /// Build a metadata-only identity for the tracked live state.  This is used
 /// only to decide whether the last exact snapshot can be reused; whenever the
 /// receipt is absent or differs, callers fall back to [`live_file_index`].
-pub fn live_metadata_fingerprint(instance_dir: &Path) -> Result<String, String> {
-    live_metadata_fingerprint_scoped(instance_dir, TRACKED_ENTRIES)
+pub fn live_metadata_fingerprint(instance_dir: &Path, entries: &[&str]) -> Result<String, String> {
+    live_metadata_fingerprint_scoped(instance_dir, entries)
 }
 
 /// [`live_metadata_fingerprint`] restricted to an explicit tracked-entry set
@@ -691,8 +908,9 @@ pub fn live_metadata_fingerprint_scoped(
 pub fn snapshot_matches_live_incremental(
     instance_dir: &Path,
     snapshot_id: &str,
+    entries: &[&str],
 ) -> Result<bool, String> {
-    snapshot_matches_live_incremental_scoped(instance_dir, snapshot_id, TRACKED_ENTRIES)
+    snapshot_matches_live_incremental_scoped(instance_dir, snapshot_id, entries)
 }
 
 /// [`snapshot_matches_live_incremental`] restricted to an explicit
@@ -731,7 +949,7 @@ pub fn snapshot_matches_live_incremental_scoped(
         let (hash, blob_valid) = if let Some(cached) = cached {
             (
                 cached.sha256.clone(),
-                snapshot_blob_is_available(instance_dir, &cached.sha256, cached.size),
+                snapshot_blob_is_available(instance_dir, &cached.sha256, cached.size)?,
             )
         } else {
             (hash_live_file(instance_dir, &entry.relative_path)?, true)
@@ -740,14 +958,15 @@ pub fn snapshot_matches_live_incremental_scoped(
         if !blob_valid {
             matches = false;
         }
-        if !reference
-            .get(&entry.relative_path)
-            .is_some_and(|(expected_hash, expected_size)| {
-                *expected_size == entry.size
-                    && expected_hash.eq_ignore_ascii_case(&hash)
-                    && snapshot_blob_is_available(instance_dir, expected_hash, *expected_size)
-            })
-        {
+        let reference_matches = match reference.get(&entry.relative_path) {
+            Some((expected_hash, expected_size))
+                if *expected_size == entry.size && expected_hash.eq_ignore_ascii_case(&hash) =>
+            {
+                snapshot_blob_is_available(instance_dir, expected_hash, *expected_size)?
+            }
+            _ => false,
+        };
+        if !reference_matches {
             matches = false;
         }
         refreshed.push(entry);
@@ -957,28 +1176,20 @@ fn hash_live_file(instance_dir: &Path, relative_path: &str) -> Result<String, St
     Ok(sha256_hex(&contents))
 }
 
-fn snapshot_blob_is_available(instance_dir: &Path, hash: &str, size: u64) -> bool {
+fn snapshot_blob_is_available(instance_dir: &Path, hash: &str, size: u64) -> Result<bool, String> {
     if validate_blob_hash(hash).is_err() {
-        return false;
+        return Ok(false);
     }
-    let path = snapshot_blob_path(instance_dir, hash);
-    if crate::artifact_receipt::is_verified(&path, "sha256", hash, i64::try_from(size).ok()) {
-        return true;
-    }
-    if !blob_file_matches(&path, hash, size) {
-        return false;
-    }
-    let _ =
-        crate::artifact_receipt::record_verified(&path, "sha256", hash, i64::try_from(size).ok());
-    true
+    Ok(snapshot_blob_source(instance_dir, hash, size)?.is_some())
 }
 
 /// Return the metadata receipt associated with a snapshot, if it is valid.
 pub fn read_snapshot_metadata_fingerprint(
     instance_dir: &Path,
     snapshot_id: &str,
+    entries: &[&str],
 ) -> Option<String> {
-    read_snapshot_metadata_fingerprint_scoped(instance_dir, snapshot_id, TRACKED_ENTRIES)
+    read_snapshot_metadata_fingerprint_scoped(instance_dir, snapshot_id, entries)
 }
 
 /// Return a snapshot fingerprint only when it was created for the same
@@ -1065,13 +1276,9 @@ pub fn write_snapshot_metadata_fingerprint(
     instance_dir: &Path,
     snapshot_id: &str,
     fingerprint: &str,
+    entries: &[&str],
 ) -> Result<(), String> {
-    write_snapshot_metadata_fingerprint_scoped(
-        instance_dir,
-        snapshot_id,
-        fingerprint,
-        TRACKED_ENTRIES,
-    )
+    write_snapshot_metadata_fingerprint_scoped(instance_dir, snapshot_id, fingerprint, entries)
 }
 
 /// Persist a reuse receipt bound to both the immutable snapshot manifest and
@@ -1173,8 +1380,12 @@ fn walk_and_hash(
 /// is the right policy for install rollback points, imports, and explicit
 /// backups. The mandatory pre-launch path should use
 /// [`create_snapshot_scoped`] with [`PRELAUNCH_TRACKED_ENTRIES`] instead.
-pub fn create_snapshot(instance_dir: &Path, label: Option<&str>) -> Result<Snapshot, String> {
-    create_snapshot_with_origin(instance_dir, label, SnapshotOrigin::Automatic)
+pub fn create_snapshot(
+    instance_dir: &Path,
+    label: Option<&str>,
+    entries: &[&str],
+) -> Result<Snapshot, String> {
+    create_snapshot_with_origin(instance_dir, label, entries, SnapshotOrigin::Automatic)
 }
 
 /// [`create_snapshot`] recording why it was taken. Callers acting on a
@@ -1184,9 +1395,10 @@ pub fn create_snapshot(instance_dir: &Path, label: Option<&str>) -> Result<Snaps
 pub fn create_snapshot_with_origin(
     instance_dir: &Path,
     label: Option<&str>,
+    entries: &[&str],
     origin: SnapshotOrigin,
 ) -> Result<Snapshot, String> {
-    create_snapshot_scoped_with_origin(instance_dir, label, TRACKED_ENTRIES, origin)
+    create_snapshot_scoped_with_origin(instance_dir, label, entries, origin)
 }
 
 /// [`create_snapshot`] restricted to an explicit tracked-entry set.
@@ -1205,12 +1417,47 @@ pub fn create_snapshot_scoped_with_origin(
     entries: &[&str],
     origin: SnapshotOrigin,
 ) -> Result<Snapshot, String> {
+    create_snapshot_full(
+        instance_dir,
+        label,
+        entries,
+        origin,
+        &SnapshotAux::default(),
+    )
+}
+
+/// [`create_snapshot_scoped_with_origin`] that also records state which is not
+/// a file, and the content-store items the captured state names.
+pub fn create_snapshot_full(
+    instance_dir: &Path,
+    label: Option<&str>,
+    entries: &[&str],
+    origin: SnapshotOrigin,
+    aux: &SnapshotAux,
+) -> Result<Snapshot, String> {
+    create_snapshot_full_with_pause(instance_dir, label, entries, origin, aux, None)
+}
+
+/// Where a capture can be paused, so a test can run a collection in the window between deciding to
+/// reuse an object and publishing the manifest that names it (MASTER_SPEC §32.8). Production always
+/// passes `None`.
+pub(crate) type CapturePause = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+/// [`create_snapshot_full`] with a pause the test seam installs.
+pub(crate) fn create_snapshot_full_with_pause(
+    instance_dir: &Path,
+    label: Option<&str>,
+    entries: &[&str],
+    origin: SnapshotOrigin,
+    aux: &SnapshotAux,
+    pause: Option<&CapturePause>,
+) -> Result<Snapshot, String> {
     let id = uuid::Uuid::new_v4().to_string();
+    // The store this capture writes through, decided once before the first folder exists.
+    let paths = snapshot_store_paths(instance_dir);
 
     fs::create_dir_all(snapshots_dir(instance_dir))
         .map_err(|e| format!("failed to create snapshots dir: {e}"))?;
-    fs::create_dir_all(snapshot_objects_dir(instance_dir))
-        .map_err(|e| format!("failed to create snapshot object store: {e}"))?;
 
     let previous = read_live_file_index_cache(instance_dir)
         .unwrap_or_default()
@@ -1219,32 +1466,108 @@ pub fn create_snapshot_scoped_with_origin(
         .collect::<std::collections::BTreeMap<_, _>>();
     let (current, metadata_fingerprint) =
         collect_live_file_metadata_with_fingerprint(instance_dir, entries)?;
-    let mut files: Vec<SnapshotFileEntry> = Vec::with_capacity(current.len());
-    let mut live_index = Vec::with_capacity(current.len());
+
+    // What every captured file's object will be, decided before anything is placed: the pending
+    // record has to name all of them, or a collection running during the capture could free an
+    // object between the file that reuses it and the manifest that publishes it.
+    struct Planned {
+        entry: LiveFileIndexEntry,
+        sha256: String,
+        size: u64,
+        /// A new or changed file is staged and hashed once outside the store lock. Placement syncs
+        /// it before rename. A file the cache says is unchanged needs no advance staging.
+        staged: Option<crate::content_store::StagedObject>,
+    }
+    let mut planned: Vec<Planned> = Vec::with_capacity(current.len());
+    for entry in current {
+        let cached = previous.get(&entry.relative_path).filter(|cached| {
+            cached.size == entry.size
+                && cached.modified_ns == entry.modified_ns
+                && cached.file_identity == entry.file_identity
+        });
+        match cached {
+            // What the cache says is not the same question as what the store holds: the object may
+            // have been collected since the cache was written, and this capture has published no
+            // record yet. So the cache decides only what has to be staged; the store is asked
+            // again, under its lock, before the capture leans on an object it did not place.
+            Some(cached) => planned.push(Planned {
+                entry,
+                sha256: cached.sha256.clone(),
+                size: cached.size,
+                staged: None,
+            }),
+            None => {
+                let source = instance_dir.join(Path::new(&entry.relative_path));
+                let staged = crate::content_store::stage_object_from_file(&paths, &source)
+                    .map_err(|e| e.to_string())?;
+                if staged.size != entry.size {
+                    return Err(format!(
+                        "{} changed while it was being captured (the walk saw {} bytes, reading it \
+                         got {}); take the snapshot again",
+                        entry.relative_path, entry.size, staged.size
+                    ));
+                }
+                planned.push(Planned {
+                    entry,
+                    sha256: staged.sha256.clone(),
+                    size: staged.size,
+                    staged: Some(staged),
+                });
+            }
+        }
+    }
+
+    // The seam sits in the window the pending record exists to close: the capture has decided what
+    // each file reuses or adds, and has not yet published the record that names those objects.
+    if let Some(pause) = pause {
+        pause();
+    }
+
+    let hashes: Vec<String> = planned.iter().map(|plan| plan.sha256.clone()).collect();
+    let pending =
+        crate::content_store::pending::begin_pending_use(&paths, &hashes, "snapshot capture")?;
+
+    let mut files: Vec<SnapshotFileEntry> = Vec::with_capacity(planned.len());
+    let mut live_index = Vec::with_capacity(planned.len());
     let mut total_size: u64 = 0;
 
-    for mut entry in current {
-        let cached = previous.get(&entry.relative_path);
-        let reused = cached
-            .filter(|cached| {
-                cached.size == entry.size
-                    && cached.modified_ns == entry.modified_ns
-                    && cached.file_identity == entry.file_identity
-                    && snapshot_blob_is_available(instance_dir, &cached.sha256, cached.size)
-            })
-            .map(|cached| (cached.sha256.clone(), cached.size));
-        let (sha256, size) = if let Some(reused) = reused {
-            reused
-        } else {
-            let source = instance_dir.join(Path::new(&entry.relative_path));
-            store_snapshot_object(instance_dir, &source)?
-        };
+    for plan in planned {
+        let Planned {
+            entry,
+            sha256,
+            size,
+            staged,
+        } = plan;
+        match staged {
+            Some(staged) => staged.place(&paths).map_err(|e| e.to_string())?,
+            None => {
+                // Nothing was staged, so this capture is reusing an object already in a store. Ask
+                // the store, not the cache: a collection is free to have taken it before this
+                // capture registered anything, and a manifest that names a blob nobody placed is a
+                // restore that cannot happen. Placing it again is the answer.
+                if !snapshot_blob_is_available(instance_dir, &sha256, size)? {
+                    let source = instance_dir.join(Path::new(&entry.relative_path));
+                    let (placed_hash, placed_size) =
+                        crate::content_store::place_object_from_file(&paths, &source)
+                            .map_err(|e| e.to_string())?;
+                    if placed_hash != sha256 || placed_size != size {
+                        return Err(format!(
+                            "{} changed while it was being captured (expected {sha256} of {size} \
+                             bytes, stored {placed_hash} of {placed_size}); take the snapshot again",
+                            entry.relative_path
+                        ));
+                    }
+                }
+            }
+        }
+        let mut entry = entry;
         entry.sha256 = sha256.clone();
         files.push(SnapshotFileEntry {
             relative_path: entry.relative_path.clone(),
             size,
             sha256: Some(sha256.clone()),
             blob_sha256: Some(sha256),
+            absent: false,
         });
         live_index.push(entry);
         total_size += size;
@@ -1257,18 +1580,25 @@ pub fn create_snapshot_scoped_with_origin(
         file_count: files.len(),
         size_estimate: total_size,
         origin: Some(origin),
+        unreadable: None,
     };
 
     let manifest = SnapshotManifest {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
         snapshot: snapshot.clone(),
         files,
-        scope: Some(capture_root_states(instance_dir, entries)),
+        scope: Some(capture_root_states(instance_dir, entries)?),
+        content_refs: aux.content_refs.clone(),
+        state: aux.state.clone(),
     };
 
     let manifest_json = serde_json::to_vec_pretty(&manifest)
         .map_err(|e| format!("failed to serialize manifest: {e}"))?;
-    atomic_write(&snapshot_manifest_path(instance_dir, &id), &manifest_json)?;
+    // The manifest names every object this capture reused or added, so publishing it and dropping
+    // the pending record happen under one hold of the store lock: a collection sees the record or
+    // the manifest, and never the moment in between.
+    pending
+        .published(|| atomic_write(&snapshot_manifest_path(instance_dir, &id), &manifest_json))?;
     let _ = write_live_file_index_cache(instance_dir, live_index);
     // Reuse the fingerprint produced by the same traversal that built the
     // snapshot. This removes the former second full tree walk.
@@ -1282,116 +1612,292 @@ pub fn create_snapshot_scoped_with_origin(
     Ok(snapshot)
 }
 
-fn store_snapshot_object(instance_dir: &Path, source: &Path) -> Result<(String, u64), String> {
-    let objects_dir = snapshot_objects_dir(instance_dir);
-    fs::create_dir_all(&objects_dir)
-        .map_err(|e| format!("failed to create snapshot object store: {e}"))?;
-    let temp_path = objects_dir.join(format!(
-        ".{}.{}.tmp",
-        uuid::Uuid::new_v4(),
-        std::process::id()
-    ));
-    let source_file =
-        fs::File::open(source).map_err(|e| format!("failed to read {}: {e}", source.display()))?;
-    let mut reader = BufReader::new(source_file);
-    let temp_file = fs::File::create(&temp_path)
-        .map_err(|e| format!("failed to create snapshot object: {e}"))?;
-    let mut writer = BufWriter::new(temp_file);
-    let mut hasher = sha2::Sha256::new();
-    let mut size = 0u64;
-    let mut buffer = vec![0u8; 1024 * 1024];
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .map_err(|e| format!("failed to read {}: {e}", source.display()))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-        writer
-            .write_all(&buffer[..read])
-            .map_err(|e| format!("failed to write snapshot object: {e}"))?;
-        size += read as u64;
-    }
-    let hash = format!("{:x}", hasher.finalize());
-    writer
-        .flush()
-        .map_err(|e| format!("failed to flush snapshot object: {e}"))?;
-    writer
-        .get_ref()
-        .sync_all()
-        .map_err(|e| format!("failed to sync snapshot object: {e}"))?;
+/// Create a snapshot whose entries are declared state files supplied as data,
+/// rather than a walk of the instance's folders.
+///
+/// Generic game instances use this: a state file may live beside content
+/// (Cyberpunk's `mods/modlist.txt`), so capturing its folder would also copy
+/// mod bytes. The contents land in the same object store and manifest a walked
+/// snapshot uses.
+///
+/// `folders` names the scope entries that are folders (the folders the game's package declares,
+/// plus the shared loadout store). Every other captured path is recorded as the file it is, so a
+/// snapshot of `user/Plugins.txt` records that file and not the folder `user` around it: a restore
+/// of a folder owns everything in it, including files the game never declared (MASTER_SPEC §32.7).
+pub fn create_snapshot_from_data(
+    instance_dir: &Path,
+    label: Option<&str>,
+    files: &[SnapshotInputFile],
+    origin: SnapshotOrigin,
+    aux: &SnapshotAux,
+    folders: &[&str],
+) -> Result<Snapshot, String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    // The store this capture writes through, decided once before the first folder exists.
+    let paths = snapshot_store_paths(instance_dir);
+    fs::create_dir_all(snapshots_dir(instance_dir))
+        .map_err(|e| format!("failed to create snapshots dir: {e}"))?;
 
-    let destination = snapshot_blob_path(instance_dir, &hash);
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create snapshot object prefix: {e}"))?;
-    }
-    if destination.exists() {
-        let already_verified = crate::artifact_receipt::is_verified(
-            &destination,
-            "sha256",
-            &hash,
-            i64::try_from(size).ok(),
-        );
-        if already_verified || blob_file_matches(&destination, &hash, size) {
-            fs::remove_file(&temp_path)
-                .map_err(|e| format!("failed to discard duplicate snapshot object: {e}"))?;
-            if !already_verified {
-                let _ = crate::artifact_receipt::record_verified(
-                    &destination,
-                    "sha256",
-                    &hash,
-                    i64::try_from(size).ok(),
-                );
+    let mut entries = Vec::with_capacity(files.len());
+    let mut total_size = 0u64;
+    // The bytes are in hand, so every hash is known before the first object lands: one pending
+    // record covers them all until the manifest that names them is published.
+    let hashes: Vec<String> = files
+        .iter()
+        .filter_map(|file| file.contents.as_deref())
+        .map(sha256_hex)
+        .collect();
+    let pending =
+        crate::content_store::pending::begin_pending_use(&paths, &hashes, "snapshot capture")?;
+    let mut roots: std::collections::BTreeMap<String, RootState> =
+        std::collections::BTreeMap::new();
+    for file in files {
+        validate_relative_path(&file.relative_path)?;
+        let first = file
+            .relative_path
+            .split('/')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        // What the snapshot recorded is what it captured: a declared folder as that folder, and a
+        // mapped file as the file itself. Recording `user` for a captured `user/Plugins.txt` would
+        // claim a folder the game never declared, and everything else in it becomes something the
+        // restore — and its undo — own. `folders` are the declarations, so a plain comparison of
+        // the first component is exact enough: the same definition supplies both strings.
+        let (name, state) = if folders.iter().any(|folder| *folder == first) {
+            (first, RootState::Directory)
+        } else {
+            (file.relative_path.clone(), RootState::File)
+        };
+        roots.entry(name).or_insert(state);
+        match &file.contents {
+            Some(bytes) => {
+                let (hash, size) = crate::content_store::place_object_from_bytes(&paths, bytes)
+                    .map_err(|e| e.to_string())?;
+                total_size += size;
+                entries.push(SnapshotFileEntry {
+                    relative_path: file.relative_path.clone(),
+                    size,
+                    sha256: Some(hash.clone()),
+                    blob_sha256: Some(hash),
+                    absent: false,
+                });
             }
-        } else {
-            fs::remove_file(&destination)
-                .map_err(|e| format!("failed to replace corrupt snapshot object: {e}"))?;
-            fs::rename(&temp_path, &destination)
-                .map_err(|e| format!("failed to replace snapshot object: {e}"))?;
-        }
-    } else if let Err(error) = fs::rename(&temp_path, &destination) {
-        if destination.exists() {
-            fs::remove_file(&temp_path).map_err(|cleanup| {
-                format!("failed to discard duplicate snapshot object: {cleanup}")
-            })?;
-        } else {
-            return Err(format!("failed to commit snapshot object: {error}"));
+            None => entries.push(SnapshotFileEntry {
+                relative_path: file.relative_path.clone(),
+                size: 0,
+                sha256: None,
+                blob_sha256: None,
+                absent: true,
+            }),
         }
     }
-    let _ = crate::artifact_receipt::record_verified(
-        &destination,
-        "sha256",
-        &hash,
-        i64::try_from(size).ok(),
-    );
-    Ok((hash, size))
+    let scope = roots
+        .into_iter()
+        .map(|(name, state)| SnapshotRoot { name, state })
+        .collect();
+    let snapshot = Snapshot {
+        id: id.clone(),
+        label: label.map(String::from),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        file_count: entries.iter().filter(|entry| !entry.absent).count(),
+        size_estimate: total_size,
+        origin: Some(origin),
+        unreadable: None,
+    };
+    let manifest = SnapshotManifest {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        snapshot: snapshot.clone(),
+        files: entries,
+        scope: Some(scope),
+        content_refs: aux.content_refs.clone(),
+        state: aux.state.clone(),
+    };
+    let manifest_json = serde_json::to_vec_pretty(&manifest)
+        .map_err(|e| format!("failed to serialize manifest: {e}"))?;
+    pending
+        .published(|| atomic_write(&snapshot_manifest_path(instance_dir, &id), &manifest_json))?;
+    mark_snapshot_ready(instance_dir)?;
+    Ok(snapshot)
+}
+
+/// Restore a snapshot created by [`create_snapshot_from_data`]: verify every
+/// blob first, then write each declared file atomically. A file the snapshot
+/// recorded as absent is removed.
+///
+/// This is the data-snapshot mechanism and it stays file-level on purpose: a generic game's state
+/// files live beside content, so the files of a declared folder are restored one by one and a file
+/// created since the capture is left alone. Whole-root snapshots go through
+/// [`restore_snapshot`], which replaces whole folders (MASTER_SPEC §32.7).
+pub fn restore_snapshot_data(
+    instance_dir: &Path,
+    snapshot_id: &str,
+) -> Result<Vec<String>, String> {
+    restore_snapshot_data_with(instance_dir, snapshot_id, &|_, _| Ok(None))
+}
+
+/// How a restore writes one file: the snapshot's own bytes, or what the caller says instead.
+///
+/// A restore is the only writer of the live files it replaces, so a caller that must never let a
+/// stale value reach the disk — an instance's pin after a restore, MASTER_SPEC §32.8 — hands in a
+/// function that says what that file holds. Returning `None` writes the snapshot's bytes, and the
+/// bytes handed in are always the verified snapshot bytes, so an override changes what is written
+/// and not what was checked.
+pub type RestoreFileOverride<'a> = dyn Fn(&str, &[u8]) -> Result<Option<Vec<u8>>, String> + 'a;
+
+/// [`restore_snapshot_data`] with one file's contents overridden as it is written, so there is no
+/// moment at which the disk holds the value the caller refuses to keep.
+pub fn restore_snapshot_data_with(
+    instance_dir: &Path,
+    snapshot_id: &str,
+    overridden: &RestoreFileOverride<'_>,
+) -> Result<Vec<String>, String> {
+    validate_snapshot_id(snapshot_id)?;
+    let manifest_path = snapshot_manifest_path(instance_dir, snapshot_id);
+    // Fail closed (§32.13): only "the operating system said not found" means this is not a data
+    // snapshot. A path that cannot be examined is its own error.
+    match agora_game_api::probe(&manifest_path) {
+        agora_game_api::Probe::Present(_) => {}
+        agora_game_api::Probe::Absent => {
+            return Err(format!("snapshot {snapshot_id} is not a data snapshot"))
+        }
+        agora_game_api::Probe::CantTell(error) => {
+            return Err(format!(
+                "cannot tell what is at {}, so this snapshot cannot be restored: {error}",
+                manifest_path.display()
+            ))
+        }
+    }
+    let manifest = read_manifest_file(&manifest_path, snapshot_id)?;
+    let mut staged: Vec<(&SnapshotFileEntry, Vec<u8>)> = Vec::new();
+    for entry in &manifest.files {
+        validate_relative_path(&entry.relative_path)?;
+        if entry.absent {
+            continue;
+        }
+        let blob_hash = entry
+            .blob_sha256
+            .as_deref()
+            .or(entry.sha256.as_deref())
+            .ok_or_else(|| {
+                format!(
+                    "snapshot manifest has no content hash for {}",
+                    entry.relative_path
+                )
+            })?;
+        validate_blob_hash(blob_hash)?;
+        let blob_path = snapshot_blob_source(instance_dir, blob_hash, entry.size)?.ok_or_else(|| {
+            format!(
+                "failed to open snapshot object for {}: no object store holds {blob_hash} of {} bytes whose bytes match the hash (missing, or a hash mismatch)",
+                entry.relative_path, entry.size
+            )
+        })?;
+        let bytes = fs::read(&blob_path).map_err(|e| {
+            format!(
+                "failed to open snapshot object for {}: {e}",
+                entry.relative_path
+            )
+        })?;
+        if bytes.len() as u64 != entry.size {
+            return Err(format!(
+                "snapshot size mismatch for {}",
+                entry.relative_path
+            ));
+        }
+        if !sha256_hex(&bytes).eq_ignore_ascii_case(blob_hash) {
+            return Err(format!(
+                "snapshot hash mismatch for {}: object is corrupted or modified",
+                entry.relative_path
+            ));
+        }
+        staged.push((entry, bytes));
+    }
+
+    let mut restored = Vec::with_capacity(manifest.files.len());
+    for (entry, bytes) in staged {
+        // The write goes through the strict path rules: a folder on the way that a link has
+        // replaced since the capture refuses the write instead of landing outside the instance
+        // (MASTER_SPEC §32.3, §32.7).
+        let live = live_target(instance_dir, &entry.relative_path)?;
+        let bytes = match overridden(&entry.relative_path, &bytes)? {
+            Some(replaced) => replaced,
+            None => bytes,
+        };
+        if let Some(parent) = live.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        }
+        atomic_write(&live, &bytes)?;
+        restored.push(entry.relative_path.clone());
+    }
+    for entry in &manifest.files {
+        if !entry.absent {
+            continue;
+        }
+        let live = live_target(instance_dir, &entry.relative_path)?;
+        // Fail closed (§32.13): only "the operating system said not found" means there is nothing
+        // to remove. A path that cannot be examined is its own error.
+        match agora_game_api::probe(&live) {
+            agora_game_api::Probe::Present(agora_game_api::PresentKind::Directory) => {
+                return Err(format!(
+                    "snapshot says {} was absent, but a folder is there",
+                    entry.relative_path
+                ))
+            }
+            agora_game_api::Probe::Present(_) => {
+                fs::remove_file(&live)
+                    .map_err(|e| format!("failed to remove {}: {e}", entry.relative_path))?;
+            }
+            agora_game_api::Probe::Absent => {}
+            agora_game_api::Probe::CantTell(error) => {
+                return Err(format!(
+                    "failed to inspect {} while restoring: {error}",
+                    entry.relative_path
+                ))
+            }
+        }
+        restored.push(entry.relative_path.clone());
+    }
+    Ok(restored)
+}
+
+/// Where a snapshot path belongs in the instance, checked against the strict path rules so a link
+/// standing in for a folder on the way cannot take the write outside.
+fn live_target(instance_dir: &Path, relative_path: &str) -> Result<PathBuf, String> {
+    let strict =
+        agora_game_api::StrictRelPath::new(relative_path.to_string()).map_err(|error| {
+            format!(
+                "the snapshot records '{relative_path}', which cannot be written: {}",
+                error.reason
+            )
+        })?;
+    agora_game_api::join_under(instance_dir, &strict)
+        .map_err(|error| format!("refusing to restore '{relative_path}': {error}"))
 }
 
 pub(crate) fn blob_file_matches(path: &Path, expected_hash: &str, expected_size: u64) -> bool {
-    let Ok(file) = fs::File::open(path) else {
-        return false;
-    };
-    let Ok(metadata) = file.metadata() else {
-        return false;
-    };
-    if metadata.len() != expected_size {
-        return false;
+    matches!(
+        check_blob_file(path, expected_hash, expected_size),
+        Ok(true)
+    )
+}
+
+fn check_blob_file(path: &Path, expected_hash: &str, expected_size: u64) -> std::io::Result<bool> {
+    let file = fs::File::open(path)?;
+    if file.metadata()?.len() != expected_size {
+        return Ok(false);
     }
     let mut reader = BufReader::new(file);
     let mut hasher = sha2::Sha256::new();
     let mut buffer = vec![0u8; 1024 * 1024];
     loop {
-        let Ok(read) = reader.read(&mut buffer) else {
-            return false;
-        };
+        let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
     }
-    format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(expected_hash)
+    Ok(format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(expected_hash))
 }
 
 fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), String> {
@@ -1423,52 +1929,10 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), String> {
         return Err(error);
     }
 
-    #[cfg(not(windows))]
-    {
-        if let Err(error) = fs::rename(&temp, path) {
-            let _ = fs::remove_file(&temp);
-            return Err(format!("failed to commit snapshot metadata: {error}"));
-        }
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    {
-        match fs::rename(&temp, path) {
-            Ok(()) => return Ok(()),
-            Err(first_error) => {
-                // Modern Windows filesystems normally support replacement,
-                // but keep a rollback fallback for platform/filesystem cases
-                // where replacing an existing destination is rejected.
-                if !path.exists() {
-                    let _ = fs::remove_file(&temp);
-                    return Err(format!("failed to commit snapshot metadata: {first_error}"));
-                }
-                let backup = parent.join(format!(
-                    ".{file_name}.{}-{}.bak",
-                    std::process::id(),
-                    uuid::Uuid::new_v4()
-                ));
-                if let Err(stage_error) = fs::rename(path, &backup) {
-                    let _ = fs::remove_file(&temp);
-                    return Err(format!(
-                        "failed to commit snapshot metadata: {first_error}; \
-                         replacement fallback could not stage the old file: {stage_error}"
-                    ));
-                }
-                if let Err(commit_error) = fs::rename(&temp, path) {
-                    let _ = fs::remove_file(&temp);
-                    let _ = fs::rename(&backup, path);
-                    return Err(format!(
-                        "failed to commit snapshot metadata after staging the old file: \
-                         {commit_error}"
-                    ));
-                }
-                let _ = fs::remove_file(&backup);
-            }
-        }
-        Ok(())
-    }
+    crate::recovery::durable_rename(&temp, path, true).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        format!("failed to commit snapshot metadata: {error}")
+    })
 }
 
 /// Restore an instance to a snapshot.
@@ -1478,8 +1942,12 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), String> {
 /// renames.  If any exchange fails, every partially promoted snapshot entry is
 /// displaced before the pre-restore entries are moved back, so rollback never
 /// depends on renaming over a non-empty destination.
-pub fn restore_snapshot(instance_dir: &Path, snapshot_id: &str) -> Result<RestoreOutcome, String> {
-    restore_snapshot_impl(instance_dir, snapshot_id, None)
+pub fn restore_snapshot(
+    instance_dir: &Path,
+    snapshot_id: &str,
+    known_roots: &[&str],
+) -> Result<RestoreOutcome, String> {
+    restore_snapshot_impl(instance_dir, snapshot_id, known_roots, None)
 }
 
 /// The scope a restore of this snapshot would cover.
@@ -1488,34 +1956,92 @@ pub fn restore_snapshot(instance_dir: &Path, snapshot_id: &str) -> Result<Restor
 /// will replace — copying worlds to undo a configuration-only restore is pure
 /// cost — and to tell the user what the restore can and cannot promise.
 pub fn restore_scope(instance_dir: &Path, snapshot_id: &str) -> Result<Vec<String>, String> {
+    Ok(restore_scope_entries(instance_dir, snapshot_id)?
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect())
+}
+
+/// [`restore_scope`] with what each entry is: a folder the game declares, or a file it maps.
+///
+/// The difference is what the notice needs — a recorded folder the game dropped and a recorded
+/// file it dropped are told apart, and named as what they are (MASTER_SPEC §32.7).
+pub fn restore_scope_entries(
+    instance_dir: &Path,
+    snapshot_id: &str,
+) -> Result<Vec<SnapshotRoot>, String> {
     validate_snapshot_id(snapshot_id)?;
     let manifest_path = snapshot_manifest_path(instance_dir, snapshot_id);
-    let manifest = if manifest_path.is_file() {
-        read_manifest_file(&manifest_path, snapshot_id)?
-    } else {
-        let file = fs::File::open(snapshot_zip_path(instance_dir, snapshot_id))
-            .map_err(|e| format!("failed to open snapshot zip: {e}"))?;
-        let mut archive =
-            zip::ZipArchive::new(file).map_err(|e| format!("failed to read snapshot zip: {e}"))?;
-        read_manifest(&mut archive, snapshot_id)?
+    // Fail closed (§32.13): only "the operating system said not found" means this snapshot predates
+    // manifests. A path that cannot be examined is its own error, not a fall back to the archive.
+    let manifest = match agora_game_api::probe(&manifest_path) {
+        agora_game_api::Probe::Present(_) => read_manifest_file(&manifest_path, snapshot_id)?,
+        agora_game_api::Probe::Absent => {
+            let file = fs::File::open(snapshot_zip_path(instance_dir, snapshot_id))
+                .map_err(|e| format!("failed to open snapshot zip: {e}"))?;
+            let mut archive = zip::ZipArchive::new(file)
+                .map_err(|e| format!("failed to read snapshot zip: {e}"))?;
+            read_manifest(&mut archive, snapshot_id)?
+        }
+        agora_game_api::Probe::CantTell(error) => {
+            return Err(format!(
+                "cannot tell what is at {}, so this snapshot's scope cannot be read: {error}",
+                manifest_path.display()
+            ))
+        }
     };
-    Ok(resolve_restore_coverage(&manifest)?
-        .roots()
-        .iter()
-        .map(|root| root.name.clone())
-        .collect())
+    Ok(resolve_restore_coverage(&manifest)?.roots().to_vec())
+}
+
+/// The sentence that tells the user a restore put back state the game no longer declares.
+///
+/// The comparison is the scope question, so a recorded folder is owned by a declaration that is it
+/// or holds it, and a recorded file by a declaration that names it or names the folder it lives in.
+/// `None` means the declaration in force still owns it, or holds something inside it.
+pub(crate) fn untracked_notice(
+    declared: &[&str],
+    entry: &SnapshotRoot,
+    game: &str,
+) -> Option<String> {
+    if scope_contains(declared, &entry.name) {
+        return None;
+    }
+    let what = match entry.state {
+        RootState::Directory => "folder",
+        RootState::File | RootState::Absent => "file",
+    };
+    Some(format!(
+        "{what} '{}' is no longer tracked by {game}; restored from the snapshot anyway",
+        entry.name
+    ))
 }
 
 fn restore_snapshot_impl(
     instance_dir: &Path,
     snapshot_id: &str,
+    known_roots: &[&str],
     fail_after_promotions: Option<usize>,
 ) -> Result<RestoreOutcome, String> {
     validate_snapshot_id(snapshot_id)?;
     let preserved_recovery_dir = recover_interrupted_restore(instance_dir)?;
     let manifest_path = snapshot_manifest_path(instance_dir, snapshot_id);
     let zip_path = snapshot_zip_path(instance_dir, snapshot_id);
-    if !manifest_path.exists() && !zip_path.exists() {
+    // Fail closed (§32.13): only "the operating system said not found" means this snapshot is not
+    // there. An unreadable location is its own answer, never "nothing found".
+    let mut found = false;
+    for path in [&manifest_path, &zip_path] {
+        match agora_game_api::probe(path) {
+            agora_game_api::Probe::Present(_) => found = true,
+            agora_game_api::Probe::Absent => {}
+            agora_game_api::Probe::CantTell(error) => {
+                return Err(format!(
+                "cannot tell what is at {}, so snapshot {snapshot_id} cannot be checked: {error}",
+                path.display()
+            ))
+            }
+        }
+    }
+    if !found {
         return Err(format!("snapshot {snapshot_id} not found"));
     }
 
@@ -1541,6 +2067,18 @@ fn restore_snapshot_impl(
         }
     };
 
+    // A manifest that records a file by path is a data snapshot (generic games). It is restored
+    // file by file, on purpose: restoring it as whole folders would replace folders it does not
+    // own. Refuse here rather than move a folder the snapshot never covered.
+    if let Some(entry) = coverage.roots().iter().find(|root| root.name.contains('/')) {
+        let _ = fs::remove_dir_all(&extract_dir);
+        return Err(format!(
+            "snapshot {snapshot_id} records the file '{}', so it is restored file by file, not as \
+             whole folders",
+            entry.name
+        ));
+    }
+
     let covered: Vec<String> = coverage
         .roots()
         .iter()
@@ -1549,13 +2087,24 @@ fn restore_snapshot_impl(
     let original = capture_root_states(
         instance_dir,
         &covered.iter().map(String::as_str).collect::<Vec<_>>(),
-    );
+    )?;
 
     let pre_dir = pre_restore_dir(instance_dir);
-    if pre_dir.exists() {
+    // Fail closed (§32.13): a backup folder that cannot be examined is reported, not treated as
+    // absent — the material in it may be the only copy of what a previous restore moved aside.
+    match agora_game_api::probe(&pre_dir) {
         // recover_interrupted_restore has already dealt with any recognised
         // recovery material, so anything still here is unaccounted for.
-        preserve_orphaned_recovery_dir(instance_dir, &pre_dir)?;
+        agora_game_api::Probe::Present(_) => {
+            preserve_orphaned_recovery_dir(instance_dir, &pre_dir)?;
+        }
+        agora_game_api::Probe::Absent => {}
+        agora_game_api::Probe::CantTell(error) => {
+            return Err(format!(
+                "cannot tell what is at {}, so this restore will not start over it: {error}",
+                pre_dir.display()
+            ))
+        }
     }
     fs::create_dir_all(&pre_dir).map_err(|e| format!("failed to create pre-restore dir: {e}"))?;
 
@@ -1574,11 +2123,35 @@ fn restore_snapshot_impl(
     fs::write(&marker_path, restore_id.as_bytes())
         .map_err(|e| format!("failed to write restore marker: {e}"))?;
 
+    // Every root the snapshot covers is replaced the same way — moved aside, then the captured
+    // root promoted in its place — whatever the game declares today. A folder the game no longer
+    // tracks belongs to the snapshot that captured it (MASTER_SPEC §32.7); giving it a second,
+    // file-by-file restore is what left it half restored after an interruption, and what left a
+    // failed pack update's files behind. What a restore may touch is the snapshot's recorded scope,
+    // not the declaration in force, which only governs future captures.
     let staged_roots = snapshot_roots(&manifest);
     let mut moved_current = Vec::new();
     for entry_name in &covered {
         let src = instance_dir.join(entry_name);
-        if fs::symlink_metadata(&src).is_ok() {
+        // Whether the root is there decides whether it is moved aside; "I could not look" is not
+        // "it is not there" (§32.13), so an unreadable one stops the restore before anything moves.
+        let present = match agora_game_api::probe(&src) {
+            agora_game_api::Probe::Present(_) => true,
+            agora_game_api::Probe::Absent => false,
+            agora_game_api::Probe::CantTell(error) => {
+                let rollback =
+                    rollback_restore(instance_dir, &pre_dir, &[], &moved_current, &restore_id);
+                let _ = fs::remove_dir_all(&extract_dir);
+                clear_journal_unless_failed(instance_dir, &rollback);
+                return Err(combine_restore_error(
+                    format!(
+                        "cannot tell whether {entry_name} is there, so it was not replaced: {error}"
+                    ),
+                    rollback,
+                ));
+            }
+        };
+        if present {
             let dst = pre_dir.join(entry_name);
             if let Some(parent) = dst.parent() {
                 fs::create_dir_all(parent).map_err(|e| format!("failed to create parent: {e}"))?;
@@ -1587,7 +2160,7 @@ fn restore_snapshot_impl(
                 let rollback =
                     rollback_restore(instance_dir, &pre_dir, &[], &moved_current, &restore_id);
                 let _ = fs::remove_dir_all(&extract_dir);
-                let _ = fs::remove_file(restore_journal_path(instance_dir));
+                clear_journal_unless_failed(instance_dir, &rollback);
                 return Err(combine_restore_error(
                     format!("failed to move current {entry_name} into backup: {error}"),
                     rollback,
@@ -1621,7 +2194,7 @@ fn restore_snapshot_impl(
                 &restore_id,
             );
             let _ = fs::remove_dir_all(&extract_dir);
-            let _ = fs::remove_file(restore_journal_path(instance_dir));
+            clear_journal_unless_failed(instance_dir, &rollback);
             return Err(combine_restore_error(
                 format!("failed to promote restored {entry_name}: {error}"),
                 rollback,
@@ -1648,7 +2221,7 @@ fn restore_snapshot_impl(
     // Tracked roots that still exist but were outside this snapshot's
     // authority. `saves` lands here for every pre-launch snapshot, which is
     // exactly the fact the caller needs to surface.
-    let mut preserved_roots: Vec<String> = TRACKED_ENTRIES
+    let mut preserved_roots: Vec<String> = known_roots
         .iter()
         .filter(|name| !covered.iter().any(|root| root == *name))
         .filter(|name| fs::symlink_metadata(instance_dir.join(name)).is_ok())
@@ -1667,6 +2240,8 @@ fn restore_snapshot_impl(
         preserved_roots,
         cleanup_warning,
         preserved_recovery_dir: preserved_recovery_dir.map(|path| path.display().to_string()),
+        undo_snapshot_id: None,
+        notices: Vec::new(),
     })
 }
 
@@ -1754,17 +2329,32 @@ fn recover_interrupted_restore(instance_dir: &Path) -> Result<Option<PathBuf>, S
         .iter()
         .filter(|root| {
             root.state == RootState::Absent
-                && fs::symlink_metadata(instance_dir.join(&root.name)).is_ok()
+                // "Not found" is the only answer that means the root is not there to undo. An
+                // unreadable one is treated as present, so rollback reports it rather than
+                // silently leaving a promoted root in place (§32.13).
+                && !agora_game_api::probe(instance_dir.join(&root.name)).is_absent()
         })
         .map(|root| root.name.clone())
         .collect();
-    let backed_up: Vec<String> = journal
+    let mut backed_up: Vec<String> = Vec::new();
+    for root in journal
         .original
         .iter()
         .filter(|root| root.state != RootState::Absent)
-        .map(|root| root.name.clone())
-        .filter(|name| pre_dir.join(name).exists())
-        .collect();
+    {
+        match agora_game_api::probe(pre_dir.join(&root.name)) {
+            agora_game_api::Probe::Present(_) => backed_up.push(root.name.clone()),
+            // A root with no backup had not moved when the process stopped; nothing to put back.
+            agora_game_api::Probe::Absent => {}
+            agora_game_api::Probe::CantTell(error) => {
+                return Err(format!(
+                    "cannot tell whether the backup of '{}' is there, so the interrupted restore \
+                     is not undone automatically: {error}",
+                    root.name
+                ))
+            }
+        }
+    }
     let mut displace = promoted;
     displace.extend(backed_up.iter().cloned());
 
@@ -1800,6 +2390,9 @@ fn extract_and_verify(
         let manifest = read_manifest_file(&manifest_path, snapshot_id)?;
         let mut seen = HashSet::new();
         for file_entry in &manifest.files {
+            if file_entry.absent {
+                continue;
+            }
             validate_relative_path(&file_entry.relative_path)?;
             if !seen.insert(file_entry.relative_path.clone()) {
                 return Err(format!(
@@ -1818,7 +2411,13 @@ fn extract_and_verify(
                     )
                 })?;
             validate_blob_hash(blob_hash)?;
-            let blob_path = snapshot_blob_path(instance_dir, blob_hash);
+            let blob_path =
+                snapshot_blob_source(instance_dir, blob_hash, file_entry.size)?.ok_or_else(|| {
+                    format!(
+                        "failed to open snapshot object for {}: no object store holds {blob_hash} of {} bytes whose bytes match the hash (missing, or a hash mismatch)",
+                        file_entry.relative_path, file_entry.size
+                    )
+                })?;
             let input = fs::File::open(&blob_path).map_err(|e| {
                 format!(
                     "failed to open snapshot object for {}: {e}",
@@ -1962,6 +2561,44 @@ fn read_manifest_file(path: &Path, snapshot_id: &str) -> Result<SnapshotManifest
     Ok(manifest)
 }
 
+/// What a verification receipt beside a snapshot or an object is called, appended to its name.
+pub(crate) const VERIFIED_RECEIPT_SUFFIX: &str = ".agora-verified";
+
+/// Whether this file name looks like a snapshot manifest, as opposed to the helper files that live
+/// beside one (`live-file-index.json`, `mutation-journal.json`) or a verification receipt.
+///
+/// Not a path validator: it compares whole file names, and the folder they are in is chosen by the
+/// caller.
+pub(crate) fn looks_like_snapshot_manifest(name: &str) -> bool {
+    let Some(id) = name.strip_suffix(".json") else {
+        return false;
+    };
+    !id.to_ascii_lowercase().ends_with(VERIFIED_RECEIPT_SUFFIX)
+        && !id.eq_ignore_ascii_case("live-file-index")
+        && !id.eq_ignore_ascii_case("mutation-journal")
+}
+
+/// Every object hash and content-store item id one snapshot manifest names, read fresh.
+///
+/// This is the collector's view of a snapshot: it never trusts a cached index, and it fails with the
+/// reason rather than returning an empty list, because an unreadable manifest may name any object.
+pub(crate) fn snapshot_manifest_references(
+    path: &Path,
+    snapshot_id: &str,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let manifest = read_manifest_file(path, snapshot_id)?;
+    let hashes = manifest
+        .files
+        .iter()
+        .filter_map(|file| file.blob_sha256.as_deref().or(file.sha256.as_deref()))
+        .filter(|hash| validate_blob_hash(hash).is_ok())
+        // Object names are lowercase hex, and a manifest may carry either case: a collection that
+        // compared them as written would free an object a snapshot still names (MASTER_SPEC §32.8).
+        .map(str::to_ascii_lowercase)
+        .collect();
+    Ok((hashes, manifest.content_refs.clone()))
+}
+
 fn validate_manifest(manifest: &SnapshotManifest, snapshot_id: &str) -> Result<(), String> {
     if manifest.schema_version == 0 || manifest.schema_version > SNAPSHOT_SCHEMA_VERSION {
         return Err(format!(
@@ -2025,22 +2662,19 @@ pub(crate) fn validate_relative_path(relative_path: &str) -> Result<(), String> 
             _ => None,
         })
         .ok_or_else(|| format!("invalid snapshot path {relative_path:?}"))?;
-    if !TRACKED_ENTRIES.contains(&root) {
+    // The scope itself is validated separately (against the snapshot's own
+    // recorded roots). This guard only keeps a path out of Agora's own
+    // coordination folders, whatever the game's scope is.
+    if root.starts_with(".agora") && root != LOADOUTS_SCOPE_ROOT {
         return Err(format!(
-            "snapshot path is outside tracked entries: {relative_path}"
-        ));
-    }
-    if TRACKED_ENTRIES
-        .iter()
-        .any(|file| *file == root && Path::new(file).extension().is_some())
-        && path.components().count() != 1
-    {
-        return Err(format!(
-            "snapshot file path cannot contain children: {relative_path}"
+            "snapshot path is inside Agora's own state: {relative_path}"
         ));
     }
     Ok(())
 }
+
+/// The shared loadout store, which a generic game instance's snapshot covers.
+pub(crate) const LOADOUTS_SCOPE_ROOT: &str = ".agora_loadouts";
 
 pub(crate) fn validate_snapshot_id(snapshot_id: &str) -> Result<(), String> {
     if snapshot_id.is_empty()
@@ -2051,7 +2685,33 @@ pub(crate) fn validate_snapshot_id(snapshot_id: &str) -> Result<(), String> {
     {
         return Err("invalid snapshot id".into());
     }
+    // Every valid ID must produce a manifest the collector will read (MASTER_SPEC §32.8).
+    if !looks_like_snapshot_manifest(&format!("{snapshot_id}.json")) {
+        return Err(format!(
+            "invalid snapshot id {snapshot_id}: the manifest name is reserved"
+        ));
+    }
     Ok(())
+}
+
+/// Whether a declared folder (or mapped file) is `path` or holds it, comparing component by
+/// component with the platform's case rule (MASTER_SPEC §32.3).
+///
+/// This is the question a restore asks about a recorded scope entry: a declaration of `state/config`
+/// covers `state/config/a.toml` and the entry `state/config`, a declaration of `characters` covers
+/// the entry `characters` and every file under it — and a declaration of `user/Plugins.txt` covers
+/// that file, never the folder `user` around it (MASTER_SPEC §32.7).
+pub(crate) fn scope_contains(declared: &[&str], path: &str) -> bool {
+    declared.iter().any(|folder| {
+        agora_game_api::same_spelling(Path::new(folder), Path::new(path))
+            || is_under(Path::new(path), Path::new(folder))
+    })
+}
+
+/// Whether `path` is inside `folder` (strictly, not equal): the game contract's comparison, so the
+/// path rules have one home (MASTER_SPEC §32.3).
+fn is_under(path: &Path, folder: &Path) -> bool {
+    agora_game_api::is_inside(path, folder)
 }
 
 fn snapshot_roots(manifest: &SnapshotManifest) -> HashSet<&str> {
@@ -2129,22 +2789,45 @@ fn write_root(relative: &str) -> Result<String, String> {
 /// Record the live state of each scope root at capture time.
 ///
 /// Uses `symlink_metadata` so a link is classified as what it is rather than
-/// as whatever it points at.
-fn capture_root_states(instance_dir: &Path, entries: &[&str]) -> Vec<SnapshotRoot> {
-    entries
-        .iter()
-        .map(|name| {
-            let state = match fs::symlink_metadata(instance_dir.join(name)) {
-                Ok(metadata) if metadata.is_dir() => RootState::Directory,
-                Ok(_) => RootState::File,
-                Err(_) => RootState::Absent,
-            };
-            SnapshotRoot {
-                name: (*name).to_string(),
-                state,
+/// as whatever it points at. The lookup is injected so a failing one can be exercised (see
+/// [`capture_root_states`]).
+///
+/// A root that cannot be examined is cannot-tell, not absent (§32.13). What this records decides
+/// whether a restore moves the root aside and whether an interruption removes it, so "I could not
+/// look" must never become "it is not there".
+fn capture_root_states_with(
+    instance_dir: &Path,
+    entries: &[&str],
+    metadata: impl Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> Result<Vec<SnapshotRoot>, String> {
+    let mut states = Vec::with_capacity(entries.len());
+    for name in entries {
+        let root = instance_dir.join(name);
+        // The injected lookup answers "is it there, and what is it"; a result that says "there is
+        // something but I will not describe it" is the only case left over, and it is cannot-tell.
+        let state = match metadata(&root) {
+            Ok(metadata) if metadata.is_dir() => RootState::Directory,
+            Ok(_) => RootState::File,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => RootState::Absent,
+            Err(error) => {
+                return Err(format!(
+                    "cannot tell whether '{}' is there, so this snapshot cannot record what it \
+                     owns: {error}",
+                    root.display()
+                ))
             }
-        })
-        .collect()
+        };
+        states.push(SnapshotRoot {
+            name: (*name).to_string(),
+            state,
+        });
+    }
+    Ok(states)
+}
+
+/// [`capture_root_states_with`] against the live filesystem.
+fn capture_root_states(instance_dir: &Path, entries: &[&str]) -> Result<Vec<SnapshotRoot>, String> {
+    capture_root_states_with(instance_dir, entries, |path| fs::symlink_metadata(path))
 }
 
 /// Decide which roots this snapshot may replace.
@@ -2157,7 +2840,19 @@ fn capture_root_states(instance_dir: &Path, entries: &[&str]) -> Vec<SnapshotRoo
 fn resolve_restore_coverage(manifest: &SnapshotManifest) -> Result<RestoreCoverage, String> {
     if let Some(scope) = &manifest.scope {
         for root in scope {
-            validate_scope_root(&root.name)?;
+            // A scope entry is a folder the game declares or a file its definition maps, and a
+            // nested entry is always the file (MASTER_SPEC §32.7).
+            if root.name.contains('/') {
+                validate_relative_path(&root.name)?;
+                if root.state != RootState::File {
+                    return Err(format!(
+                        "snapshot scope records '{}' as a folder, but a nested entry is a file",
+                        root.name
+                    ));
+                }
+            } else {
+                validate_scope_root(&root.name)?;
+            }
         }
         let mut seen = HashSet::new();
         for root in scope {
@@ -2165,11 +2860,13 @@ fn resolve_restore_coverage(manifest: &SnapshotManifest) -> Result<RestoreCovera
                 return Err(format!("snapshot scope lists {} twice", root.name));
             }
         }
-        // Every recorded file must live inside a covered root, or the manifest
-        // is internally inconsistent and must not be applied.
+        // Every recorded file must be inside a covered entry — a folder that holds it, or the file
+        // itself — or the manifest is internally inconsistent and must not be applied.
         for entry in &manifest.files {
-            let root = entry.relative_path.split('/').next().unwrap_or_default();
-            if !seen.contains(root) {
+            let covered = scope
+                .iter()
+                .any(|root| scope_contains(&[root.name.as_str()], &entry.relative_path));
+            if !covered {
                 return Err(format!(
                     "snapshot contains {} which is outside its recorded scope",
                     entry.relative_path
@@ -2210,7 +2907,11 @@ fn resolve_restore_coverage(manifest: &SnapshotManifest) -> Result<RestoreCovera
     Ok(RestoreCoverage::LegacyPartial(roots))
 }
 
-const RESTORE_JOURNAL_SCHEMA_VERSION: u32 = 1;
+/// Version 2 dropped the file-by-file retired-root fields: a journal from version 1 named roots
+/// whose rollback is now a root rename, so its `original`/`target` no longer describe what recovery
+/// would do. A version 1 journal is therefore not interpreted at all — it is refused and preserved
+/// like a pre-journal marker, instead of being replayed under rules it was not written for.
+const RESTORE_JOURNAL_SCHEMA_VERSION: u32 = 2;
 
 fn restore_journal_path(instance_dir: &Path) -> PathBuf {
     instance_dir.join(".agora_restore_journal.json")
@@ -2271,13 +2972,13 @@ fn preserve_orphaned_recovery_dir(instance_dir: &Path, pre_dir: &Path) -> Result
 
 /// Scope roots must be plain top-level names, and must never name the
 /// launcher's own coordination state.
-fn validate_scope_root(name: &str) -> Result<(), String> {
+pub(crate) fn validate_scope_root(name: &str) -> Result<(), String> {
     if name.is_empty()
         || name == "."
         || name == ".."
         || name.contains('/')
         || name.contains('\\')
-        || name.starts_with(".agora")
+        || (name.starts_with(".agora") && name != LOADOUTS_SCOPE_ROOT)
     {
         return Err(format!("invalid snapshot scope root {name:?}"));
     }
@@ -2312,36 +3013,66 @@ fn rollback_restore(
     let mut errors = Vec::new();
     for entry_name in promoted.iter().rev() {
         let live = instance_dir.join(entry_name);
-        if live.exists() {
-            let displaced = failed_dir.join(entry_name);
-            if let Some(parent) = displaced.parent() {
-                if let Err(e) = fs::create_dir_all(parent) {
-                    errors.push(format!(
-                        "could not prepare displacement for {entry_name}: {e}"
-                    ));
-                    continue;
-                }
-            }
-            if let Err(e) = fs::rename(&live, &displaced) {
+        // Fail closed: only "not found" means there is nothing to displace (§32.13).
+        match agora_game_api::probe(&live) {
+            agora_game_api::Probe::Absent => continue,
+            agora_game_api::Probe::CantTell(error) => {
                 errors.push(format!(
-                    "could not displace partial restore {entry_name}: {e}"
+                    "cannot tell whether the partial restore of {entry_name} is there: {error}"
                 ));
+                continue;
             }
+            agora_game_api::Probe::Present(_) => {}
+        }
+        let displaced = failed_dir.join(entry_name);
+        if let Some(parent) = displaced.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                errors.push(format!(
+                    "could not prepare displacement for {entry_name}: {e}"
+                ));
+                continue;
+            }
+        }
+        if let Err(e) = fs::rename(&live, &displaced) {
+            errors.push(format!(
+                "could not displace partial restore {entry_name}: {e}"
+            ));
         }
     }
 
     for entry_name in moved_current.iter().rev() {
         let backup = pre_dir.join(entry_name);
         let live = instance_dir.join(entry_name);
-        if !backup.exists() {
-            errors.push(format!("rollback backup is missing for {entry_name}"));
-            continue;
+        // A backup that is a link is present as a link: `exists()` follows it, and a folder the
+        // person replaced with a link to a path that no longer exists would read as missing — the
+        // rollback would report failure and leave the link in the backup folder (§32.13).
+        match agora_game_api::probe(&backup) {
+            agora_game_api::Probe::Present(_) => {}
+            agora_game_api::Probe::Absent => {
+                errors.push(format!("rollback backup is missing for {entry_name}"));
+                continue;
+            }
+            agora_game_api::Probe::CantTell(error) => {
+                errors.push(format!(
+                    "cannot tell whether the rollback backup of {entry_name} is there: {error}"
+                ));
+                continue;
+            }
         }
-        if live.exists() {
-            errors.push(format!(
-                "rollback destination still exists for {entry_name}"
-            ));
-            continue;
+        match agora_game_api::probe(&live) {
+            agora_game_api::Probe::Absent => {}
+            agora_game_api::Probe::Present(_) => {
+                errors.push(format!(
+                    "rollback destination still exists for {entry_name}"
+                ));
+                continue;
+            }
+            agora_game_api::Probe::CantTell(error) => {
+                errors.push(format!(
+                    "cannot tell whether {entry_name} is still there to be replaced back: {error}"
+                ));
+                continue;
+            }
         }
         if let Err(e) = fs::rename(&backup, &live) {
             errors.push(format!("could not restore original {entry_name}: {e}"));
@@ -2370,6 +3101,17 @@ fn combine_restore_error(primary: String, rollback: Result<(), String>) -> Strin
     }
 }
 
+/// Clear the restore journal once the transaction is over without leaving work behind.
+///
+/// A rollback that could not finish keeps it: the journal names the pre-restore state, so recovery
+/// — or the person, with the paths the error printed — can still act on what is left (MASTER_SPEC
+/// §32.11). Removing it would make the failed transaction look like one that never started.
+fn clear_journal_unless_failed(instance_dir: &Path, rollback: &Result<(), String>) {
+    if rollback.is_ok() {
+        let _ = fs::remove_file(restore_journal_path(instance_dir));
+    }
+}
+
 /// The lock snapshots of an instance (taken when it was locked), in no particular order.
 pub fn lock_snapshots(instance_dir: &Path) -> Result<Vec<Snapshot>, String> {
     Ok(list_snapshots(instance_dir)?
@@ -2380,17 +3122,44 @@ pub fn lock_snapshots(instance_dir: &Path) -> Result<Vec<Snapshot>, String> {
 
 /// List all snapshots for an instance.
 pub fn list_snapshots(instance_dir: &Path) -> Result<Vec<Snapshot>, String> {
+    list_snapshots_with(instance_dir, |path| fs::symlink_metadata(path))
+}
+
+/// Listing with the metadata lookups injected, so a failed lookup can be
+/// exercised without depending on the OS to fail on cue. The public wrapper
+/// always stats the real filesystem.
+fn list_snapshots_with(
+    instance_dir: &Path,
+    metadata: impl Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> Result<Vec<Snapshot>, String> {
     let marker = instance_dir.join(RESTORE_MARKER);
-    if marker.exists() {
-        return Err(
-            "Previous restore was interrupted. Check .agora_pre_restore/ for backed-up files."
-                .into(),
-        );
+    match metadata(&marker) {
+        Ok(_) => {
+            return Err(
+                "Previous restore was interrupted. Check .agora_pre_restore/ for backed-up files."
+                    .into(),
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot check restore marker {}: {error}",
+                marker.display()
+            ))
+        }
     }
 
     let dir = snapshots_dir(instance_dir);
-    if !dir.is_dir() {
-        return Ok(Vec::new());
+    match metadata(&dir) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect snapshots dir {}: {error}",
+                dir.display()
+            ))
+        }
     }
 
     let mut snapshots = Vec::new();
@@ -2400,32 +3169,58 @@ pub fn list_snapshots(instance_dir: &Path) -> Result<Vec<Snapshot>, String> {
     for entry in entries {
         let entry = entry.map_err(|e| format!("failed to read entry: {e}"))?;
         let path = entry.path();
-        match path.extension().and_then(|e| e.to_str()) {
-            Some("json") => {
-                let Some(id) = path.file_stem().and_then(|name| name.to_str()) else {
-                    continue;
-                };
-                if let Ok(manifest) = read_manifest_file(&path, id) {
-                    snapshots.push(manifest.snapshot);
-                }
-            }
-            Some("zip") => {
-                let Some(id) = path.file_stem().and_then(|name| name.to_str()) else {
-                    continue;
-                };
-                let file = match fs::File::open(&path) {
-                    Ok(f) => f,
-                    Err(_) => continue,
-                };
-                let mut archive = match zip::ZipArchive::new(file) {
-                    Ok(a) => a,
-                    Err(_) => continue,
-                };
-                if let Ok(manifest) = read_manifest(&mut archive, id) {
-                    snapshots.push(manifest.snapshot);
-                }
-            }
+        // These are Agora's own side files in the same folder, not snapshots.
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if name.ends_with(".agora-verified.json")
+            || name == "live-file-index.json"
+            || name == "mutation-journal.json"
+        {
+            continue;
+        }
+        let Some(id) = path.file_stem().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let read = match path.extension().and_then(|e| e.to_str()) {
+            Some("json") => read_manifest_file(&path, id).map(|manifest| manifest.snapshot),
+            Some("zip") => fs::File::open(&path)
+                .map_err(|e| format!("failed to open snapshot zip: {e}"))
+                .and_then(|file| {
+                    zip::ZipArchive::new(file)
+                        .map_err(|e| format!("failed to read snapshot zip: {e}"))
+                })
+                .and_then(|mut archive| read_manifest(&mut archive, id).map(|m| m.snapshot)),
             _ => continue,
+        };
+        match read {
+            Ok(snapshot) => snapshots.push(snapshot),
+            Err(error) => {
+                // List a damaged snapshot rather than hiding it: the user can
+                // see it and delete it. It is never treated as usable.
+                let created_at = fs::metadata(&path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| {
+                        let duration = modified.duration_since(UNIX_EPOCH).ok()?;
+                        chrono::DateTime::<chrono::Utc>::from_timestamp(
+                            i64::try_from(duration.as_secs()).ok()?,
+                            0,
+                        )
+                    })
+                    .map(|at| at.to_rfc3339())
+                    .unwrap_or_default();
+                snapshots.push(Snapshot {
+                    id: id.to_string(),
+                    label: None,
+                    created_at,
+                    file_count: 0,
+                    size_estimate: 0,
+                    origin: None,
+                    unreadable: Some(error),
+                });
+            }
         }
     }
 
@@ -2433,26 +3228,85 @@ pub fn list_snapshots(instance_dir: &Path) -> Result<Vec<Snapshot>, String> {
     Ok(snapshots)
 }
 
-/// Delete a snapshot.
+/// Delete a snapshot. A user-requested delete waits briefly for a passing instance move or scan;
+/// if the lock is still busy it refuses, with the holder named in the retry message.
 pub fn delete_snapshot(instance_dir: &Path, snapshot_id: &str) -> Result<(), String> {
+    delete_snapshot_collecting(instance_dir, snapshot_id, None).map(|_| ())
+}
+
+/// [`delete_snapshot`] whose result carries what the collection did with the objects the snapshot
+/// no longer holds: what it reclaimed, what it kept and why. Deleting the snapshot succeeds either
+/// way; showing the report is the adapter's job (MASTER_SPEC §32.8).
+pub fn delete_snapshot_with_report(
+    instance_dir: &Path,
+    snapshot_id: &str,
+) -> Result<crate::content_store::collect::CollectReport, String> {
+    delete_snapshot_collecting(instance_dir, snapshot_id, None)
+}
+
+/// Delete one snapshot and then collect what it no longer holds (MASTER_SPEC §32.8).
+///
+/// The collector's lock order decides this one: the content store first, then instance locations,
+/// held from the collection's first listing to its last delete. `grace` is the collector's grace
+/// period for a newly written object; `None` is the hour production uses, and a test passes zero to
+/// see what deleting the last snapshot frees.
+pub(crate) fn delete_snapshot_collecting(
+    instance_dir: &Path,
+    snapshot_id: &str,
+    grace: Option<std::time::Duration>,
+) -> Result<crate::content_store::collect::CollectReport, String> {
+    let manager = LockManager::new(snapshot_store_paths(instance_dir).locks_root());
+    let store = manager
+        .acquire(LockResource::ContentStore, "snapshot-delete")
+        .map_err(|error| format!("snapshot delete could not lock the content store: {error}"))?;
+    let locations = lock_snapshot_locations(instance_dir, "snapshot-delete", true)?;
+    delete_snapshot_with(
+        instance_dir,
+        snapshot_id,
+        list_snapshot_scan_dir,
+        &locations,
+        &store,
+        grace,
+    )
+}
+
+/// Delete a snapshot whose caller already holds InstanceLocations and the content-store lock, then
+/// collect.
+///
+/// The guards are proof the non-reentrant locks are held: retention takes them once for a whole
+/// round and passes them to every delete, so no delete tries to take either again. Store first,
+/// then locations, is the collector's order, and a caller that has one without the other refuses
+/// rather than reaching for it here (MASTER_SPEC §32.8).
+pub(super) fn delete_snapshot_with(
+    instance_dir: &Path,
+    snapshot_id: &str,
+    _list_dir: impl Fn(&Path) -> std::io::Result<Vec<std::io::Result<PathBuf>>>,
+    locations: &LockGuard,
+    store: &LockGuard,
+    grace: Option<std::time::Duration>,
+) -> Result<crate::content_store::collect::CollectReport, String> {
+    delete_snapshot_records(instance_dir, snapshot_id)?;
+    finish_snapshot_delete(instance_dir, snapshot_id, locations, store, grace)
+}
+
+/// Remove one snapshot's own records — its manifest or zip, the receipt beside it and its
+/// fingerprint — and judge no object.
+///
+/// Separated from the collection so a batch (retention's whole plan) removes everything it is going
+/// to remove first, then runs **one** collection over the result: per-snapshot collections made a
+/// round of retention free objects a later eviction still named inside the same round
+/// (MASTER_SPEC §32.8).
+pub(super) fn delete_snapshot_records(
+    instance_dir: &Path,
+    snapshot_id: &str,
+) -> Result<(), String> {
     validate_snapshot_id(snapshot_id)?;
     let manifest_path = snapshot_manifest_path(instance_dir, snapshot_id);
     let zip_path = snapshot_zip_path(instance_dir, snapshot_id);
     if !manifest_path.exists() && !zip_path.exists() {
         return Err(format!("snapshot {snapshot_id} not found"));
     }
-
-    let mut blobs = Vec::new();
     if manifest_path.is_file() {
-        if let Ok(manifest) = read_manifest_file(&manifest_path, snapshot_id) {
-            blobs = manifest
-                .files
-                .iter()
-                .filter_map(|file| file.blob_sha256.as_deref().or(file.sha256.as_deref()))
-                .filter(|hash| validate_blob_hash(hash).is_ok())
-                .map(str::to_string)
-                .collect();
-        }
         fs::remove_file(&manifest_path)
             .map_err(|e| format!("failed to delete snapshot manifest: {e}"))?;
         if let Some(name) = manifest_path.file_name().and_then(|name| name.to_str()) {
@@ -2464,19 +3318,32 @@ pub fn delete_snapshot(instance_dir: &Path, snapshot_id: &str) -> Result<(), Str
         fs::remove_file(&zip_path).map_err(|e| format!("failed to delete snapshot zip: {e}"))?;
     }
     let _ = fs::remove_file(snapshot_fingerprint_path(instance_dir, snapshot_id));
+    Ok(())
+}
 
-    for hash in blobs {
-        if !blob_is_referenced_by_any_snapshot(instance_dir, &hash) {
-            let path = snapshot_blob_path(instance_dir, &hash);
-            let _ = fs::remove_file(&path);
-            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-                let _ = fs::remove_file(path.with_file_name(format!("{name}.agora-verified.json")));
-            }
-            if let Some(parent) = path.parent() {
-                let _ = fs::remove_dir(parent);
-            }
-        }
-    }
+/// Collect after a snapshot (or a whole batch of them) has been removed, and tidy an empty
+/// snapshots folder. The report says what the collection freed, or why it freed nothing.
+fn finish_snapshot_delete(
+    instance_dir: &Path,
+    snapshot_id: &str,
+    _locations: &LockGuard,
+    store: &LockGuard,
+    grace: Option<std::time::Duration>,
+) -> Result<crate::content_store::collect::CollectReport, String> {
+    // Nothing names this snapshot's objects now: the one collection decides whether any record
+    // still does, and says why it kept them if it cannot tell.
+    let report = crate::content_store::collect::collect_at_instance(
+        instance_dir,
+        &crate::content_store::collect::CollectRequest {
+            store: crate::content_store::collect::LockRequest::Held,
+            locations: crate::content_store::collect::LockRequest::Held,
+            grace,
+            ignore_unreadable_snapshots: false,
+            pause: None,
+        },
+    )
+    .map_err(|error| format!("snapshot {snapshot_id} was deleted, but {error}"))?;
+    let _ = store;
 
     let dir = snapshots_dir(instance_dir);
     if dir.exists()
@@ -2487,143 +3354,124 @@ pub fn delete_snapshot(instance_dir: &Path, snapshot_id: &str) -> Result<(), Str
     {
         let _ = fs::remove_dir(&dir);
     }
-
-    Ok(())
+    Ok(report)
 }
 
-/// Whether a blob may still be needed by some snapshot.
-///
-/// Fails closed: the object store is shared by every instance, so if any
-/// snapshot directory or manifest cannot be read right now (a sharing
-/// violation and a half-written file look the same), the blob is reported as
-/// referenced and kept. Leaving an orphan blob costs disk space; deleting a
-/// needed one costs a restore point.
-fn blob_is_referenced_by_any_snapshot(instance_dir: &Path, hash: &str) -> bool {
-    if validate_blob_hash(hash).is_err() {
-        return false;
-    }
-    let instances_root = instance_dir.parent().unwrap_or(instance_dir);
-    let mut dirs: Vec<PathBuf> = match fs::read_dir(instances_root) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path().join(".agora_snapshots"))
-            .collect(),
-        Err(error) => {
-            eprintln!("snapshot blob cleanup skipped: cannot list instances: {error}");
-            return true;
-        }
+/// Take instance locations for snapshot cleanup. `wait` uses the short bounded wait for operations
+/// where a passing collision should resolve itself; without it a busy lock is refused at once.
+pub(crate) fn lock_snapshot_locations(
+    instance_dir: &Path,
+    operation: &str,
+    wait: bool,
+) -> Result<LockGuard, String> {
+    let manager = LockManager::new(snapshot_store_paths(instance_dir).locks_root());
+    let acquired = if wait {
+        manager.wait_instance_locations(operation)
+    } else {
+        manager.try_instance_locations(operation)
     };
-    dirs.push(snapshots_dir(instance_dir));
+    acquired.map_err(|error| format!("snapshot cleanup could not lock instance locations: {error}"))
+}
 
-    for dir in dirs {
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                eprintln!(
-                    "snapshot blob cleanup skipped: cannot read {}: {error}",
-                    dir.display()
-                );
-                return true;
-            }
-        };
-        for entry in entries {
-            let Ok(entry) = entry else {
-                return true;
-            };
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            let is_manifest = name.ends_with(".json")
-                && !name.ends_with(".agora-verified.json")
-                && name != "live-file-index.json"
-                && name != "mutation-journal.json";
-            if !is_manifest {
-                continue;
-            }
-            let Some(id) = path.file_stem().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            match read_manifest_file(&path, id) {
-                Ok(manifest) => {
-                    if manifest.files.iter().any(|file| {
-                        file.blob_sha256.as_deref().or(file.sha256.as_deref()) == Some(hash)
-                    }) {
-                        return true;
-                    }
-                }
-                Err(error) => {
-                    eprintln!(
-                        "snapshot blob cleanup skipped: cannot read manifest {}: {error}",
-                        path.display()
-                    );
-                    return true;
-                }
-            }
-        }
-    }
-    false
+pub(super) fn list_snapshot_scan_dir(dir: &Path) -> std::io::Result<Vec<std::io::Result<PathBuf>>> {
+    fs::read_dir(dir).map(|entries| {
+        entries
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect()
+    })
 }
 
 /// Return the physical storage estimate used by retention for a snapshot.
 /// Shared objects may be counted by more than one snapshot, which is
 /// intentionally conservative for a size-cap policy.
-pub fn snapshot_storage_size(instance_dir: &Path, snapshot_id: &str) -> u64 {
-    if validate_snapshot_id(snapshot_id).is_err() {
-        return 0;
-    }
-    let manifest_path = snapshot_manifest_path(instance_dir, snapshot_id);
-    if let Ok(manifest) = read_manifest_file(&manifest_path, snapshot_id) {
-        return fs::metadata(&manifest_path).map(|m| m.len()).unwrap_or(0)
-            + manifest
-                .files
-                .iter()
-                .filter_map(|file| file.blob_sha256.as_deref().or(file.sha256.as_deref()))
-                .filter(|hash| validate_blob_hash(hash).is_ok())
-                .map(|hash| {
-                    fs::metadata(snapshot_blob_path(instance_dir, hash))
-                        .map(|m| m.len())
-                        .unwrap_or(0)
-                })
-                .sum::<u64>();
-    }
-    fs::metadata(snapshot_zip_path(instance_dir, snapshot_id))
-        .map(|metadata| metadata.len())
-        .unwrap_or(0)
-}
-
-/// Remove content-addressed objects that are no longer referenced by any
-/// instance snapshot manifest. Garbage collection is best-effort at lifecycle
-/// boundaries; restore correctness never depends on it.
-pub fn prune_unreferenced_objects(instance_dir: &Path) -> Result<(), String> {
-    let root = snapshot_objects_dir(instance_dir);
-    if !root.is_dir() {
-        return Ok(());
-    }
-    let prefixes =
-        fs::read_dir(&root).map_err(|e| format!("failed to scan snapshot object store: {e}"))?;
-    for prefix in prefixes {
-        let prefix = prefix.map_err(|e| format!("failed to read snapshot object prefix: {e}"))?;
-        if !prefix.path().is_dir() {
-            continue;
-        }
-        for entry in fs::read_dir(prefix.path())
-            .map_err(|e| format!("failed to scan snapshot objects: {e}"))?
-        {
-            let entry = entry.map_err(|e| format!("failed to read snapshot object: {e}"))?;
-            let Some(hash) = entry.file_name().to_str().map(str::to_string) else {
+pub fn snapshot_storage_size(instance_dir: &Path, snapshot_id: &str) -> Result<u64, String> {
+    validate_snapshot_id(snapshot_id)?;
+    let path = snapshot_manifest_path(instance_dir, snapshot_id);
+    let Some(manifest_size) = snapshot_file_size(&path)? else {
+        let zip = snapshot_zip_path(instance_dir, snapshot_id);
+        return snapshot_file_size(&zip)?
+            .ok_or_else(|| format!("snapshot archive {} is missing", zip.display()));
+    };
+    let manifest = read_manifest_file(&path, snapshot_id)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let paths = snapshot_store_paths(instance_dir);
+    let legacy_active = crate::content_store::migrate::legacy_store_active(&paths);
+    let mut size = manifest_size;
+    for file in manifest.files.iter().filter(|file| !file.absent) {
+        let hash = file
+            .blob_sha256
+            .as_deref()
+            .or(file.sha256.as_deref())
+            .ok_or_else(|| format!("snapshot has no content hash for {}", file.relative_path))?;
+        validate_blob_hash(hash)?;
+        // Count physical bytes even when a blob is damaged.
+        if legacy_active {
+            let legacy = snapshot_blob_path(instance_dir, hash);
+            if let Some(metadata) = legacy_blob_metadata(&paths, &legacy)? {
+                size += metadata.len();
                 continue;
-            };
-            if validate_blob_hash(&hash).is_ok()
-                && !blob_is_referenced_by_any_snapshot(instance_dir, &hash)
-            {
-                let _ = fs::remove_file(entry.path());
             }
         }
-        let _ = fs::remove_dir(prefix.path());
+        let content = paths.content_object_path(&hash.to_ascii_lowercase());
+        size += snapshot_file_size(&content)?
+            .ok_or_else(|| format!("snapshot object {} is missing", content.display()))?;
     }
-    let _ = fs::remove_dir(root);
+    Ok(size)
+}
+
+fn snapshot_file_size(path: &Path) -> Result<Option<u64>, String> {
+    match fs::symlink_metadata(path) {
+        Ok(entry) if entry.is_file() && !agora_game_api::is_a_reparse_point(&entry) => {
+            Ok(Some(entry.len()))
+        }
+        Ok(_) => Err(format!("{} is not a plain file", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("could not measure {}: {error}", path.display())),
+    }
+}
+
+/// Remove content-addressed objects that no owner record names any more (MASTER_SPEC §32.8).
+///
+/// This is the same collection that a snapshot delete and an item removal run; it is the entry point
+/// for a caller that only wants the sweep. Garbage collection is best-effort at lifecycle
+/// boundaries: a refusal here leaves objects for the next one, and restore correctness never depends
+/// on it.
+pub fn prune_unreferenced_objects(instance_dir: &Path) -> Result<(), String> {
+    prune_unreferenced_objects_with_grace(instance_dir, None)
+}
+
+/// [`prune_unreferenced_objects`] with the collector's grace period chosen: `None` is the hour
+/// production uses, and a test passes zero to see what a sweep frees.
+pub(crate) fn prune_unreferenced_objects_with_grace(
+    instance_dir: &Path,
+    grace: Option<std::time::Duration>,
+) -> Result<(), String> {
+    prune_unreferenced_objects_with_pause(instance_dir, grace, None)
+}
+
+/// [`prune_unreferenced_objects_with_grace`] with the collector's pause installed: the test hook
+/// fires once every owner record has been listed and before the first delete.
+pub(crate) fn prune_unreferenced_objects_with_pause(
+    instance_dir: &Path,
+    grace: Option<std::time::Duration>,
+    pause: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+) -> Result<(), String> {
+    let report = crate::content_store::collect::collect_at_instance(
+        instance_dir,
+        &crate::content_store::collect::CollectRequest {
+            store: crate::content_store::collect::LockRequest::Wait,
+            locations: crate::content_store::collect::LockRequest::Try,
+            grace,
+            ignore_unreadable_snapshots: false,
+            pause,
+        },
+    )?;
+    if report.refused() {
+        return Err(format!(
+            "nothing was swept from the content store: {}",
+            report.refusal_reasons()
+        ));
+    }
     Ok(())
 }
 
@@ -2633,6 +3481,81 @@ mod tests {
     use tempfile::TempDir;
     use zip::write::SimpleFileOptions;
     use zip::CompressionMethod;
+
+    /// The Minecraft folders the fixtures model (core no longer knows them).
+    const TRACKED: &[&str] = &[
+        "mods",
+        "config",
+        "defaultconfigs",
+        "kubejs",
+        "resourcepacks",
+        "shaderpacks",
+        "datapacks",
+        "saves",
+        "options.txt",
+        "instance_manifest.json",
+    ];
+    const PRELAUNCH: &[&str] = &[
+        "mods",
+        "config",
+        "defaultconfigs",
+        "kubejs",
+        "resourcepacks",
+        "shaderpacks",
+        "datapacks",
+        "options.txt",
+        "instance_manifest.json",
+    ];
+
+    // Test-only defaults so the fixtures read the way they did before the
+    // Minecraft scope moved into the Minecraft package.
+    fn prelaunch_tracked_entries() -> &'static [&'static str] {
+        PRELAUNCH
+    }
+    fn create_snapshot(dir: &Path, label: Option<&str>) -> Result<Snapshot, String> {
+        super::create_snapshot(dir, label, TRACKED)
+    }
+    #[allow(dead_code)]
+    fn create_snapshot_with_origin(
+        dir: &Path,
+        label: Option<&str>,
+        origin: SnapshotOrigin,
+    ) -> Result<Snapshot, String> {
+        super::create_snapshot_with_origin(dir, label, TRACKED, origin)
+    }
+    fn restore_snapshot(dir: &Path, id: &str) -> Result<RestoreOutcome, String> {
+        super::restore_snapshot(dir, id, TRACKED)
+    }
+    fn restore_snapshot_impl(
+        dir: &Path,
+        id: &str,
+        fail_after: Option<usize>,
+    ) -> Result<RestoreOutcome, String> {
+        super::restore_snapshot_impl(dir, id, TRACKED, fail_after)
+    }
+    #[allow(dead_code)]
+    fn live_file_index(dir: &Path) -> Result<Vec<crate::lkg::FileEntry>, String> {
+        super::live_file_index(dir, TRACKED)
+    }
+    fn live_metadata_fingerprint(dir: &Path) -> Result<String, String> {
+        super::live_metadata_fingerprint(dir, TRACKED)
+    }
+    fn prelaunch_snapshot_is_reusable(dir: &Path, id: &str) -> bool {
+        super::prelaunch_snapshot_is_reusable(dir, id, PRELAUNCH)
+    }
+    fn snapshot_matches_live_incremental(dir: &Path, id: &str) -> Result<bool, String> {
+        super::snapshot_matches_live_incremental(dir, id, TRACKED)
+    }
+    fn read_snapshot_metadata_fingerprint(dir: &Path, id: &str) -> Option<String> {
+        super::read_snapshot_metadata_fingerprint(dir, id, TRACKED)
+    }
+    fn write_snapshot_metadata_fingerprint(
+        dir: &Path,
+        id: &str,
+        fingerprint: &str,
+    ) -> Result<(), String> {
+        super::write_snapshot_metadata_fingerprint(dir, id, fingerprint, TRACKED)
+    }
 
     fn make_instance(tmp: &TempDir) -> PathBuf {
         let dir = tmp.path().join("instance");
@@ -2647,11 +3570,209 @@ mod tests {
     }
 
     fn count_snapshot_objects(instance_dir: &Path) -> usize {
-        fs::read_dir(snapshot_objects_dir(instance_dir))
-            .unwrap()
-            .filter_map(Result::ok)
-            .map(|prefix| fs::read_dir(prefix.path()).unwrap().count())
+        // Snapshots write into the one content store; a store captured before the migration still
+        // holds its blobs in `snapshot-objects`. Count both, so a test about reachability is the
+        // same test before and after the move.
+        let object_stores = [
+            snapshot_objects_dir(instance_dir),
+            snapshot_store_paths(instance_dir).content_objects_dir(),
+        ];
+        object_stores
+            .iter()
+            .filter_map(|root| fs::read_dir(root).ok())
+            .flat_map(|prefixes| prefixes.filter_map(Result::ok))
+            .map(|prefix| {
+                fs::read_dir(prefix.path())
+                    .map(|entries| entries.filter_map(Result::ok).count())
+                    .unwrap_or(0)
+            })
             .sum()
+    }
+
+    /// Make `link` point at `target`: a junction on Windows (no administrator needed) and a
+    /// symlink elsewhere. Returns whether the link exists, so a test can fail rather than pass
+    /// without exercising it.
+    fn make_folder_link(target: &Path, link: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false);
+            made && std::fs::symlink_metadata(link)
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(false)
+        }
+        #[cfg(not(windows))]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+    }
+
+    /// Whether any object store still holds a file with this object name: the snapshots write into
+    /// the content store, and a store captured before the migration is in `snapshot-objects`.
+    fn blob_exists_in_any_store(instance_dir: &Path, hash: &str) -> bool {
+        snapshot_blob_path(instance_dir, hash).is_file()
+            || snapshot_store_paths(instance_dir)
+                .content_object_path(hash)
+                .is_file()
+    }
+
+    fn hash_of_first_blob(dir: &Path, id: &str) -> String {
+        let manifest = read_manifest_file(&snapshot_manifest_path(dir, id), id).unwrap();
+        manifest
+            .files
+            .iter()
+            .filter_map(|file| file.blob_sha256.as_deref().or(file.sha256.as_deref()))
+            .next()
+            .expect("snapshot records a blob hash")
+            .to_string()
+    }
+
+    /// Two instances with identical content, so their snapshots share one blob
+    /// in the app-wide object store. The instances live under `<data>/instances`
+    /// so the reachability scan derives the right app root.
+    fn two_instances_sharing_a_blob(tmp: &TempDir) -> (PathBuf, PathBuf, String, Snapshot) {
+        let instances = tmp.path().join("instances");
+        let a = instances.join("inst-a");
+        let b = instances.join("inst-b");
+        for dir in [&a, &b] {
+            fs::create_dir_all(dir.join("mods")).unwrap();
+            fs::write(dir.join("mods").join("shared.jar"), b"same bytes in both").unwrap();
+        }
+        let snap_a = create_snapshot(&a, Some("a")).unwrap();
+        let _snap_b = create_snapshot(&b, Some("b")).unwrap();
+        let hash = hash_of_first_blob(&a, &snap_a.id);
+        (a, b, hash, snap_a)
+    }
+
+    #[test]
+    fn review_a_manifest_naming_a_malformed_hash_keeps_the_objects_it_names() {
+        let tmp = TempDir::new().unwrap();
+        let instances = tmp.path().join("instances");
+        let a = instances.join("inst-a");
+        fs::create_dir_all(a.join("mods")).unwrap();
+        fs::write(a.join("mods").join("kept.jar"), b"keep me").unwrap();
+        let snap = create_snapshot(&a, Some("a")).unwrap();
+        let hash = hash_of_first_blob(&a, &snap.id);
+
+        // A record that names an object it cannot spell is still a record: the entries it names
+        // properly keep their objects, and the malformed name matches no object at all.
+        let manifest_path = snapshot_manifest_path(&a, &snap.id);
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        manifest["files"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "relative_path": "mods/other.jar",
+                "size": 3,
+                "sha256": "not-a-sha256",
+                "blob_sha256": "not-a-sha256",
+            }));
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        super::prune_unreferenced_objects_with_grace(&a, Some(std::time::Duration::ZERO)).unwrap();
+        assert!(
+            blob_exists_in_any_store(&a, &hash),
+            "a manifest that names an object must keep it, whatever else it spells wrong"
+        );
+    }
+
+    #[test]
+    fn review_list_snapshots_refuses_when_snapshot_folder_metadata_fails() {
+        let tmp = TempDir::new().unwrap();
+        let inst = tmp.path().join("inst");
+        fs::create_dir_all(&inst).unwrap();
+        let snapshots = snapshots_dir(&inst);
+        let error = super::list_snapshots_with(&inst, |path| {
+            if path == snapshots {
+                Err(std::io::Error::other("metadata unavailable"))
+            } else {
+                fs::symlink_metadata(path)
+            }
+        })
+        .expect_err("cannot tell whether snapshots exist, so listing must fail");
+        assert!(
+            error.to_string().contains("metadata unavailable"),
+            "the reason is reported: {error}"
+        );
+    }
+
+    #[test]
+    fn review_delete_keeps_blob_when_an_instance_location_is_a_link() {
+        let tmp = TempDir::new().unwrap();
+        let (a, b, hash, snap_a) = two_instances_sharing_a_blob(&tmp);
+        // The other instance is reached through a link. Which objects it holds cannot be judged
+        // without following a tree this collection was not asked about, so nothing is deleted.
+        let link = tmp.path().join("instances").join("linked");
+        if !make_folder_link(&b, &link) {
+            eprintln!(
+                "skipped: this process cannot create a folder link, so the check does not run"
+            );
+            return;
+        }
+        fs::remove_file(snapshot_manifest_path(&a, &snap_a.id)).unwrap();
+
+        let error =
+            super::prune_unreferenced_objects_with_grace(&a, Some(std::time::Duration::ZERO))
+                .expect_err("a linked instance must stop the collection");
+        assert!(
+            error.contains("is a link") && error.contains(&link.display().to_string()),
+            "the refusal names the link: {error}"
+        );
+        assert!(
+            blob_exists_in_any_store(&a, &hash),
+            "a collection that cannot judge a linked instance must delete nothing"
+        );
+    }
+
+    #[test]
+    fn review_delete_keeps_blob_referenced_only_from_each_trash_root() {
+        for trash_root in ["recently-deleted", "recently-deleted-games"] {
+            let tmp = TempDir::new().unwrap();
+            let (a, b, hash, snap_a) = two_instances_sharing_a_blob(&tmp);
+            assert!(
+                blob_exists_in_any_store(&a, &hash),
+                "setup: shared blob should exist"
+            );
+
+            // The other snapshot travels with its instance into Recently
+            // deleted; its `.agora_snapshots` folder is inside the moved folder.
+            let trashed = tmp.path().join(trash_root).join("entry-b").join("instance");
+            fs::create_dir_all(trashed.parent().unwrap()).unwrap();
+            fs::rename(&b, &trashed).unwrap();
+
+            delete_snapshot(&a, &snap_a.id).unwrap();
+            assert!(
+                blob_exists_in_any_store(&a, &hash),
+                "{trash_root}: blob needed only by a trashed snapshot was deleted"
+            );
+        }
+    }
+
+    #[test]
+    fn review_delete_keeps_blob_when_a_trash_root_cannot_be_listed() {
+        let tmp = TempDir::new().unwrap();
+        let instances = tmp.path().join("instances");
+        let a = instances.join("inst-a");
+        fs::create_dir_all(a.join("mods")).unwrap();
+        fs::write(a.join("mods").join("only.jar"), b"only here").unwrap();
+        let snap = create_snapshot(&a, Some("a")).unwrap();
+        let hash = hash_of_first_blob(&a, &snap.id);
+
+        // The root exists but cannot be listed (a file where a directory was
+        // expected). There may be a snapshot in it: "can't tell" keeps the blob.
+        fs::write(tmp.path().join("recently-deleted"), b"not a directory").unwrap();
+
+        delete_snapshot(&a, &snap.id).unwrap();
+        assert!(
+            blob_exists_in_any_store(&a, &hash),
+            "an unreadable trash root must keep the blob"
+        );
     }
 
     // Shared blobs live in one app-wide object store. An unreadable sibling
@@ -2677,9 +3798,8 @@ mod tests {
             .next()
             .expect("snapshot a records a blob hash")
             .to_string();
-        let blob = snapshot_blob_path(&a, &hash);
         assert!(
-            blob.is_file(),
+            blob_exists_in_any_store(&a, &hash),
             "setup: shared blob should exist before delete"
         );
 
@@ -2690,7 +3810,7 @@ mod tests {
         delete_snapshot(&a, &snap_a.id).unwrap();
 
         assert!(
-            blob.is_file(),
+            blob_exists_in_any_store(&a, &hash),
             "shared blob {hash} was removed while snapshot {} may still need it",
             snap_b.id
         );
@@ -2732,7 +3852,7 @@ mod tests {
         fs::write(snapshots_dir(&a).join("live-file-index.json"), b"garbage").unwrap();
         fs::write(snapshots_dir(&a).join("mutation-journal.json"), b"garbage").unwrap();
         assert!(count_snapshot_objects(&a) > 0);
-        delete_snapshot(&a, &snap.id).unwrap();
+        delete_snapshot_collecting(&a, &snap.id, Some(std::time::Duration::ZERO)).unwrap();
         assert!(!snapshot_objects_dir(&a).exists() || count_snapshot_objects(&a) == 0);
     }
 
@@ -3065,6 +4185,28 @@ mod tests {
         assert_eq!(snapshot_readiness(tmp.path()), SnapshotReadiness::Failed);
     }
 
+    /// The crash answer's test flow takes this full snapshot, so a world changed during the
+    /// test must be put back with it.
+    #[test]
+    fn a_full_snapshot_restores_a_world_changed_during_a_test() {
+        let tmp = TempDir::new().unwrap();
+        let inst = make_instance(&tmp);
+        let world = inst.join("saves").join("world1");
+        fs::create_dir_all(&world).unwrap();
+        fs::write(world.join("level.dat"), b"world before the test").unwrap();
+
+        let snap = create_snapshot(&inst, Some("crash-doctor-test")).unwrap();
+        fs::write(world.join("level.dat"), b"world changed by the test").unwrap();
+
+        let outcome = restore_snapshot(&inst, &snap.id).unwrap();
+
+        assert!(outcome.restored_roots.iter().any(|root| root == "saves"));
+        assert_eq!(
+            fs::read(world.join("level.dat")).unwrap(),
+            b"world before the test"
+        );
+    }
+
     #[test]
     fn restore_snapshot_preserves_content() {
         let tmp = TempDir::new().unwrap();
@@ -3108,7 +4250,12 @@ mod tests {
             .blob_sha256
             .as_deref()
             .unwrap();
-        let content = fs::read(snapshot_blob_path(&inst, hash)).unwrap();
+        let content = fs::read(
+            snapshot_blob_source(&inst, hash, 11)
+                .unwrap()
+                .expect("the object is in a store"),
+        )
+        .unwrap();
         assert_eq!(content, b"mod content");
     }
 
@@ -3121,7 +4268,9 @@ mod tests {
         let manifest_path = snapshot_manifest_path(&inst, &snap.id);
         assert!(manifest_path.exists());
 
-        delete_snapshot(&inst, &snap.id).unwrap();
+        // Grace zero: this test is about what deleting the last snapshot frees, and the fixture
+        // wrote its objects a moment ago.
+        delete_snapshot_collecting(&inst, &snap.id, Some(std::time::Duration::ZERO)).unwrap();
         assert!(!manifest_path.exists());
         assert_eq!(count_snapshot_objects(&inst), 0);
     }
@@ -3148,6 +4297,7 @@ mod tests {
             file_count: 1,
             size_estimate: contents.len() as u64,
             origin: None,
+            unreadable: None,
         };
         let legacy_manifest = serde_json::json!({
             "snapshot": snapshot,
@@ -3199,7 +4349,12 @@ mod tests {
             .blob_sha256
             .as_deref()
             .unwrap();
-        fs::write(snapshot_blob_path(&inst, hash), b"bad content").unwrap();
+        // Fixture: a stored object of the recorded size whose bytes are no longer the recorded
+        // ones. Restore must notice that and leave the live instance alone.
+        let stored = snapshot_store_paths(&inst).content_object_path(hash);
+        crate::content_store::protect::unprotect(&stored).unwrap();
+        let same_length_other_bytes = vec![0u8; fs::metadata(&stored).unwrap().len() as usize];
+        fs::write(&stored, &same_length_other_bytes).unwrap();
 
         let error = restore_snapshot(&inst, &snapshot.id).unwrap_err();
         assert!(error.contains("hash mismatch"));
@@ -3241,8 +4396,208 @@ mod tests {
         assert!(!inst.join(RESTORE_MARKER).exists());
     }
 
+    /// A rollback that could not finish leaves the journal in place.
+    ///
+    /// Recovery is the only thing that knows what the instance looked like before the interrupted
+    /// restore; removing its record when the rollback fails would leave a mixed instance with
+    /// nothing naming the state it should go back to (MASTER_SPEC §32.11).
     #[test]
-    fn interrupted_restore_is_recovered_before_a_new_attempt() {
+    fn a_failed_rollback_keeps_the_journal() {
+        let tmp = TempDir::new().unwrap();
+        let inst = make_instance(&tmp);
+        let pre = pre_restore_dir(&inst);
+        fs::create_dir_all(pre.join("characters")).unwrap();
+        fs::write(pre.join("characters").join("hero.sav"), b"level 1").unwrap();
+        fs::create_dir_all(inst.join("characters")).unwrap();
+        fs::write(inst.join("characters").join("hero.sav"), b"partial").unwrap();
+        fs::write(inst.join(RESTORE_MARKER), b"interrupted").unwrap();
+        // A leftover file where the rollback needs its displacement folder, so the rollback cannot
+        // even start: the recovery has to report that and leave its record alone.
+        fs::write(
+            inst.join(".agora_failed_restore_interrupted-interrupted"),
+            b"in the way",
+        )
+        .unwrap();
+        RestoreJournal {
+            schema_version: RESTORE_JOURNAL_SCHEMA_VERSION,
+            restore_id: "interrupted".into(),
+            snapshot_id: "whatever".into(),
+            original: vec![SnapshotRoot {
+                name: "characters".into(),
+                state: RootState::Directory,
+            }],
+            target: vec![SnapshotRoot {
+                name: "characters".into(),
+                state: RootState::Directory,
+            }],
+            committed: false,
+        }
+        .write(&inst)
+        .unwrap();
+
+        let error = restore_snapshot(&inst, "missing-snapshot").unwrap_err();
+
+        assert!(
+            error.contains("rollback"),
+            "the recovery says what it could not do: {error}"
+        );
+        assert!(
+            restore_journal_path(&inst).exists(),
+            "the journal is still there to recover from"
+        );
+    }
+
+    /// A backup that is a link is seen as a link.
+    ///
+    /// A folder replaced by a link to a path that no longer exists is still a folder standing in the
+    /// instance, and it is what a rollback has to put back. `exists()` follows the link, answers
+    /// "no such thing", and leaves the link in the backup folder behind a failed rollback
+    /// (MASTER_SPEC §32.13).
+    #[cfg(windows)]
+    #[test]
+    fn a_rollback_puts_back_a_dangling_link_as_a_link() {
+        use std::process::Command;
+
+        let tmp = TempDir::new().unwrap();
+        let inst = make_instance(&tmp);
+        fs::create_dir_all(inst.join("characters")).unwrap();
+        fs::write(inst.join("characters").join("hero.sav"), b"level 1").unwrap();
+        let snapshot = create_snapshot_scoped(
+            &inst,
+            Some("captured characters"),
+            &["characters", "mods", "config"],
+        )
+        .unwrap();
+
+        // The folder is now a junction to a place that does not exist.
+        fs::remove_dir_all(inst.join("characters")).unwrap();
+        let gone = tmp.path().join("gone");
+        let link = inst.join("characters");
+        let status = Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&link)
+            .arg(&gone)
+            .status()
+            .unwrap();
+        assert!(status.success(), "the junction was not created");
+        assert!(
+            matches!(
+                agora_game_api::probe(&link),
+                agora_game_api::Probe::Present(agora_game_api::PresentKind::Symlink)
+            ),
+            "the fixture is a link that is there"
+        );
+
+        let error = restore_snapshot_impl(&inst, &snapshot.id, Some(0)).unwrap_err();
+
+        assert!(
+            error.contains("original instance state was restored"),
+            "the rollback put the folder back: {error}"
+        );
+        assert!(
+            matches!(
+                agora_game_api::probe(&link),
+                agora_game_api::Probe::Present(agora_game_api::PresentKind::Symlink)
+            ),
+            "the link is back where it was"
+        );
+        assert!(
+            !restore_journal_path(&inst).exists(),
+            "and the journal is only kept when a rollback could not finish"
+        );
+    }
+
+    /// A folder the game no longer declares is restored by the same wholesale mechanism as any
+    /// tracked one, so a failure at any promotion step is rolled back through the journal instead
+    /// of leaving the folder half restored (MASTER_SPEC §32.7).
+    #[test]
+    fn an_interrupted_restore_of_a_retired_folder_rolls_back_at_every_step() {
+        // `characters` is first so the injected failure reaches it before any tracked root: the
+        // retired root's restore has no step of its own to interrupt. Every entry holds a file, so
+        // each one is a promotion step that can be made to fail.
+        const CAPTURED: &[&str] = &["characters", "mods", "config", "options.txt"];
+        for step in 0..CAPTURED.len() {
+            let tmp = TempDir::new().unwrap();
+            let inst = make_instance(&tmp);
+            fs::create_dir_all(inst.join("characters")).unwrap();
+            fs::write(inst.join("characters").join("hero.sav"), b"level 1").unwrap();
+            // Captured while `characters` was part of the scope; `TRACKED` no longer names it.
+            let snapshot =
+                create_snapshot_scoped(&inst, Some("captured characters"), CAPTURED).unwrap();
+
+            fs::write(inst.join("characters").join("hero.sav"), b"level 9").unwrap();
+            fs::write(inst.join("characters").join("new.sav"), b"created since").unwrap();
+            fs::write(inst.join("config").join("settings.toml"), b"key=changed").unwrap();
+
+            let error = restore_snapshot_impl(&inst, &snapshot.id, Some(step)).unwrap_err();
+            assert!(
+                error.contains("original instance state was restored"),
+                "step {step}: {error}"
+            );
+            assert_eq!(
+                fs::read(inst.join("characters").join("hero.sav")).unwrap(),
+                b"level 9",
+                "step {step}: the file the restore replaced is back"
+            );
+            assert_eq!(
+                fs::read(inst.join("characters").join("new.sav")).unwrap(),
+                b"created since",
+                "step {step}: the file created since the capture is back"
+            );
+            assert_eq!(
+                fs::read(inst.join("config").join("settings.toml")).unwrap(),
+                b"key=changed",
+                "step {step}"
+            );
+            assert!(
+                !inst.join(RESTORE_MARKER).exists(),
+                "step {step}: the marker is cleared"
+            );
+            assert!(
+                !restore_journal_path(&inst).exists(),
+                "step {step}: no journal is left to recover"
+            );
+        }
+    }
+
+    /// A root whose metadata cannot be read is cannot-tell, not absent.
+    ///
+    /// What a restore records about a root decides whether it is moved aside and whether an
+    /// interruption removes it, so "I could not look" must never become "it is not there". The
+    /// metadata lookup is injected so the failure can be exercised without the OS failing on cue.
+    #[test]
+    fn a_root_that_cannot_be_examined_is_cannot_tell_not_absent() {
+        let tmp = TempDir::new().unwrap();
+        let inst = make_instance(&tmp);
+        let refused = capture_root_states_with(&inst, &["mods"], |path| {
+            if path.ends_with("mods") {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "denied",
+                ))
+            } else {
+                fs::symlink_metadata(path)
+            }
+        })
+        .expect_err("a root that cannot be examined is cannot-tell");
+        assert!(
+            refused.contains("mods") && refused.contains("cannot tell"),
+            "{refused}"
+        );
+
+        // The control: what is there and what is not are still told apart.
+        let states = capture_root_states_with(&inst, &["mods", "datapacks"], |path| {
+            fs::symlink_metadata(path)
+        })
+        .unwrap();
+        assert_eq!(states[0].state, RootState::Directory);
+        assert_eq!(states[1].state, RootState::Absent);
+    }
+
+    #[test]
+    fn an_interrupted_restore_is_recovered_before_a_new_attempt() {
         let tmp = TempDir::new().unwrap();
         let inst = make_instance(&tmp);
         fs::write(
@@ -3426,7 +4781,11 @@ mod tests {
         let inst = make_instance(&tmp);
         let id = "legacy-scopeless";
         fs::create_dir_all(snapshots_dir(&inst)).unwrap();
-        let blob = store_snapshot_object(&inst, &inst.join("options.txt")).unwrap();
+        let blob = crate::content_store::place_object_from_file(
+            &snapshot_store_paths(&inst),
+            &inst.join("options.txt"),
+        )
+        .unwrap();
         let manifest = serde_json::json!({
             "schema_version": 3,
             "snapshot": {
@@ -3464,6 +4823,37 @@ mod tests {
         );
     }
 
+    /// The scope comparison a restore and the "no longer tracked" notice both ask: a declared
+    /// folder covers itself and everything under it, compared component by component.
+    #[test]
+    fn scope_comparison_follows_path_components() {
+        let declared = ["state/config", "characters"];
+        assert!(scope_contains(&declared, "characters"));
+        assert!(scope_contains(&declared, "characters/hero.sav"));
+        assert!(scope_contains(&declared, "characters/nested/deep.sav"));
+        assert!(scope_contains(&declared, "state/config/a.toml"));
+        // A sibling that shares a prefix with a declared folder is a different folder.
+        assert!(!scope_contains(&declared, "characters-old/hero.sav"));
+        assert!(!scope_contains(&declared, "state"));
+        assert!(!scope_contains(&declared, "state/configs/a.toml"));
+
+        // The case rule is the platform's: case-insensitive where the file system is (Windows,
+        // macOS), exact on Linux.
+        let insensitive = !cfg!(target_os = "linux");
+        assert_eq!(
+            scope_contains(&declared, "CHARACTERS/hero.sav"),
+            insensitive
+        );
+        assert_eq!(
+            scope_contains(&declared, "State/Config/a.toml"),
+            insensitive
+        );
+
+        // A path mapped inside a folder does not own that folder: `user` is not tracked just
+        // because `user/Plugins.txt` is (MASTER_SPEC §32.7).
+        assert!(!scope_contains(&["user/Plugins.txt"], "user"));
+    }
+
     fn write_test_archive(path: &Path, entries: &[(&str, &[u8])]) {
         let file = fs::File::create(path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
@@ -3473,5 +4863,26 @@ mod tests {
             zip.write_all(contents).unwrap();
         }
         zip.finish().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod id_tests {
+    use super::*;
+
+    /// A manifest and the receipt beside an object are both `<name>.json` in the same folder, so an
+    /// id that ends like a receipt would be read as a receipt: `list_snapshots` and the collector
+    /// would skip the manifest and free the blobs it names (MASTER_SPEC §32.8).
+    #[test]
+    fn every_reserved_snapshot_id_is_refused() {
+        for id in ["live-file-index", "mutation-journal", "snap.agora-verified"] {
+            assert!(!looks_like_snapshot_manifest(&format!("{id}.json")));
+            assert!(
+                validate_snapshot_id(id).is_err(),
+                "accepted reserved id {id}"
+            );
+            assert!(validate_snapshot_id(&id.to_ascii_uppercase()).is_err());
+        }
+        assert!(validate_snapshot_id("plain-id").is_ok());
     }
 }

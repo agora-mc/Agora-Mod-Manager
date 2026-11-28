@@ -46,6 +46,13 @@ pub struct Contributions {
     /// Content sources shown in Browse. Requires `content:provide`.
     #[serde(default)]
     pub content_providers: Vec<crate::provider::ProviderContribution>,
+    /// Game packages defined by this plugin. Requires `game:define`.
+    #[serde(default, alias = "game_packages")]
+    pub game_packages: Vec<GamePackageContribution>,
+    /// Crash doctor packs: JSON files of sources, parsers, inspectors and rules, whose shape is
+    /// `agora_game_api::crash::CrashPack`. Requires `crash:contribute`.
+    #[serde(default)]
+    pub crash_packs: Vec<CrashPackContribution>,
 }
 
 impl Contributions {
@@ -111,7 +118,23 @@ impl Contributions {
             && self.launch_checks.is_empty()
             && self.replacements.is_empty()
             && self.content_providers.is_empty()
+            && self.game_packages.is_empty()
+            && self.crash_packs.is_empty()
     }
+}
+
+/// A game package definition contributed by a plugin. Requires `game:define`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GamePackageContribution {
+    pub path: String,
+}
+
+/// A crash pack contributed by a plugin. Requires `crash:contribute`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CrashPackContribution {
+    pub path: String,
 }
 
 /// Which surface a contribution belongs to.

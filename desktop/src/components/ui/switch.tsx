@@ -3,23 +3,36 @@ import * as SwitchPrimitives from "@radix-ui/react-switch"
 
 import { cn } from "@/lib/utils"
 
+/**
+ * Agora's on/off switch. Off reads as off whatever the theme: a neutral track (not `--input`,
+ * which themes set to the accent), and only the on state takes the accent, with a soft glow.
+ * The knob slides with a small spring, shows a check when on, and stretches while pressed.
+ * Styles live in `index.css` (`.agora-switch`) so the app's Motion setting turns the
+ * movement off along with every other transition.
+ */
 const Switch = React.forwardRef<
   React.ElementRef<typeof SwitchPrimitives.Root>,
-  React.ComponentPropsWithoutRef<typeof SwitchPrimitives.Root>
->(({ className, ...props }, ref) => (
+  React.ComponentPropsWithoutRef<typeof SwitchPrimitives.Root> & {
+    size?: "sm" | "md"
+    /** "danger" turns the on state red, for switches whose on state is a warning (Lockdown Mode). */
+    tone?: "default" | "danger"
+  }
+>(({ className, size = "md", tone = "default", ...props }, ref) => (
   <SwitchPrimitives.Root
     className={cn(
-      "peer inline-flex h-6 w-11 shrink-0 cursor-pointer items-center rounded-full border-2 border-transparent transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:cursor-not-allowed disabled:opacity-50 data-[state=checked]:bg-primary data-[state=unchecked]:bg-input",
-      className
+      "agora-switch peer",
+      size === "sm" && "agora-switch--sm",
+      tone === "danger" && "agora-switch--danger",
+      className,
     )}
     {...props}
     ref={ref}
   >
-    <SwitchPrimitives.Thumb
-      className={cn(
-        "pointer-events-none block h-5 w-5 rounded-full bg-background shadow-lg ring-0 transition-transform data-[state=checked]:translate-x-5 data-[state=unchecked]:translate-x-0"
-      )}
-    />
+    <SwitchPrimitives.Thumb className="agora-switch__thumb">
+      <svg className="agora-switch__check" viewBox="0 0 12 12" aria-hidden="true">
+        <path d="M2.5 6.3 4.9 8.6 9.5 3.6" />
+      </svg>
+    </SwitchPrimitives.Thumb>
   </SwitchPrimitives.Root>
 ))
 Switch.displayName = SwitchPrimitives.Root.displayName

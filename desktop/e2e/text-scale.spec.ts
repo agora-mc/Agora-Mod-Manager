@@ -1,5 +1,5 @@
 import { test, expect, type Locator, type Page } from '@playwright/test';
-import { TOUR_STEPS } from '../src/features/tour/tourModel';
+import { TOUR_STEPS, visibleTourSteps } from '../src/features/tour/tourModel';
 
 /**
  * Text size at 150% must not push pages sideways or stack controls on top of
@@ -423,7 +423,7 @@ test('Settings reset controls stay in view at 150% text size', async ({ page }) 
 });
 
 test('the tour scrolls Settings into view before spotlighting it at 150% text size', async ({ page }) => {
-  const settingsStep = TOUR_STEPS.findIndex((step) => step.id === 'settings');
+  const settingsStep = visibleTourSteps(TOUR_STEPS, { multipleGames: false }).findIndex((step) => step.id === 'settings');
   expect(settingsStep).toBeGreaterThan(-1);
   await page.addInitScript((index) => {
     localStorage.setItem('agora-tour', JSON.stringify({ version: 1, status: 'running', index, completed: false }));
@@ -597,7 +597,7 @@ test('the install review opens at its title from a scrolled page at 100% text si
 });
 
 test('the install review keeps its title in view while the tour spotlights it', async ({ page }) => {
-  const reviewStep = TOUR_STEPS.findIndex((step) => step.id === 'install-review');
+  const reviewStep = visibleTourSteps(TOUR_STEPS, { multipleGames: false }).findIndex((step) => step.id === 'install-review');
   await page.addInitScript((index) => {
     localStorage.setItem('agora-tour', JSON.stringify({ version: 1, status: 'running', index, completed: false }));
   }, reviewStep);
@@ -673,6 +673,7 @@ for (const [label, preferences] of [['Civic Gold (dark)', {}], ['light', LIGHT_T
 
 test('export feedback reaches a user who exported from a scrolled page', async ({ page }) => {
   await bootEditor(page, 1280, 700, 1);
+  await page.getByRole('button', { name: 'Import & Export' }).click();
   await page.getByRole('button', { name: 'Export', exact: true }).click();
   await page.locator('main').evaluate((main) => {
     main.style.paddingBottom = '1500px';

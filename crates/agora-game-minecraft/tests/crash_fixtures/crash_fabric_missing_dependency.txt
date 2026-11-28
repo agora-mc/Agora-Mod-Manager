@@ -1,0 +1,18 @@
+---- Minecraft Crash Report ----
+// An invented crash for these tests.
+
+Description: Initializing game
+
+net.fabricmc.loader.impl.FormattedException: net.fabricmc.loader.impl.discovery.ModResolutionException: Mod resolution encountered an incompatible mod set!
+A potential solution has been determined:
+	 - Install examplelib, any version.
+Unmet dependency listing:
+	 - Mod 'Example Mod' (examplemod) 1.2.3 requires any version of examplelib, which is missing!
+	 - Mod 'Example Tools' (exampletools) 4.5.6 requires version 2.0.0 or later of mod 'Example Library' (examplelib), which is missing!
+More details:
+	 - See the loader log.
+	at net.fabricmc.loader.impl.FabricLoaderImpl.load(FabricLoaderImpl.java:1)
+
+A detailed walkthrough of the error:
+-- System Details --
+	Minecraft Version: 1.20.1

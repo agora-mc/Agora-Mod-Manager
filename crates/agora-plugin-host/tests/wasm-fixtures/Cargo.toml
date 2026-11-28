@@ -1,0 +1,16 @@
+[package]
+name = "agora-wasm-fixtures"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Deliberately not a workspace member: this crate only builds for
+# wasm32-wasip1, and its outputs are committed for the host's tests.
+[workspace]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

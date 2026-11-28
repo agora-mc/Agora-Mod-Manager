@@ -16,7 +16,7 @@ test('hanging startup invokes still render a branded shell immediately', async (
     });
   });
   await page.goto('/');
-  await expect(page.getByText('Agora Launcher')).toBeVisible();
+  await expect(page.getByText('Agora Mod Manager')).toBeVisible();
   await expect(page.getByText('Preparing your library…')).toBeVisible();
 });
 

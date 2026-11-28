@@ -1,9 +1,9 @@
 //! The outbound-request gate must be enforced at the request chokepoints, not
 //! at each feature module's entry point.
 //!
-//! These live in their own integration binary because the gate is process-wide:
-//! a unit test installing a denying gate would race every other test whose
-//! `Ctx::for_testing` installs a permissive one.
+//! The gate belongs to the clients (MASTER_SPEC 32.9), so each case hands its
+//! own clients a denying gate; nothing here touches the process-wide fallback,
+//! and no other test in the process can loosen it.
 //!
 //! Each case asserts that the request is refused *by the gate* rather than by
 //! URL validation or by the network. That distinction is the whole point — a
@@ -16,8 +16,7 @@ use agora_core::network_gate;
 use std::sync::Arc;
 
 fn deny_everything() -> HttpClients {
-    network_gate::install(Arc::new(network_gate::DenyAll));
-    HttpClients::for_testing(reqwest::Client::new())
+    HttpClients::for_testing(reqwest::Client::new()).with_gate(Arc::new(network_gate::DenyAll))
 }
 
 /// Every category, refused before any network work — including the two that
@@ -92,13 +91,14 @@ async fn the_gate_refuses_requests_carrying_custom_headers() {
 
 /// Every public request helper must reach the gate.
 ///
-/// A structural guard: the count of `network_gate::authorize` calls in the HTTP
-/// module must match the number of request entry points. Adding a helper
-/// without gating it should fail here rather than in production.
+/// A structural guard: the count of gate checks (`clients.authorize`, the
+/// clients' own gate) in the HTTP module must match the number of request entry
+/// points. Adding a helper without gating it should fail here rather than in
+/// production.
 #[test]
 fn every_request_path_in_the_http_module_consults_the_gate() {
     let source = include_str!("../src/http_client.rs");
-    let gated = source.matches("network_gate::authorize(").count();
+    let gated = source.matches("clients.authorize(category)?").count();
     assert!(
         gated >= 4,
         "expected every request chokepoint to call the gate, found {gated}"

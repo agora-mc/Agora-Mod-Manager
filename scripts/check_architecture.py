@@ -14,21 +14,37 @@ Checks:
 6. No direct HTTP request building in mod_install/modrinth_raw/crash_investigator
 7. Core crate has no tauri dependency
 8. Tauri binding name-manifest check runs (typed signatures explicitly waived)
+9. Update checks have one core implementation
+10. Live instance reads use the canonical manifest loader
+11. Game API depends only on serde, serde_json, semver, thiserror and regex (all dependency sections)
+12. Core must not reference the future Minecraft package's modules or crate
+13. Game packages' remaining agora-core references stay within a budget that only shrinks
+14. Process-wide state (`static`, `thread_local!`, `OnceLock`, `LazyLock`, `task_local!`) in
+    non-test code of core and the Minecraft package is on a checked-in allowlist
+15. Fail-closed reads (error-read-as-absent sites) in recovery, trust, lease, GC and staging
+    code stay within a budget that only shrinks (MASTER_SPEC §32.13)
 """
 
 import json
 import os
 import re
+import subprocess
 import sys
+import tomllib
 from pathlib import Path
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 DESKTOP_SRC = REPO_ROOT / "desktop" / "src-tauri" / "src"
 CORE_SRC = REPO_ROOT / "crates" / "agora-core" / "src"
 CLI_SRC = REPO_ROOT / "crates" / "agora" / "src"
+# Game packages hold game logic that used to live in core; the rules that
+# scanned core scan them too, or code moving out of core would escape them.
+MC_SRC = REPO_ROOT / "crates" / "agora-game-minecraft" / "src"
 
 CORE_CARGO = REPO_ROOT / "crates" / "agora-core" / "Cargo.toml"
+GAME_API_CARGO = REPO_ROOT / "crates" / "agora-game-api" / "Cargo.toml"
 
 # ---- Documented thin adapter modules ---------------------------------------
 # These modules share a name with a crate/agora-core module but are explicitly
@@ -150,7 +166,13 @@ def check_duplicate_modules() -> None:
         for m in re.finditer(r'^\s*pub\s+mod\s+(\w+)', text, re.MULTILINE):
             desktop_mods.add(m.group(1))
 
-    core_files = {p.stem for p in CORE_SRC.rglob("*.rs") if p.stem != "lib"}
+    core_files = {
+        p.stem
+        for root in (CORE_SRC, MC_SRC)
+        if root.exists()
+        for p in root.rglob("*.rs")
+        if p.stem not in ("lib", "mod")
+    }
 
     shared = desktop_mods & core_files
     unknown = shared - THIN_ADAPTER_MODULES
@@ -190,6 +212,16 @@ def check_orphaned_modules() -> None:
                 name = name.strip()
                 if name:
                     declared.add(name)
+        # ...and single-name re-exports, e.g.
+        # `pub use agora_game_minecraft::loader_manifests;`
+        for m in re.finditer(r'^\s*pub\s+use\s+(?:\w+::)+(\w+)\s*;', text, re.MULTILINE):
+            declared.add(m.group(1))
+    # Files in a subdirectory module (desktop/src-tauri/src/games/) are declared by that
+    # directory's mod.rs rather than by lib.rs, so those declarations count too.
+    for mod_rs in DESKTOP_SRC.rglob("mod.rs"):
+        text = mod_rs.read_text(encoding="utf-8")
+        for m in re.finditer(r'^\s*pub\s+mod\s+(\w+)', text, re.MULTILINE):
+            declared.add(m.group(1))
 
     found_files: set[str] = set()
     for p in DESKTOP_SRC.rglob("*.rs"):
@@ -298,6 +330,7 @@ def check_tauri_bindings_manifest() -> None:
 
 # The one module allowed to decide "does this installed item have an update?".
 UPDATE_CHECK_OWNER = "update_cache.rs"
+UPDATE_CHECK_OWNER_DIR = MC_SRC
 
 # Entry points that answer that question. An adapter reaching for either is
 # building a second implementation.
@@ -323,15 +356,15 @@ def check_single_update_check() -> None:
     and nothing enforced it, so a fix to one would have silently drifted from
     the other and shown up to the user as the badge disagreeing with the panel.
     Both now route through
-    `agora_core::update_cache::check_single_instance_updates_with`.
+    `agora_game_minecraft::update_cache::check_single_instance_updates_with`.
     """
-    search_roots = [DESKTOP_SRC, CLI_SRC, CORE_SRC]
+    search_roots = [DESKTOP_SRC, CLI_SRC, CORE_SRC, MC_SRC]
     hits: list[str] = []
     for root in search_roots:
         if not root.exists():
             continue
         for path in sorted(root.rglob("*.rs")):
-            if path.parent == CORE_SRC and path.name == UPDATE_CHECK_OWNER:
+            if path.parent == UPDATE_CHECK_OWNER_DIR and path.name == UPDATE_CHECK_OWNER:
                 continue
             text = path.read_text(encoding="utf-8", errors="replace")
             for lineno, line in enumerate(text.splitlines(), 1):
@@ -345,10 +378,10 @@ def check_single_update_check() -> None:
                         break
     if hits:
         err(
-            "Update-check logic found outside crates/agora-core/src/"
+            "Update-check logic found outside crates/agora-game-minecraft/src/"
             f"{UPDATE_CHECK_OWNER} — there must be exactly one implementation, "
             "or the update badge and the update panel can disagree. Call "
-            "agora_core::update_cache::check_single_instance_updates_with "
+            "agora_game_minecraft::update_cache::check_single_instance_updates_with "
             "instead"
         )
         for h in hits:
@@ -356,7 +389,7 @@ def check_single_update_check() -> None:
     else:
         print(
             "OK: update-check matching rules live only in "
-            f"agora-core/src/{UPDATE_CHECK_OWNER}"
+            f"agora-game-minecraft/src/{UPDATE_CHECK_OWNER}"
         )
 
 
@@ -393,7 +426,7 @@ def check_instance_manifest_raw() -> None:
     any read, but the file on disk must not be rewritten until the next write.
     That is only guaranteed if every live read goes through helpers::read_manifest.
     """
-    search_roots = [DESKTOP_SRC, CLI_SRC, CORE_SRC]
+    search_roots = [DESKTOP_SRC, CLI_SRC, CORE_SRC, MC_SRC]
     hits: list[str] = []
     for root in search_roots:
         if not root.exists():
@@ -421,7 +454,9 @@ def check_instance_manifest_raw() -> None:
                 #       serde_json::from_str(&text)...
                 # across two lines. Matching only the annotation's own line
                 # missed 28 real sites, so scan a small window.
-                if "InstanceManifest" not in line:
+                # A word match: `GameInstanceManifest` (generic instances) is a
+                # different type with no pack backfill, and must not trip this.
+                if not re.search(r"\bInstanceManifest\b", line):
                     continue
                 window = chr(10).join(lines[lineno - 1 : lineno + 2])
                 if "from_str" in window or "from_slice" in window or "from_reader" in window:
@@ -443,11 +478,1248 @@ def check_instance_manifest_raw() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# 11–12. Game package dependency boundaries
 # ---------------------------------------------------------------------------
 
+def dependency_tables(manifest: dict):
+    """Include development/build and target-specific dependencies, too."""
+    for kind in ("dependencies", "dev-dependencies", "build-dependencies"):
+        yield from manifest.get(kind, {}).items()
+    for target in manifest.get("target", {}).values():
+        yield from dependency_tables(target)
+
+
+def resolved_dependency(name: str, specification, workspace: dict) -> tuple[str, dict]:
+    if isinstance(specification, dict) and specification.get("workspace"):
+        specification = workspace.get("workspace", {}).get("dependencies", {}).get(name, specification)
+    details = specification if isinstance(specification, dict) else {}
+    return details.get("package", name), details
+
+
+def check_game_api_dependencies() -> None:
+    # serde_json and regex are for the crash contract: a pack is hand-written JSON, and its linter
+    # compiles rule regexes (MASTER_SPEC §30.11). Both are plain libraries, not a runtime.
+    #
+    # zip, sevenz-rust2, tar and flate2 are the one archive reader (§32.3). They are decoders, not a
+    # runtime: no process, no network, no operating-system store, and the workspace already carried
+    # all four for core and the Minecraft package. RAR has no such library, so the reader declares a
+    # seam and core fills it in out of process.
+    allowed = {
+        "serde",
+        "serde_json",
+        "semver",
+        "thiserror",
+        "regex",
+        "zip",
+        "sevenz-rust2",
+        "tar",
+        "flate2",
+        # Test-only, and the repository's own rule for a temporary directory (a path unique per
+        # process). It builds into no code that ships.
+        "tempfile",
+    }
+    if not GAME_API_CARGO.exists():
+        err("agora-game-api Cargo.toml missing")
+        return
+    try:
+        manifest = tomllib.loads(GAME_API_CARGO.read_text(encoding="utf-8"))
+        workspace = tomllib.loads((REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        err(f"Cannot inspect agora-game-api dependencies: {exc}")
+        return
+    forbidden = []
+    for alias, specification in dependency_tables(manifest):
+        package, details = resolved_dependency(alias, specification, workspace)
+        # A local crate named serde is not the approved contract dependency.
+        if package not in allowed or "path" in details or "git" in details:
+            forbidden.append(alias)
+    if forbidden:
+        err(
+            "agora-game-api dependencies must be serde, serde_json, semver, thiserror, regex or "
+            f"the archive decoders (zip, sevenz-rust2, tar, flate2) only: {sorted(forbidden)}"
+        )
+    else:
+        print(
+            "OK: agora-game-api depends only on serde, serde_json, semver, thiserror, regex and "
+            "the archive decoders"
+        )
+
+
+def is_game_package(name: str, path: str = "") -> bool:
+    if name in ("agora-game-api", "agora_game_api"):
+        return False
+    if name.startswith("agora-game-") or name.startswith("agora_game_"):
+        return True
+    path_norm = path.replace("\\", "/").rstrip("/")
+    if "agora-game-" in path_norm and not path_norm.endswith("agora-game-api"):
+        return True
+    return False
+
+
+def check_core_no_game_packages() -> None:
+    """Core never references a game package: adapters register packages into
+    core's `GameRegistry` through agora-game-api, never the other way round.
+    Check renamed dependencies as well as direct/import/include references."""
+    hits = []
+    if CORE_CARGO.exists():
+        try:
+            manifest = tomllib.loads(CORE_CARGO.read_text(encoding="utf-8"))
+            workspace = tomllib.loads((REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            err(f"Cannot inspect core game package dependencies: {exc}")
+            return
+        for alias, specification in dependency_tables(manifest):
+            package, details = resolved_dependency(alias, specification, workspace)
+            path_str = details.get("path", "")
+            if is_game_package(package, path_str):
+                hits.append(f"  {CORE_CARGO.relative_to(REPO_ROOT)}: dependency {alias}")
+    pattern = re.compile(r"\bagora_game_(?!api\b)\w+\b|agora-game-(?!api\b)[\w-]+")
+    # Tests and build scripts are part of core's dependency boundary too.
+    for path in sorted(CORE_CARGO.parent.rglob("*.rs")):
+        # Ignore comments (including multi-line block comments), but retain
+        # newlines so reported source locations remain useful.
+        source = path.read_text(encoding="utf-8")
+        source = re.sub(r"/\*.*?\*/", lambda m: "\n" * m.group().count("\n"), source, flags=re.S)
+        for lineno, line in enumerate(source.splitlines(), 1):
+            if pattern.search(line.split("//", 1)[0]):
+                hits.append(f"  {path.relative_to(REPO_ROOT)}:{lineno}: {line.strip()}")
+    if hits:
+        err("agora-core references game package modules — packages register through agora-game-api")
+        for hit in hits:
+            print(hit, file=sys.stderr)
+    else:
+        print("OK: agora-core does not reference any game package modules")
+
+
+check_core_no_minecraft_package = check_core_no_game_packages
+
+
+# ---------------------------------------------------------------------------
+# 13. Game packages' remaining dependence on agora-core only shrinks
+# ---------------------------------------------------------------------------
+# MASTER_SPEC §26.12: a game package depends on agora-game-api, never on
+# agora-core. Slice 2 moved Minecraft out of core but left
+# agora-game-minecraft using core's types and services; each use moves onto a
+# host service when another game needs that service, and the budget is zero by
+# Phase 5. Until a package's
+# budget reaches zero it may depend on agora-core, and its count of
+# `agora_core` references may only fall. A lower count must be written back
+# into the budget file, so a gain cannot be quietly given back.
+GAME_PACKAGE_CORE_BUDGET = REPO_ROOT / "scripts" / "game_package_core_budget.json"
+CRATES_DIR = REPO_ROOT / "crates"
+
+
+def count_core_references(package_dir: Path) -> int:
+    """`agora_core` identifiers in a package's Rust code, comments excluded."""
+    total = 0
+    for sub in ("src", "tests", "benches", "examples"):
+        root = package_dir / sub
+        if not root.exists():
+            continue
+        for path in sorted(root.rglob("*.rs")):
+            source = path.read_text(encoding="utf-8", errors="replace")
+            source = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
+            for line in source.splitlines():
+                total += len(re.findall(r"\bagora_core\b", line.split("//", 1)[0]))
+    build = package_dir / "build.rs"
+    if build.exists():
+        total += len(re.findall(r"\bagora_core\b", build.read_text(encoding="utf-8")))
+    return total
+
+
+def depends_on_core(cargo_toml: Path) -> bool:
+    try:
+        manifest = tomllib.loads(cargo_toml.read_text(encoding="utf-8"))
+        workspace = tomllib.loads((REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return True  # unreadable: assume the worst
+    for alias, specification in dependency_tables(manifest):
+        package, details = resolved_dependency(alias, specification, workspace)
+        if package == "agora-core" or details.get("path", "").rstrip("/").endswith("agora-core"):
+            return True
+    return False
+
+
+def check_game_package_core_budget() -> None:
+    try:
+        budget = json.loads(GAME_PACKAGE_CORE_BUDGET.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        budget = {}
+    except (OSError, ValueError) as exc:
+        err(f"Cannot read {GAME_PACKAGE_CORE_BUDGET.name}: {exc}")
+        return
+    problems = []
+    report = []
+    packages = sorted(
+        p for p in CRATES_DIR.glob("agora-game-*")
+        if p.name != "agora-game-api" and (p / "Cargo.toml").exists()
+    )
+    for package in packages:
+        name = package.name
+        count = count_core_references(package)
+        allowed = budget.get(name)
+        if allowed is None:
+            if depends_on_core(package / "Cargo.toml") or count:
+                problems.append(
+                    f"  {name}: depends on agora-core ({count} references) but has no "
+                    f"entry in {GAME_PACKAGE_CORE_BUDGET.name}; packages reach core "
+                    "through agora-game-api only"
+                )
+            continue
+        if count > allowed:
+            problems.append(
+                f"  {name}: {count} agora_core references, budget {allowed}; "
+                "this budget only shrinks"
+            )
+        elif count < allowed:
+            problems.append(
+                f"  {name}: {count} agora_core references, below the budget of "
+                f"{allowed}; lower it to {count} in {GAME_PACKAGE_CORE_BUDGET.name}"
+            )
+        elif count == 0 and depends_on_core(package / "Cargo.toml"):
+            problems.append(
+                f"  {name}: no agora_core references left; remove the agora-core "
+                "dependency and the budget entry"
+            )
+        else:
+            report.append(f"{name} {count}")
+    for name in sorted(set(budget) - {p.name for p in packages}):
+        problems.append(f"  {name}: budget entry for a package that does not exist")
+    if problems:
+        err("Game package dependence on agora-core (MASTER_SPEC §26.12)")
+        for problem in problems:
+            print(problem, file=sys.stderr)
+    elif report:
+        print("OK: game packages within their agora-core budget: " + ", ".join(report))
+    else:
+        print("OK: no game package depends on agora-core")
+
+
+# ---------------------------------------------------------------------------
+# 14. Process-wide state in core and the Minecraft package is on the allowlist
+# ---------------------------------------------------------------------------
+# MASTER_SPEC §32.9: a test seam lives on `Ctx` (or is passed in), because a
+# process-wide `static` lets one test's hook catch another test's code, and a
+# `thread_local!` cannot reach code the operation runs on another thread.
+# Configuration is moving onto `Ctx` too. What is left is written down with the
+# reason it really has to be process-wide: a guard that is one per process by
+# definition, a cache, a counter, or configuration that has not moved yet.
+PROCESS_STATE_ALLOWLIST = REPO_ROOT / "scripts" / "process_state_allowlist.json"
+
+# The item kinds §32.9 names: a `static` (which is also how `OnceLock` and
+# `LazyLock` state is declared, and what each `thread_local!`/`task_local!` block
+# holds), wherever it sits: at module level, inside a function body, or in a
+# `thread_local!`/`task_local!` block.
+PROCESS_STATE_ITEM = re.compile(r"(?<!')\bstatic\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)")
+# The items a function-local static can sit in. A `;` before the `{` means a
+# declaration without a body (a trait method), which owns nothing.
+ENCLOSING_ITEM = re.compile(r"\b(?:fn|mod)\s+([A-Za-z_][A-Za-z0-9_]*)[^{;]*\{")
+
+
+def process_state_items(root: Path) -> list[tuple[Path, int, str, str]]:
+    """Process-wide items in the non-test code under `root`, as (file, line, name, owner).
+
+    `owner` is the `fn`/`mod` an item sits inside (the innermost one), or `""` at
+    module level. A static inside a function is keyed by that function, so a
+    fifth `static RE` beside four existing ones in one file does not read as an
+    entry that is already allowed.
+
+    Test code is skipped through the shared scanner: only the item a
+    `#[cfg(test)]` attribute applies to is blanked, so production code after a
+    test helper is still counted.
+    """
+    items: list[tuple[Path, int, str, str]] = []
+    for path in sorted(root.rglob("*.rs")):
+        try:
+            source = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        cleaned = blank_test_items(blank_rust_noise(source))
+        owners = [
+            (match.start(), item_end(cleaned, match.start()), match.group(1))
+            for match in ENCLOSING_ITEM.finditer(cleaned)
+        ]
+        for match in PROCESS_STATE_ITEM.finditer(cleaned):
+            owner = ""
+            owner_start = -1
+            for start, end, name in owners:
+                if end is not None and start < match.start() < end and start > owner_start:
+                    owner, owner_start = name, start
+            line = cleaned.count("\n", 0, match.start()) + 1
+            items.append((path, line, match.group(1), owner))
+    return items
+
+
+def check_process_state_allowlisted() -> None:
+    try:
+        allowlist = json.loads(PROCESS_STATE_ALLOWLIST.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        allowlist = {}
+    except (OSError, ValueError) as exc:
+        err(f"Cannot read {PROCESS_STATE_ALLOWLIST.name}: {exc}")
+        return
+    found: set[str] = set()
+    for root in (CORE_SRC, MC_SRC):
+        for path, _line, name, owner in process_state_items(root):
+            relative = path.relative_to(REPO_ROOT).as_posix()
+            # A static inside a function is keyed by that function, so a fifth
+            # `static RE` in the same file cannot pass as an existing entry.
+            key = f"{relative}::{owner}::{name}" if owner else f"{relative}::{name}"
+            # A name declared twice in one owner (rare) gets its own numbered entry.
+            count = 1
+            while key in found:
+                count += 1
+                key = f"{relative}::{owner}::{name}#{count}" if owner else f"{relative}::{name}#{count}"
+            found.add(key)
+    unknown = sorted(found - set(allowlist))
+    stale = sorted(set(allowlist) - set(found))
+    bad_entry = sorted(
+        key
+        for key, entry in allowlist.items()
+        if key in found
+        and (
+            entry.get("category") not in {"config", "guard", "cache", "counter", "constant"}
+            or not entry.get("why")
+        )
+    )
+    if unknown or stale or bad_entry:
+        err("Process-wide state in agora-core / agora-game-minecraft (MASTER_SPEC §32.9)")
+        for key in unknown:
+            print(
+                f"  {key}: a static or thread-local that is not on the allowlist. A test "
+                "seam belongs on `Ctx` (or is passed in), and configuration is moving there "
+                f"too. Add it to {PROCESS_STATE_ALLOWLIST.name} with a category "
+                "(config|guard|cache|counter|constant) and the reason it is process-wide",
+                file=sys.stderr,
+            )
+        for key in stale:
+            print(f"  {key}: allowlisted but no longer found; remove the entry", file=sys.stderr)
+        for key in bad_entry:
+            print(
+                f"  {key}: allowlist entry needs a category "
+                "(config|guard|cache|counter|constant) and a `why`",
+                file=sys.stderr,
+            )
+    else:
+        print(
+            f"OK: {len(found)} process-wide items in core and the Minecraft package, "
+            "each allowlisted"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 15. Fail-closed reads: error-read-as-absent sites may only go down
+# ---------------------------------------------------------------------------
+# MASTER_SPEC §32.13. Most late review findings were one class of bug: an error
+# read as "nothing there" (`.exists()`, `.ok()`, `unwrap_or_default()` on a
+# read). In recovery, trust, lease, garbage-collection and staging code those
+# patterns decide whether user data may be deleted or overwritten, so they are
+# counted per file and may only fall: a lower count must be written back, the
+# same rule as the game-package budget above.
+#
+# What the count is, exactly: the three patterns, matched textually in the
+# file's production code.
+#
+# - Comments and the insides of string and char literals are blanked before
+#   counting, so `// p.exists()` and a `".ok()"` message string count nothing.
+# - Only the item a `#[cfg(test)]` attribute applies to is blanked: an inline
+#   `mod tests { ... }` with its braces, a `#[cfg(test)] mod helper;`
+#   declaration line, or a `#[cfg(test)] fn ...` test-only helper. Everything
+#   after it is still counted — a test-module declaration early in a file must
+#   not hide the production code below it. An attribute inside a parameter list
+#   (`fn present(#[cfg(test)] _c: usize, p: &Path)`) applies to that parameter
+#   alone, so only the attribute is blanked.
+# - Whitespace inside a call is allowed (`p.exists ()`, `.ok ( )`).
+#
+# The count is deliberately textual: telling a filesystem result from a parse
+# result needs types, and a count that needs a compiler is not a count any
+# contributor can run. It may therefore count a harmless site, which a slice can
+# remove or leave, but it does not miss one.
+#
+# The list is the modules the spec names: recovery (`startup_recovery`, the
+# journals and their passes, `backup`), trust (the signed registry and plugin
+# signatures), leases and locks (the runtime lease, the recorded process, the OS
+# lock, the session ledger), garbage collection (`snapshot`, `game_base`,
+# Recently deleted) and staging (`game_user_files`, `game_tool_swap`, plugin
+# installs, `content_store`). The authority for the list is MASTER_SPEC §32.13;
+# a slice that converts a whole module adds it here, and one that splits a file
+# moves its entry.
+FAIL_CLOSED_READ_BUDGET = REPO_ROOT / "scripts" / "fail_closed_read_budget.json"
+FAIL_CLOSED_READ_PATTERNS = (
+    re.compile(r"\.exists\s*\(\s*\)"),
+    re.compile(r"\.ok\s*\(\s*\)"),
+    re.compile(r"\.unwrap_or_default\s*\(\s*\)"),
+)
+# A `#[cfg(test)]` attribute, with any spacing.
+CFG_TEST_ATTRIBUTE = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
+# An attribute group, e.g. `#[allow(clippy::too_many_lines)]` on the same item.
+ATTRIBUTE = re.compile(r"#\s*!?\s*\[[^\]]*\]")
+
+
+def blank_rust_noise(source: str) -> str:
+    """Comments and the insides of string/char literals replaced by spaces.
+
+    Line structure is kept, so the result lines up with the input. What is left
+    cannot contain a pattern that only appears in a comment or a message string.
+    """
+    out: list[str] = []
+    index = 0
+    while index < len(source):
+        pair = source[index : index + 2]
+        if pair == "//":
+            end = source.find("\n", index)
+            end = len(source) if end == -1 else end
+            out.append(" " * (end - index))
+            index = end
+        elif pair == "/*":
+            # Rust block comments nest.
+            depth = 0
+            end = index
+            while end < len(source):
+                if source[end : end + 2] == "/*":
+                    depth += 1
+                    end += 2
+                elif source[end : end + 2] == "*/":
+                    depth -= 1
+                    end += 2
+                    if depth == 0:
+                        break
+                else:
+                    end += 1
+            out.append("".join("\n" if c == "\n" else " " for c in source[index:end]))
+            index = end
+        elif source[index] == "r" and re.match(r'r#*"', source[index:]):
+            # A raw string: r"..." or r#"..."#, closed by a quote and its hashes.
+            hashes = re.match(r'r(#*)"', source[index:]).group(1)
+            close = '"' + hashes
+            end = source.find(close, index + len(hashes) + 2)
+            end = len(source) if end == -1 else end + len(close)
+            out.append("".join("\n" if c == "\n" else " " for c in source[index:end]))
+            index = end
+        elif source[index] == '"':
+            end = index + 1
+            while end < len(source):
+                if source[end] == "\\":
+                    end += 2
+                elif source[end] == '"':
+                    end += 1
+                    break
+                else:
+                    end += 1
+            out.append("".join("\n" if c == "\n" else " " for c in source[index:end]))
+            index = end
+        elif source[index] == "'" and source[index + 1 : index + 2] != "":
+            # A char literal ('x', '\n', '\\', '\u{..}') or a lifetime ('a). Only a
+            # literal closes on its own quote, so a lifetime is left alone.
+            if source[index + 1] == "\\":
+                close = source.find("'", index + 2)
+            else:
+                close = index + 2 if source[index + 2 : index + 3] == "'" else -1
+            if close == -1:
+                out.append(source[index])
+                index += 1
+            else:
+                out.append(" " * (close + 1 - index))
+                index = close + 1
+        else:
+            out.append(source[index])
+            index += 1
+    return "".join(out)
+
+
+def item_end(source: str, start: int) -> int | None:
+    """One past the end of the item starting at `start`: its `;` or its brace block."""
+    brace = source.find("{", start)
+    semicolon = source.find(";", start)
+    if semicolon != -1 and (brace == -1 or semicolon < brace):
+        return semicolon + 1
+    if brace == -1:
+        return None
+    depth = 0
+    for index in range(brace, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return None
+
+
+def inside_parentheses(source: str, position: int) -> bool:
+    """Whether `position` sits inside a `(` that is still open — a parameter list.
+
+    An attribute there applies to the parameter it precedes, not to the item after the list.
+    """
+    stack: list[str] = []
+    for char in source[:position]:
+        if char in "([{":
+            stack.append(char)
+        elif char in ")]}" and stack:
+            stack.pop()
+    return stack[-1:] == ["("]
+
+
+def blank_test_items(source: str) -> str:
+    """Blank what a `#[cfg(test)]` attribute applies to, and only that.
+
+    A test module sits in the middle of some files (`content_store/mod.rs` declares one before its
+    production code), so dropping everything from the first test attribute to the end of the file
+    would hide real sites. Each attribute is followed to its own item instead.
+    """
+    while True:
+        match = CFG_TEST_ATTRIBUTE.search(source)
+        if not match:
+            return source
+        if inside_parentheses(source, match.start()):
+            # `fn present(#[cfg(test)] _c: usize, p: &Path) -> bool { p.exists() }`: the attribute
+            # applies to the parameter only, so blank it alone and keep counting the body.
+            source = (
+                source[: match.start()]
+                + " " * (match.end() - match.start())
+                + source[match.end() :]
+            )
+            continue
+        cursor = match.end()
+        while True:
+            whitespace = len(source[cursor:]) - len(source[cursor:].lstrip())
+            cursor += whitespace
+            further = ATTRIBUTE.match(source, cursor)
+            if not further:
+                break
+            cursor = further.end()
+        end = item_end(source, cursor)
+        if end is None:
+            # Nothing that looks like an item follows: blank the attribute only, so the count
+            # still sees whatever comes next.
+            end = match.end()
+        source = (
+            source[: match.start()]
+            + "".join("\n" if c == "\n" else " " for c in source[match.start() : end])
+            + source[end:]
+        )
+
+
+def count_fail_closed_reads(source: str) -> int:
+    """Error-read-as-absent sites in one Rust file, comments and test items excluded."""
+    cleaned = blank_test_items(blank_rust_noise(source))
+    return sum(len(pattern.findall(cleaned)) for pattern in FAIL_CLOSED_READ_PATTERNS)
+
+
+def count_fail_closed_reads_in(path: Path) -> int:
+    return count_fail_closed_reads(path.read_text(encoding="utf-8", errors="replace"))
+
+
+def is_test_only_module_file(path: Path) -> bool:
+    """True when the module that declares `path` declares it `#[cfg(test)] mod name;`.
+
+    Such a file is test code in full (a benchmark or fixture module), so the
+    production count skips it. The declaring module is the sibling `mod.rs`,
+    `lib.rs` or `main.rs`, or the parent directory's `<dir>.rs`.
+    """
+    stem = path.stem
+    if stem in ("mod", "lib", "main"):
+        return False
+    candidates = [path.parent / name for name in ("mod.rs", "lib.rs", "main.rs")]
+    candidates.append(path.parent.parent / f"{path.parent.name}.rs")
+    declaration = re.compile(
+        r"#\[cfg\(test\)\]\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+" + re.escape(stem) + r"\s*;"
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            text = blank_rust_noise(candidate.read_text(encoding="utf-8", errors="replace"))
+            if declaration.search(text):
+                return True
+    return False
+
+
+def check_fail_closed_reads() -> None:
+    try:
+        budget = json.loads(FAIL_CLOSED_READ_BUDGET.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        err(f"{FAIL_CLOSED_READ_BUDGET.name} is missing: the fail-closed read budget is checked in")
+        return
+    except (OSError, ValueError) as exc:
+        err(f"Cannot read {FAIL_CLOSED_READ_BUDGET.name}: {exc}")
+        return
+    files = budget.get("files", {})
+    directories = budget.get("directories", {})
+    problems: list[str] = []
+    report: list[str] = []
+
+    def compare(relative: str, count: int, allowed: int) -> None:
+        if count > allowed:
+            problems.append(
+                f"  {relative}: {count} error-read-as-absent sites, budget {allowed}; "
+                "this budget only shrinks. Use probe() or match the error instead"
+            )
+        elif count < allowed:
+            problems.append(
+                f"  {relative}: {count} error-read-as-absent sites, below the budget of "
+                f"{allowed}; lower it to {count} in {FAIL_CLOSED_READ_BUDGET.name}"
+            )
+        else:
+            report.append(f"{relative} {count}")
+
+    for relative, allowed in sorted(files.items()):
+        path = REPO_ROOT / relative
+        if not path.is_file():
+            problems.append(f"  {relative}: budgeted but not found; correct or remove the entry")
+            continue
+        if not isinstance(allowed, int):
+            problems.append(f"  {relative}: budget must be a whole number, not {allowed!r}")
+            continue
+        compare(relative, count_fail_closed_reads_in(path), allowed)
+    for relative, expected in sorted(directories.items()):
+        root = REPO_ROOT / relative
+        if not root.is_dir():
+            problems.append(f"  {relative}/: budgeted directory not found")
+            continue
+        if not isinstance(expected, dict):
+            problems.append(f"  {relative}/: budget must map each file to its count")
+            continue
+        # Every Rust file below the directory, not just the ones beside it: a
+        # recovery module that grows a subdirectory must be counted, not skipped.
+        present = {
+            path.relative_to(root).as_posix(): path
+            for path in sorted(root.rglob("*.rs"))
+            if not is_test_only_module_file(path)
+        }
+        for name in sorted(set(present) - set(expected)):
+            problems.append(
+                f"  {relative}/{name}: not in the budget "
+                f"({count_fail_closed_reads_in(present[name])} sites); add its count to "
+                f"{FAIL_CLOSED_READ_BUDGET.name}"
+            )
+        for name, allowed in sorted(expected.items()):
+            if name not in present:
+                problems.append(f"  {relative}/{name}: budgeted but not found")
+            elif not isinstance(allowed, int):
+                problems.append(f"  {relative}/{name}: budget must be a whole number")
+            else:
+                compare(f"{relative}/{name}", count_fail_closed_reads_in(present[name]), allowed)
+
+    if problems:
+        err("Fail-closed reads in recovery, trust, lease, GC and staging code (MASTER_SPEC §32.13)")
+        for problem in problems:
+            print(problem, file=sys.stderr)
+    elif report:
+        print(f"OK: fail-closed reads within budget in {len(report)} files")
+    else:
+        print("OK: no fail-closed read budget to check")
+
+
+# ---------------------------------------------------------------------------
+# 16. Path rules and path comparison: one of each, counts that only go down
+# ---------------------------------------------------------------------------
+# MASTER_SPEC §32.3. Dozens of functions used to decide "is this a safe relative
+# path", and three comparators decided "is this the same path", each with its own
+# idea of case, separators and links. The strict rule and the comparison now live
+# in `crates/agora-game-api/src/path.rs`; this counts what is left outside it, so
+# the number can only fall.
+#
+# Two counts, per file:
+#
+# - `validators`: a function that decides whether a path or a name may be used,
+#   found by its name (`is_`/`validate_`/`check_`/`assert_`/`sanitize_`/
+#   `normalize_`/`normalise_`/`clean_`/`lexical_` with a path noun) or by its body
+#   (it reasons about `ParentDir`, `is_absolute` or `has_root`). A name heuristic
+#   counts a few harmless functions; that errs toward counting, and a slice that
+#   deletes or renames one lowers the number.
+# - `comparisons`: the ingredients of a hand-written comparison —
+#   `fold_path_case(`, `canonicalize()` and `.components()` — in the recovery,
+#   trust and staging modules the spec names (§32.13's list is the same set of
+#   modules). The comparison module itself has none.
+#
+# Test items are blanked before counting, on the same rules as §15 above, so a
+# test fixture that names a path validator is not a validator.
+PATH_RULES_BUDGET = REPO_ROOT / "scripts" / "path_rules_budget.json"
+PATH_OWNER_MODULE = "crates/agora-game-api/src/path.rs"
+PATH_VALIDATOR_ROOTS = (
+    CORE_SRC,
+    REPO_ROOT / "crates" / "agora-game-api" / "src",
+    MC_SRC,
+    REPO_ROOT / "crates" / "agora-game-creation" / "src",
+    REPO_ROOT / "crates" / "agora-plugin-api" / "src",
+    REPO_ROOT / "crates" / "agora-plugin-host" / "src",
+    CLI_SRC,
+    DESKTOP_SRC,
+)
+# A function definition, with its name.
+FUNCTION_NAME = re.compile(r"\bfn\s+([A-Za-z0-9_]+)\s*[(<]")
+PATH_VALIDATOR_VERB = re.compile(
+    r"^(is|validate|check|assert|safe|sanitize|normalize|normalise|clean|lexical)_"
+)
+PATH_VALIDATOR_NOUN = re.compile(
+    r"(path|entry|component|relative|filename|file_name|rel_path|name|folder"
+    # A link helper decides whether a name may be used, which is the same decision as a path
+    # validator and should have the same one home. Counting them keeps a private copy visible.
+    r"|link|reparse|symlink)"
+)
+# Tokens a function that reasons about escaping has and a name check does not. A validator renamed
+# off the verb list is still found by these, which is the point: renaming is not a way out. Only
+# identifiers can be markers: comments and the insides of string and char literals are blanked
+# before the body is searched, so a rule written as `== ".."` is invisible to this count.
+PATH_VALIDATOR_BODY = (
+    "ParentDir",
+    "is_absolute",
+    "has_root",
+    "is_windows_device_name",
+)
+PATH_COMPARISON_PATTERNS = (
+    # The comparison ingredient itself, however it is called: a free function too.
+    re.compile(r"fold_path_case\s*\("),
+    # `canonicalize(` is the same call whether it is a method or a free function, and a comparison
+    # that spells it without the empty parentheses would otherwise not be counted.
+    re.compile(r"canonicalize\s*\("),
+    # `.components()`, `Path::components(` and an associated call alike.
+    re.compile(r"components\s*\("),
+)
+# The comparison functions and orderings a module may import under another name. An alias is the
+# same ingredient under a shorter spelling, so the alias is counted where it is used.
+PATH_COMPARATOR_NAMES = (
+    "fold_path_case",
+    "same_spelling",
+    "same_target",
+    "same_folder",
+    "compare_folder",
+    "same_path",
+    "paths_eq_case_insensitive",
+    "paths_eq_exact",
+    "canonical_paths_match",
+)
+ALIASED_IMPORT = re.compile(r"\b(?:pub\s+)?use\s+[^;]*;", re.S)
+ALIAS_PAIR = re.compile(r"\b([A-Za-z0-9_]+)\s+as\s+([A-Za-z0-9_]+)")
+# The recovery, trust, lease, GC and staging modules: the same set §15 counts, because they are
+# the modules whose decisions delete, overwrite or adopt user files.
+PATH_COMPARISON_MODULES = (
+    "crates/agora-core/src/artifact_hash.rs",
+    "crates/agora-core/src/backup.rs",
+    "crates/agora-core/src/db.rs",
+    "crates/agora-core/src/game_base/mod.rs",
+    "crates/agora-core/src/game_instance/trash.rs",
+    "crates/agora-core/src/game_mod_ini.rs",
+    "crates/agora-core/src/game_tool_swap.rs",
+    "crates/agora-core/src/game_user_files.rs",
+    "crates/agora-core/src/instance_runtime.rs",
+    "crates/agora-core/src/lkg.rs",
+    "crates/agora-core/src/lock_manager.rs",
+    "crates/agora-core/src/plugins/install.rs",
+    "crates/agora-core/src/plugins/install_recovery.rs",
+    "crates/agora-core/src/plugins/store.rs",
+    "crates/agora-core/src/process_identity.rs",
+    "crates/agora-core/src/recovery.rs",
+    "crates/agora-core/src/recovery_report.rs",
+    "crates/agora-core/src/registry_bundle.rs",
+    "crates/agora-core/src/registry_sync.rs",
+    "crates/agora-core/src/session_ledger.rs",
+    "crates/agora-core/src/snapshot.rs",
+    "crates/agora-core/src/startup_recovery.rs",
+    "crates/agora-game-minecraft/src/launcher_import_service.rs",
+    "crates/agora-game-minecraft/src/recently_deleted.rs",
+    # The staged writes of the content store. They have none today, and a hand-written comparison
+    # appearing in one is exactly what this count is for.
+    "crates/agora-core/src/content_store/convert.rs",
+    "crates/agora-core/src/content_store/mod.rs",
+    "crates/agora-core/src/content_store/place.rs",
+    "crates/agora-core/src/content_store/protect.rs",
+    "crates/agora-core/src/content_store/rar.rs",
+)
+
+
+def path_validators(source: str) -> list[str]:
+    """The names of the functions in one Rust file that decide whether a path may be used."""
+    cleaned = blank_test_items(blank_rust_noise(source))
+    names: list[str] = []
+    for match in FUNCTION_NAME.finditer(cleaned):
+        end = item_end(cleaned, match.end())
+        if end is None:
+            continue
+        name = match.group(1)
+        body = cleaned[match.end() : end]
+        by_name = bool(PATH_VALIDATOR_VERB.match(name)) and bool(
+            PATH_VALIDATOR_NOUN.search(name)
+        )
+        by_body = any(marker in body for marker in PATH_VALIDATOR_BODY)
+        if by_name or by_body:
+            names.append(name)
+    return names
+
+
+def count_path_validators_in(path: Path) -> int:
+    return len(path_validators(path.read_text(encoding="utf-8", errors="replace")))
+
+
+def comparison_aliases(source: str) -> list[str]:
+    """The other names this file gives a comparison function, from `use ... as ...`.
+
+    An ingredient imported under a shorter name is the same ingredient: `use
+    agora_game_api::fold_path_case as fold;` then `fold(a) == fold(b)` is a hand-written comparison
+    with the module's name hidden, so the alias is counted where it is used.
+    """
+    aliases = []
+    for declaration in ALIASED_IMPORT.findall(source):
+        for original, alias in ALIAS_PAIR.findall(declaration):
+            if original in PATH_COMPARATOR_NAMES:
+                aliases.append(alias)
+    return aliases
+
+
+def count_path_comparisons(source: str) -> int:
+    """Hand-written path comparisons in one Rust file, comments and test items excluded."""
+    cleaned = blank_test_items(blank_rust_noise(source))
+    count = sum(len(pattern.findall(cleaned)) for pattern in PATH_COMPARISON_PATTERNS)
+    for alias in comparison_aliases(cleaned):
+        count += len(re.findall(rf"\b{re.escape(alias)}\s*\(", cleaned))
+    return count
+
+
+def count_path_comparisons_in(path: Path) -> int:
+    return count_path_comparisons(path.read_text(encoding="utf-8", errors="replace"))
+
+
+def budget_baseline_ref() -> str | None:
+    """The commit the budget is compared against: where this branch left `origin/master`.
+
+    Comparing with `HEAD` only sees the last commit, and a pull request is many commit
+    boundaries: raising the code in one commit and the budget in the next would pass both
+    comparisons separately. The branch point is the copy a reviewer already has, so it is the one
+    that decides. Outside a clone with a remote — a tarball, a first commit — the parent of `HEAD`
+    is the best that can be had, and `None` (no baseline, with a note) is the honest answer when
+    there is no parent either.
+    """
+    for args in (
+        ["merge-base", "HEAD", "origin/master"],
+        ["rev-parse", "--verify", "HEAD^"],
+    ):
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    return None
+
+
+def committed_budget() -> dict[str, Any] | None:
+    """The budget as the branch point has it, or `None` when there is no git to ask.
+
+    The budget may only go down, and a comparison against the file's own numbers cannot see a
+    commit that raised code and budget together. The committed copy can: a raised number is a
+    raised number, whatever the working tree says. `None` also covers a baseline commit that did
+    not have the file yet: the caller says so rather than inventing a number.
+    """
+    reference = budget_baseline_ref()
+    if reference is None:
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "show", f"{reference}:{PATH_RULES_BUDGET.relative_to(REPO_ROOT).as_posix()}"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)
+    except ValueError:
+        return None
+
+
+def check_path_rules() -> None:
+    try:
+        budget = json.loads(PATH_RULES_BUDGET.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        err(f"{PATH_RULES_BUDGET.name} is missing: the path rule budget is checked in")
+        return
+    except (OSError, ValueError) as exc:
+        err(f"Cannot read {PATH_RULES_BUDGET.name}: {exc}")
+        return
+    validators = budget.get("validators", {})
+    comparisons = budget.get("comparisons", {})
+    problems: list[str] = []
+    report: list[str] = []
+
+    # The budget only goes down. Raising it in the same change as the code it counts would otherwise
+    # pass, because the file and the code would agree; the copy at the branch point does not agree,
+    # and it stays the same for every commit of the pull request, so raising the code in one commit
+    # and the budget in the next is caught too. The one exception is a change to the counting rule
+    # itself, which says so by bumping `rule`: then the numbers are re-taken from the truth and the
+    # reviewer sees the rule diff beside them.
+    committed = committed_budget()
+    if committed is None:
+        print(
+            "note: no committed budget to compare against (no git, no parent commit, or the file "
+            "is new at the branch point); the only-goes-down rule is unchecked this run",
+            file=sys.stderr,
+        )
+    elif budget.get("rule") != committed.get("rule"):
+        print(
+            f"note: the counting rule changed ({committed.get('rule')} -> {budget.get('rule')}), "
+            "so the numbers are re-taken; the only-goes-down rule starts from this commit",
+            file=sys.stderr,
+        )
+    else:
+        for section in ("validators", "comparisons"):
+            was = committed.get(section, {})
+            now = budget.get(section, {})
+            for name in sorted(set(now) | set(was)):
+                allowed_now = now.get(name, 0)
+                allowed_was = was.get(name, 0)
+                if isinstance(allowed_now, int) and allowed_now > allowed_was:
+                    problems.append(
+                        f"  {name}: {section} budget raised from {allowed_was} to {allowed_now}; "
+                        f"this budget only shrinks, so the code it counts must fall instead"
+                    )
+
+    def compare(relative: str, count: int, allowed: int, what: str, hint: str) -> None:
+        if count > allowed:
+            problems.append(
+                f"  {relative}: {count} {what}, budget {allowed}; this budget only shrinks. "
+                f"{hint}"
+            )
+        elif count < allowed:
+            problems.append(
+                f"  {relative}: {count} {what}, below the budget of {allowed}; lower it to "
+                f"{count} in {PATH_RULES_BUDGET.name}"
+            )
+        else:
+            report.append(f"{relative} {count}")
+
+    found_validators = {}
+    for root in PATH_VALIDATOR_ROOTS:
+        if not root.is_dir():
+            continue
+        for path in sorted(root.rglob("*.rs")):
+            if is_test_only_module_file(path):
+                continue
+            relative = path.relative_to(REPO_ROOT).as_posix()
+            if relative == PATH_OWNER_MODULE:
+                continue
+            count = count_path_validators_in(path)
+            if count:
+                found_validators[relative] = count
+    for name in sorted(set(found_validators) - set(validators)):
+        problems.append(
+            f"  {name}: {found_validators[name]} private path validator(s) not in the budget; "
+            f"use agora_game_api::RelPath::strict, FileName or validate_path_set, or add its "
+            f"count to {PATH_RULES_BUDGET.name}"
+        )
+    for name in sorted(set(validators) - set(found_validators)):
+        problems.append(f"  {name}: budgeted but no path validator found; remove its entry")
+    for name in sorted(set(validators) & set(found_validators)):
+        allowed = validators[name]
+        if not isinstance(allowed, int):
+            problems.append(f"  {name}: budget must be a whole number, not {allowed!r}")
+        else:
+            compare(
+                name,
+                found_validators[name],
+                allowed,
+                "path validator(s)",
+                "Move it onto RelPath::strict or FileName and lower the budget",
+            )
+
+    found_comparisons = {}
+    for relative in PATH_COMPARISON_MODULES:
+        path = REPO_ROOT / relative
+        if not path.is_file():
+            problems.append(f"  {relative}: a counted module that is not there; correct the list")
+            continue
+        count = count_path_comparisons_in(path)
+        if count:
+            found_comparisons[relative] = count
+    for name in sorted(set(found_comparisons) - set(comparisons)):
+        problems.append(
+            f"  {name}: {found_comparisons[name]} hand-written path comparison(s) not in the "
+            f"budget; use agora_game_api::same_spelling, same_target or same_folder, or add its "
+            f"count to {PATH_RULES_BUDGET.name}"
+        )
+    for name in sorted(set(comparisons) - set(found_comparisons)):
+        problems.append(f"  {name}: budgeted but no path comparison found; remove its entry")
+    for name in sorted(set(comparisons) & set(found_comparisons)):
+        allowed = comparisons[name]
+        if not isinstance(allowed, int):
+            problems.append(f"  {name}: budget must be a whole number, not {allowed!r}")
+        else:
+            compare(
+                name,
+                found_comparisons[name],
+                allowed,
+                "hand-written path comparison(s)",
+                "Move it onto the game contract's comparison and lower the budget",
+            )
+
+    if problems:
+        err("Path rules and path comparison (MASTER_SPEC §32.3)")
+        for problem in problems:
+            print(problem, file=sys.stderr)
+    else:
+        total = sum(found_validators.values()) + sum(found_comparisons.values())
+        print(f"OK: {total} path rules left outside agora-game-api, within budget")
+
+
+# ---------------------------------------------------------------------------
+# 17. Direct archive opens: one reader, counted, and the count may only go down
+# ---------------------------------------------------------------------------
+# MASTER_SPEC §32.3. About 37 production call sites opened zip archives themselves, each with its
+# own idea of which entry names were acceptable and how large an archive may be; `tar.gz` runtimes
+# had their own `tar` code; and RAR went through `tar.exe` through a third path. The one reader is
+# `agora-game-api::SafeArchive`; this counts what still opens an archive directly, per file, so the
+# number can only fall.
+#
+# An *open* is a decoder constructed, or a process spawned that lists or extracts an archive: the
+# zip crate's reader, `sevenz_rust2`'s archive and reader, the `tar` crate's archive, a gzip decoder
+# wrapped around one, and a `tar.exe`/`unrar` command. Writing an archive is not counted: only reads
+# are this slice's job, and the writers are a different one.
+#
+# Two files are the reader itself and are not counted: the contract's `archive.rs`, and core's
+# out-of-process RAR backend, which is the `RarReader` implementation the seam exists for. Test
+# items are blanked before counting, on the same rules as §15 and §16.
+ARCHIVE_BUDGET = REPO_ROOT / "scripts" / "archive_budget.json"
+ARCHIVE_OWNER_MODULES = (
+    "crates/agora-game-api/src/archive.rs",
+    "crates/agora-core/src/content_store/rar.rs",
+)
+ARCHIVE_OPEN_ROOTS = (
+    CORE_SRC,
+    REPO_ROOT / "crates" / "agora-game-minecraft" / "src",
+    REPO_ROOT / "crates" / "agora-game-creation" / "src",
+    REPO_ROOT / "crates" / "agora-plugin-host" / "src",
+    CLI_SRC,
+    DESKTOP_SRC,
+)
+# Each pattern is one direct open, however it is spelled. `ZipArchive::new` covers `zip::ZipArchive`
+# and the imported `ZipArchive`; `ZipWriter` is a write and is deliberately absent.
+ARCHIVE_OPEN_PATTERNS = (
+    re.compile(r"ZipArchive\s*::\s*new\s*\("),
+    re.compile(r"sevenz_rust2\s*::\s*Archive\s*::\s*read\s*\("),
+    re.compile(r"sevenz_rust2\s*::\s*ArchiveReader\s*::\s*new\s*\("),
+    re.compile(r"tar\s*::\s*Archive\s*::\s*new\s*\("),
+    re.compile(r"flate2\s*::\s*read\s*::\s*GzDecoder\s*::\s*new\s*\("),
+    # A process that lists or extracts an archive.
+    re.compile(r"Command\s*::\s*new\s*\(\s*[^)]*(?:tar|unrar|7z)"),
+)
+
+
+def archive_opens_in(path: Path) -> int:
+    """How many times one Rust file opens an archive directly."""
+    cleaned = blank_test_items(blank_rust_noise(path.read_text(encoding="utf-8", errors="replace")))
+    return sum(len(pattern.findall(cleaned)) for pattern in ARCHIVE_OPEN_PATTERNS)
+
+
+def check_one_archive_reader() -> None:
+    try:
+        budget_document = json.loads(ARCHIVE_BUDGET.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        err(f"{ARCHIVE_BUDGET.name} is missing: the archive-open budget is checked in")
+        return
+    except (OSError, ValueError) as exc:
+        err(f"Cannot read {ARCHIVE_BUDGET.name}: {exc}")
+        return
+    allowed_counts = budget_document.get("opens", {})
+    if not isinstance(allowed_counts, dict):
+        err(f"{ARCHIVE_BUDGET.name}: 'opens' must be an object of file to count")
+        return
+
+    found = {}
+    for root in ARCHIVE_OPEN_ROOTS:
+        if not root.is_dir():
+            continue
+        for path in sorted(root.rglob("*.rs")):
+            if is_test_only_module_file(path):
+                continue
+            relative = path.relative_to(REPO_ROOT).as_posix()
+            if relative in ARCHIVE_OWNER_MODULES:
+                continue
+            count = archive_opens_in(path)
+            if count:
+                found[relative] = count
+
+    problems = []
+    for name in sorted(set(found) - set(allowed_counts)):
+        problems.append(
+            f"  {name}: {found[name]} direct archive open(s) not in the budget; use "
+            f"agora_game_api::SafeArchive, or add its count to {ARCHIVE_BUDGET.name}"
+        )
+    for name in sorted(set(allowed_counts) - set(found)):
+        problems.append(f"  {name}: budgeted but no direct archive open found; remove its entry")
+
+    committed = committed_archive_budget()
+    if committed is None:
+        print(
+            "note: no committed archive budget to compare against (no git, no parent commit, or "
+            "the file is new at the branch point); the only-goes-down rule is unchecked this run",
+            file=sys.stderr,
+        )
+    elif budget_document.get("rule") != committed.get("rule"):
+        print(
+            f"note: the counting rule changed ({committed.get('rule')} -> "
+            f"{budget_document.get('rule')}), so the numbers are re-taken; the only-goes-down rule "
+            "starts from this commit",
+            file=sys.stderr,
+        )
+    else:
+        was = committed.get("opens", {})
+        for name in sorted(set(found) | set(was)):
+            raised = found.get(name, 0) > was.get(name, 0)
+            if raised:
+                problems.append(
+                    f"  {name}: direct archive opens raised from {was.get(name, 0)} to "
+                    f"{found.get(name, 0)}; this budget only shrinks"
+                )
+
+    for name in sorted(set(found) & set(allowed_counts)):
+        allowed = allowed_counts[name]
+        if not isinstance(allowed, int):
+            problems.append(f"  {name}: budget must be a whole number, not {allowed!r}")
+        elif found[name] > allowed:
+            problems.append(
+                f"  {name}: {found[name]} direct archive opens, budget {allowed}; this budget only "
+                "shrinks. Move the open onto agora_game_api::SafeArchive"
+            )
+        elif found[name] < allowed:
+            problems.append(
+                f"  {name}: {found[name]} direct archive opens, below the budget of {allowed}; "
+                f"lower it to {found[name]} in {ARCHIVE_BUDGET.name}"
+            )
+
+    if problems:
+        err("One archive reader (MASTER_SPEC §32.3)")
+        for problem in problems:
+            print(problem, file=sys.stderr)
+    else:
+        total = sum(found.values())
+        print(f"OK: {total} direct archive opens left outside SafeArchive, within budget")
+
+
+def committed_archive_budget() -> dict[str, Any] | None:
+    """The archive budget as the branch point has it, or `None` when there is no git to ask."""
+    reference = budget_baseline_ref()
+    if reference is None:
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "show", f"{reference}:{ARCHIVE_BUDGET.relative_to(REPO_ROOT).as_posix()}"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 18. Direct writes in the Minecraft package: counted, and the count may only go down
+# ---------------------------------------------------------------------------
+# MASTER_SPEC §32.4: one durable way to put files into an instance is staged apply (and, for a new
+# instance, its whole-folder protocol). A writer that writes the instance's files itself gets
+# none of it: no journal, no commit point, no recovery, no keeping the user's changed files. The
+# Minecraft package is where the instance writers live, so its direct writes are counted per
+# file, and a file's number may only fall: a new direct write fails until it goes through staged
+# apply or its file's number is raised in the budget, which a reviewer then sees.
+#
+# A *direct write* is a call that changes a file's bytes or where it is: `fs::write`, `fs::copy`,
+# `fs::rename`, `fs::remove_file`, `fs::remove_dir_all`, and the manifest's `atomic_write_manifest`
+# (with or without a `std::` prefix). Creating a folder is not counted. The count is textual, on
+# the production code only (comments, strings and test items blanked, as in §15), so it also
+# counts writes that never touch an instance (exports, the app's own data); those are the ones a
+# slice may leave. It does not tell an instance path from another, and does not try.
+INSTANCE_WRITE_BUDGET = REPO_ROOT / "scripts" / "instance_write_budget.json"
+INSTANCE_WRITE_ROOT = REPO_ROOT / "crates" / "agora-game-minecraft" / "src"
+DIRECT_WRITE_PATTERNS = (
+    re.compile(r"\bfs\s*::\s*(?:write|copy|rename|remove_file|remove_dir_all)\s*\("),
+    re.compile(r"\batomic_write_manifest\s*\("),
+)
+
+
+def count_direct_instance_writes(source: str) -> int:
+    """Direct writes in one Rust file's production code."""
+    cleaned = blank_test_items(blank_rust_noise(source))
+    return sum(len(pattern.findall(cleaned)) for pattern in DIRECT_WRITE_PATTERNS)
+
+
+def is_test_file_by_name(path: Path) -> bool:
+    """A file of test code by where it lives: below a `tests` folder, or named `tests.rs` or
+    `*_tests.rs`. (`is_test_only_module_file` sees only the module that declares a file; a test
+    folder's files are declared by its own `mod.rs`, which is itself the test-only one.)"""
+    relative = path.relative_to(INSTANCE_WRITE_ROOT)
+    return (
+        "tests" in relative.parts[:-1]
+        or path.stem == "tests"
+        or path.stem.endswith("_tests")
+    )
+
+
+def check_direct_instance_writes() -> None:
+    try:
+        budget = json.loads(INSTANCE_WRITE_BUDGET.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        err(f"{INSTANCE_WRITE_BUDGET.name} is missing: the direct-write budget is checked in")
+        return
+    except (OSError, ValueError) as exc:
+        err(f"Cannot read {INSTANCE_WRITE_BUDGET.name}: {exc}")
+        return
+    allowed = budget.get("writes", {})
+    if not isinstance(allowed, dict):
+        err(f"{INSTANCE_WRITE_BUDGET.name}: 'writes' must be an object of file to count")
+        return
+    found = {}
+    if INSTANCE_WRITE_ROOT.is_dir():
+        for path in sorted(INSTANCE_WRITE_ROOT.rglob("*.rs")):
+            if is_test_only_module_file(path) or is_test_file_by_name(path):
+                continue
+            count = count_direct_instance_writes(
+                path.read_text(encoding="utf-8", errors="replace")
+            )
+            if count:
+                found[path.relative_to(REPO_ROOT).as_posix()] = count
+    problems = []
+    for name in sorted(set(found) | set(allowed)):
+        count, limit = found.get(name, 0), allowed.get(name, 0)
+        if not isinstance(limit, int):
+            problems.append(f"  {name}: budget must be a whole number, not {limit!r}")
+        elif count > limit:
+            problems.append(
+                f"  {name}: {count} direct writes, budget {limit}; write through staged apply "
+                f"(agora_core::staged_apply) instead, or raise its number in "
+                f"{INSTANCE_WRITE_BUDGET.name} with the reason in the commit"
+            )
+        elif count < limit:
+            removal = " (remove the entry)" if not count else ""
+            problems.append(
+                f"  {name}: {count} direct writes, below the budget of {limit}; lower it to "
+                f"{count} in {INSTANCE_WRITE_BUDGET.name}{removal}"
+            )
+    if problems:
+        err("Direct file writes in the Minecraft package (MASTER_SPEC §32.4)")
+        for problem in problems:
+            print(problem, file=sys.stderr)
+    else:
+        print(f"OK: {sum(found.values())} direct writes in {len(found)} files, within budget")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def main() -> int:
-    print("=== Architecture Boundary Checks ===\n")
 
     print("--- 1. Raw reqwest::Client in desktop ---")
     check_reqwest_desktop()
@@ -487,6 +1759,37 @@ def main() -> int:
 
     print("--- 10. Single InstanceManifest loader (lazy backfill) ---")
     check_instance_manifest_raw()
+    print()
+
+    print("--- 11. Game API contract dependencies ---")
+    check_game_api_dependencies()
+    print()
+
+    print("--- 12. Core has no game package references ---")
+    check_core_no_game_packages()
+
+    print("\n--- 13. Game packages' agora-core budget ---")
+    check_game_package_core_budget()
+    print()
+
+    print("--- 14. Process-wide state is on the allowlist ---")
+    check_process_state_allowlisted()
+    print()
+
+    print("--- 15. Fail-closed reads in recovery, trust, lease, GC and staging code ---")
+    check_fail_closed_reads()
+    print()
+
+    print("--- 16. Path rules and path comparison ---")
+    check_path_rules()
+    print()
+
+    print("--- 17. One archive reader ---")
+    check_one_archive_reader()
+    print()
+
+    print("--- 18. Direct instance writes ---")
+    check_direct_instance_writes()
     print()
 
     if EXIT_CODE == 0:

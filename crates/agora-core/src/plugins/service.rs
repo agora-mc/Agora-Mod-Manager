@@ -25,20 +25,83 @@ use agora_plugin_api::contributions::{
     LaunchCheckFailure, ReplaceableSurface, SettingDefinition, ViewSource, MAX_LAUNCH_CHECK_MS,
 };
 use agora_plugin_api::diagnostics::{DiagnosticReport, RepairAction, RepairProposal, Severity};
-use agora_plugin_api::distribution::{Release, UpdateDocument};
+use agora_plugin_api::distribution::{Release, UpdateDocument, UPDATE_SOURCE_FILENAME};
 use agora_plugin_api::dto::ViewModel;
 use agora_plugin_api::error::{PluginError, PluginErrorCode};
-use agora_plugin_api::host::{ActivationRequest, HostBridge, ScriptHost};
-use agora_plugin_api::manifest::{ActivationEvent, PluginId, PluginManifest};
+use agora_plugin_api::host::{ActivationRequest, GameReads, HostBridge, ScriptHost, StoredBlobs};
+use agora_plugin_api::manifest::{ActivationEvent, PluginId, PluginManifest, MANIFEST_FILENAME};
 use agora_plugin_api::protocol::{HostRequest, HostResponse, LogLevel};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-/// Setting that turns the whole subsystem on. Off by default.
-pub const PLUGINS_ENABLED_SETTING: &str = "plugins_enabled";
+/// The emergency stop: while it is engaged, no plugin script runs, official or
+/// community. Default **not engaged**; a plugin's scripts then run if the user
+/// allowed that plugin's scripts (see [`PluginService::set_scripts_allowed`]).
+///
+/// Stored under a new key on purpose. The old `plugins_enabled` key meant the
+/// opposite ("community plugins on"), defaulted off, and was seeded as `false`
+/// in every database; reading it with the new meaning would have silently
+/// engaged the stop for everyone. It is ignored, treated as absent, and no longer
+/// written. Agora has no users yet, so there is nothing to migrate.
+///
+/// Data-only plugins (game packages) run no code and are not affected by it.
+pub const PLUGINS_EMERGENCY_STOP_SETTING: &str = "plugins_emergency_stop";
+
+/// What the user agreed to when installing a plugin.
+///
+/// Two separate answers, because they are separate questions: "may it have these
+/// permissions" and, for a plugin that has code, "may it run that code". A plain
+/// `bool` converts to both answers at once, which is what every caller that does
+/// not offer the second choice means by "yes".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Consent {
+    /// The capabilities and network hosts the preview listed.
+    pub capabilities: bool,
+    /// Running the plugin's scripts. Ignored for a plugin with no code, and for
+    /// an update of a plugin that already has an answer: that answer stands.
+    pub scripts: bool,
+    /// The `package_digest` of the preview this answer belongs to, when the
+    /// caller showed one. The installer refuses bytes that do not match, so a
+    /// yes given for one package cannot install a different one.
+    pub previewed_digest: Option<String>,
+}
+
+fn plugin_install_db_error(error: rusqlite::Error) -> LauncherError {
+    LauncherError::Generic {
+        code: "ERR_LOCAL_STATE_FAILED".into(),
+        message: error.to_string(),
+    }
+}
+
+impl Consent {
+    /// Permissions granted, but the plugin's code is not allowed to run.
+    pub fn without_code() -> Self {
+        Self {
+            capabilities: true,
+            scripts: false,
+            previewed_digest: None,
+        }
+    }
+
+    /// Bind this answer to the preview it was given for.
+    pub fn for_preview(mut self, digest: impl Into<String>) -> Self {
+        self.previewed_digest = Some(digest.into());
+        self
+    }
+}
+
+impl From<bool> for Consent {
+    fn from(answer: bool) -> Self {
+        Self {
+            capabilities: answer,
+            scripts: answer,
+            previewed_digest: None,
+        }
+    }
+}
 
 /// Which plugin, if any, the user chose to render each replaceable surface.
 ///
@@ -105,6 +168,18 @@ pub struct PluginSummary {
     pub restorable_data: Option<store::CheckpointSummary>,
     /// Events this plugin missed because it could not keep up.
     pub dropped_events: u64,
+    /// Whether this plugin is currently verified as an official plugin, from
+    /// the signed registry. Never read from the manifest.
+    pub official: super::official::OfficialStatus,
+    /// The plugin has code (an entrypoint). A data-only plugin runs nothing.
+    pub runs_code: bool,
+    /// The user allowed this plugin's code to run and the code on disk is what
+    /// they allowed. Always `false` for a data-only plugin. Independent of every
+    /// other plugin, and of the emergency stop, which overrides it while engaged.
+    pub scripts_allowed: bool,
+    /// The Code column's label, including why an earlier answer no longer
+    /// covers the installed code. Uses the same consent check as the runtime.
+    pub scripts_consent_text: String,
 }
 
 /// The outcome of the most recent update check, for display.
@@ -255,13 +330,149 @@ impl LaunchCheckOutcome {
 // Shared state
 // ---------------------------------------------------------------------------
 
-struct Inner {
-    ctx: Ctx,
+/// One code file's identity, as seen without reading its bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodeFileId {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+/// A digest memo, valid only while the installed code still has these identities.
+#[derive(Debug, Clone)]
+struct CodeIdentityMemo {
+    files: BTreeMap<String, CodeFileId>,
+    digest: Option<String>,
+}
+
+/// The answer to "may the code on disk run?", before the emergency stop and
+/// official standing are taken into account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodeConsentState {
+    NoCode,
+    NotAnswered,
+    Allowed,
+    Stale,
+    Uncheckable,
+}
+
+impl CodeConsentState {
+    /// One classifier for the gate, the refusal message and the manager's list:
+    /// a stale answer is a different answer from one that was never given.
+    fn classify(answered: Option<bool>, consented: Option<&str>, current: Option<&str>) -> Self {
+        if answered != Some(true) {
+            return Self::NotAnswered;
+        }
+        if consented == current {
+            Self::Allowed
+        } else {
+            Self::Stale
+        }
+    }
+
+    fn permitted(self) -> bool {
+        matches!(self, Self::NoCode | Self::Allowed)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::NoCode => "none",
+            Self::NotAnswered => "not allowed",
+            Self::Allowed => "allowed",
+            Self::Stale => "consent needed again (code changed)",
+            Self::Uncheckable => "could not tell (code not verified)",
+        }
+    }
+}
+
+/// Snapshot the identity of every file that `install::script_digest` hashes,
+/// excluding the same two host metadata files. Reading metadata is cheap; the
+/// bytes are only read on a cache miss. An unreadable file is an error, so a
+/// memo is never trusted on a guess.
+fn code_identity(plugin_dir: &Path) -> LauncherResult<BTreeMap<String, CodeFileId>> {
+    fn collect(
+        root: &Path,
+        dir: &Path,
+        out: &mut BTreeMap<String, CodeFileId>,
+    ) -> LauncherResult<()> {
+        let read = std::fs::read_dir(dir).map_err(|e| LauncherError::Generic {
+            code: "ERR_PLUGIN_IO".into(),
+            message: format!("could not read {}: {e}", dir.display()),
+        })?;
+        for item in read {
+            let item = item.map_err(|e| LauncherError::Generic {
+                code: "ERR_PLUGIN_IO".into(),
+                message: format!("could not read {}: {e}", dir.display()),
+            })?;
+            let path = item.path();
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|_| LauncherError::Generic {
+                    code: "ERR_PLUGIN_IO".into(),
+                    message: "a plugin file is outside its folder".into(),
+                })?
+                .to_string_lossy()
+                .replace('\\', "/");
+            let meta = std::fs::symlink_metadata(&path).map_err(|e| LauncherError::Generic {
+                code: "ERR_PLUGIN_IO".into(),
+                message: format!("could not inspect {}: {e}", path.display()),
+            })?;
+            if meta.is_dir() {
+                collect(root, &path, out)?;
+                continue;
+            }
+            if rel == MANIFEST_FILENAME || rel == UPDATE_SOURCE_FILENAME {
+                continue;
+            }
+            // A link inside the package resolves to a file the digest hashes,
+            // so follow it for identity too: changing its target must show up.
+            let identity = if meta.file_type().is_symlink() {
+                std::fs::metadata(&path).ok()
+            } else {
+                Some(meta)
+            };
+            let Some(identity) = identity else {
+                out.insert(
+                    rel,
+                    CodeFileId {
+                        len: 0,
+                        modified: None,
+                    },
+                );
+                continue;
+            };
+            out.insert(
+                rel,
+                CodeFileId {
+                    len: identity.len(),
+                    modified: identity.modified().ok(),
+                },
+            );
+        }
+        Ok(())
+    }
+    let mut out = BTreeMap::new();
+    collect(plugin_dir, plugin_dir, &mut out)?;
+    Ok(out)
+}
+
+pub(super) struct Inner {
+    pub(super) ctx: Ctx,
     host: Arc<dyn ScriptHost>,
     ui: Arc<dyn PluginUiSink>,
     subscriptions: EventSubscriptions,
     resolution: RwLock<Resolution>,
     logs_root: PathBuf,
+    /// The key the registry must be signed with for a plugin to count as
+    /// official. The compiled-in key everywhere except tests.
+    pub(super) registry_trust: super::official::RegistryTrust,
+    /// Standing of the plugins that are official or use an official id, as of
+    /// the last `reload`. Read by `list`, so showing the manager does not
+    /// re-verify the registry on every render.
+    official: RwLock<BTreeMap<String, super::official::OfficialStatus>>,
+    /// Last verified code digest per plugin, with the file identities it was
+    /// computed from. Bounded by the number of installed plugins; re-hashed
+    /// whenever any identity differs and on activation.
+    code_identities: RwLock<BTreeMap<String, CodeIdentityMemo>>,
 }
 
 impl Inner {
@@ -273,7 +484,7 @@ impl Inner {
             .map(|resolved| resolved.record.clone())
     }
 
-    fn conn(&self) -> LauncherResult<rusqlite::Connection> {
+    pub(super) fn conn(&self) -> LauncherResult<rusqlite::Connection> {
         crate::db::local_state_connection(&self.ctx.paths.local_state_db()).map_err(|e| {
             LauncherError::Generic {
                 code: "ERR_LOCAL_STATE_FAILED".into(),
@@ -313,6 +524,7 @@ impl HostBridge for CoreBridge {
             settings_schema: &record.manifest.contributions.settings,
             subscriptions: &self.inner.subscriptions,
             ui: self.inner.ui.as_ref(),
+            bound_instance: request.bound_instance.as_deref(),
         };
 
         // Everything this call causes is attributed to the plugin, which is
@@ -325,6 +537,140 @@ impl HostBridge for CoreBridge {
 
     fn log(&self, plugin_id: &PluginId, level: LogLevel, message: &str) {
         logs::append(&self.inner.logs_root, plugin_id, level, message);
+    }
+
+    fn begin_event(&self, plugin_id: &PluginId) {
+        self.inner
+            .ctx
+            .extensions
+            .get_or_insert_with(crate::game_script::GameBudgets::default)
+            .start_handler(plugin_id.as_str());
+    }
+
+    fn end_event(&self, plugin_id: &PluginId) {
+        self.inner
+            .ctx
+            .extensions
+            .get_or_insert_with(crate::game_script::GameBudgets::default)
+            .end_handler(plugin_id.as_str());
+    }
+}
+
+/// What a scripted game package calls. It is deliberately a thin wrapper: the
+/// plugin service owns consent, activation, time and memory limits.
+struct ScriptBehaviourInvoker {
+    service: PluginService,
+}
+
+impl crate::game_registry::scripted::BehaviourInvoker for ScriptBehaviourInvoker {
+    fn invoke(
+        &self,
+        plugin_id: &PluginId,
+        export: &str,
+        args: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, PluginError> {
+        let blobs = self.service.blobs_for(plugin_id);
+        self.service
+            .invoke_behaviour(plugin_id, export, args, timeout, None, Some(blobs))
+    }
+
+    fn invoke_with_game_reads(
+        &self,
+        plugin_id: &PluginId,
+        export: &str,
+        args: serde_json::Value,
+        timeout: Duration,
+        reads: Arc<dyn GameReads>,
+    ) -> Result<serde_json::Value, PluginError> {
+        let blobs = self.service.blobs_for(plugin_id);
+        self.service
+            .invoke_behaviour(plugin_id, export, args, timeout, Some(reads), Some(blobs))
+    }
+
+    fn invoke_hook(
+        &self,
+        plugin_id: &PluginId,
+        export: &str,
+        args: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, PluginError> {
+        // One hook, one budget session. Every `game.*` call the script makes
+        // during this hook shares it, and the session closes when the hook
+        // returns, however it returns.
+        let budgets = self
+            .service
+            .inner
+            .ctx
+            .extensions
+            .get_or_insert_with(crate::game_script::GameBudgets::default);
+        let _budget = budgets.begin(plugin_id.as_str());
+        let session = budgets.session(plugin_id.as_str());
+
+        // A hook that names an instance gets that instance's merged view in
+        // scope, so `game:read` works inside it and `game.*` is bound to that
+        // instance. `detect_runtime` names an install instead, which gets the
+        // install's folder as its view.
+        let granted_read = self.service.inner.record(plugin_id).is_some_and(|record| {
+            record
+                .granted
+                .contains(agora_plugin_api::Capability::GameRead)
+        });
+        if granted_read {
+            let instance = args
+                .get("context")
+                .and_then(|context| context.get("instance"))
+                .and_then(|instance| instance.as_str());
+            if let Some(instance_id) = instance {
+                if let Ok(reads) = crate::game_script::instance_reads_with_budget(
+                    &self.service.inner.ctx,
+                    instance_id,
+                    session.reads.clone(),
+                ) {
+                    let blobs = self.service.blobs_for(plugin_id);
+                    return self.service.invoke_behaviour(
+                        plugin_id,
+                        export,
+                        args,
+                        timeout,
+                        Some(Arc::new(reads)),
+                        Some(blobs),
+                    );
+                }
+            }
+            let install = args
+                .get("install")
+                .and_then(|install| install.get("location"))
+                .and_then(|location| location.as_str());
+            if let Some(location) = install {
+                if let Ok(reads) = crate::game_script::install_reads(
+                    std::path::PathBuf::from(location),
+                    session.reads.clone(),
+                ) {
+                    let blobs = self.service.blobs_for(plugin_id);
+                    return self.service.invoke_behaviour(
+                        plugin_id,
+                        export,
+                        args,
+                        timeout,
+                        Some(Arc::new(reads)),
+                        Some(blobs),
+                    );
+                }
+            }
+        }
+        let blobs = self.service.blobs_for(plugin_id);
+        self.service
+            .invoke_behaviour(plugin_id, export, args, timeout, None, Some(blobs))
+    }
+
+    fn report(&self, plugin_id: &PluginId, message: &str) {
+        logs::append(
+            &self.service.inner.logs_root,
+            plugin_id,
+            LogLevel::Warn,
+            message,
+        );
     }
 }
 
@@ -346,12 +692,23 @@ pub struct PluginContentProvider {
 /// Core-owned plugin management and execution.
 #[derive(Clone)]
 pub struct PluginService {
-    inner: Arc<Inner>,
+    pub(super) inner: Arc<Inner>,
     bus: PluginEventBus,
 }
 
 impl PluginService {
     pub fn new(ctx: Ctx, host: Arc<dyn ScriptHost>, ui: Arc<dyn PluginUiSink>) -> Self {
+        Self::new_with_registry_trust(ctx, host, ui, super::official::RegistryTrust::production())
+    }
+
+    /// [`Self::new`] with an explicit registry key. Test support: production
+    /// adapters call `new`, which trusts only the key compiled into the app.
+    pub fn new_with_registry_trust(
+        ctx: Ctx,
+        host: Arc<dyn ScriptHost>,
+        ui: Arc<dyn PluginUiSink>,
+        registry_trust: super::official::RegistryTrust,
+    ) -> Self {
         let subscriptions = EventSubscriptions::new();
         let logs_root = ctx.paths.plugin_logs_root();
         let inner = Arc::new(Inner {
@@ -361,11 +718,47 @@ impl PluginService {
             subscriptions: subscriptions.clone(),
             resolution: RwLock::new(Resolution::default()),
             logs_root,
+            registry_trust,
+            official: RwLock::new(BTreeMap::new()),
+            code_identities: RwLock::new(BTreeMap::new()),
         });
-        Self {
+        let service = Self {
             bus: PluginEventBus::new(subscriptions, host),
             inner,
+        };
+        // A scripted game package is built before this service exists, so it
+        // holds a handle the service now fills in. One bridge serves every
+        // package, and looks the caller's grants up on each call.
+        let runtime = service
+            .inner
+            .ctx
+            .extensions
+            .get_or_insert_with(crate::game_registry::scripted::BehaviourRuntime::new);
+        runtime.install(Arc::new(ScriptBehaviourInvoker {
+            service: service.clone(),
+        }));
+        // A scripted hook asked before the service existed left its answer
+        // unknown. Now that the runtime is here, re-run detection once so an
+        // early call cannot stick: what was unknown is asked again.
+        if service.inner.ctx.games.games().any(|game| {
+            game.version_sources
+                .iter()
+                .any(|source| matches!(source, agora_game_api::VersionSource::PackageBehaviour))
+        }) {
+            let inventory = crate::game_registry::installed_games(&service.inner.ctx);
+            for install in inventory.installs {
+                if let crate::game_registry::RuntimeResolution::Unidentified { reasons } =
+                    &install.runtime
+                {
+                    eprintln!(
+                        "[plugins] runtime detection for {} is still unknown: {}",
+                        install.game,
+                        reasons.join(", ")
+                    );
+                }
+            }
         }
+        service
     }
 
     /// A service with no UI sink, for the CLI and for tests.
@@ -377,21 +770,205 @@ impl PluginService {
         &self.bus
     }
 
-    /// Whether the user has turned the plugin system on at all.
+    /// Whether the emergency stop is engaged: no plugin script runs, official
+    /// included.
     ///
-    /// Checked before anything is loaded. A user who never opts in never has a
-    /// plugin runtime in their process.
-    pub fn is_enabled(&self) -> bool {
-        self.inner
-            .conn()
-            .ok()
-            .and_then(|conn| {
-                crate::db::get_setting(&conn, PLUGINS_ENABLED_SETTING)
-                    .ok()
-                    .flatten()
+    /// Fails closed. An unreadable or malformed setting counts as engaged,
+    /// because the stop exists for the moment something is wrong and "I could
+    /// not tell" must not let code run. An absent setting is not engaged.
+    pub fn emergency_stop_engaged(&self) -> bool {
+        let Ok(conn) = self.inner.conn() else {
+            return true;
+        };
+        match crate::settings_registry::read_bool(&conn, PLUGINS_EMERGENCY_STOP_SETTING) {
+            Ok(Some(engaged)) => engaged,
+            Ok(None) => false,
+            Err(_) => true,
+        }
+    }
+
+    /// The inverse, for callers that gate a whole feature on it: plugin code
+    /// may run for the plugins that are allowed to.
+    pub fn plugin_code_allowed(&self) -> bool {
+        !self.emergency_stop_engaged()
+    }
+
+    /// Engage or release the emergency stop. Engaging also stops every plugin
+    /// that is running now, rather than waiting for a restart.
+    pub fn set_emergency_stop(&self, engaged: bool) -> LauncherResult<()> {
+        // Stop what is running first. The stop exists for the moment something
+        // is wrong, and it must not wait on the database write: if saving the
+        // setting fails, the scripts still stop and the caller is told the
+        // setting did not persist.
+        if engaged {
+            let ids: Vec<PluginId> = self
+                .inner
+                .resolution
+                .read()
+                .map(|resolution| {
+                    resolution
+                        .plugins
+                        .iter()
+                        .map(|resolved| resolved.id().clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            for id in ids {
+                self.inner.host.cancel(&id);
+                let _ = self.deactivate(&id);
+            }
+        }
+        let conn = self.inner.conn()?;
+        crate::db::set_setting(
+            &conn,
+            PLUGINS_EMERGENCY_STOP_SETTING,
+            &serde_json::Value::Bool(engaged),
+        )
+        .map_err(|e| LauncherError::Generic {
+            code: "ERR_LOCAL_STATE_FAILED".into(),
+            message: e.to_string(),
+        })?;
+        Ok(())
+    }
+
+    /// Whether this plugin's code may run right now: the emergency stop is not
+    /// engaged, and either the plugin has no code or the user allowed the code
+    /// that is actually on disk.
+    ///
+    /// Data-only plugins return `true`: they run nothing, so there is nothing to
+    /// allow or stop. Used for every decision about starting or calling a script.
+    pub fn scripts_permitted(&self, plugin_id: &PluginId) -> bool {
+        if self.emergency_stop_engaged() {
+            return false;
+        }
+        let Some(record) = self.inner.record(plugin_id) else {
+            return false;
+        };
+        if record.manifest.is_declarative_only() {
+            return true;
+        }
+        // An official plugin whose catalog standing could not be checked (or
+        // whose version is no longer listed) keeps loading its data, but its
+        // scripts wait until a verified catalog says it is official again.
+        // Consent alone is not enough without a verifiable source.
+        let status_forbids_scripts = self
+            .inner
+            .official
+            .read()
+            .map(|statuses| {
+                statuses
+                    .get(plugin_id.as_str())
+                    .is_some_and(|status| !status.scripts_allowed_by_status())
             })
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false)
+            // Cannot read the standings: do not run code on a guess.
+            .unwrap_or(true);
+        if status_forbids_scripts {
+            return false;
+        }
+        self.code_consent_state(plugin_id).permitted()
+    }
+
+    /// The digest of the code now installed, memoised by file identity. Identity
+    /// is captured before hashing so a change during the hash is caught on the
+    /// next call rather than hidden by a memo recorded from the older snapshot.
+    fn code_digest_for(
+        &self,
+        plugin_id: &PluginId,
+        manifest: &PluginManifest,
+        install_dir: &Path,
+    ) -> LauncherResult<Option<String>> {
+        let identity = code_identity(install_dir)?;
+        if let Ok(cache) = self.inner.code_identities.read() {
+            if cache
+                .get(plugin_id.as_str())
+                .is_some_and(|memo| memo.files == identity)
+            {
+                return Ok(cache[plugin_id.as_str()].digest.clone());
+            }
+        }
+        let digest = install::script_digest(manifest, install_dir)?;
+        if let Ok(mut cache) = self.inner.code_identities.write() {
+            cache.insert(
+                plugin_id.as_str().to_string(),
+                CodeIdentityMemo {
+                    files: identity,
+                    digest: digest.clone(),
+                },
+            );
+        }
+        Ok(digest)
+    }
+
+    /// The consent decision shared by the runtime gate, the refusal text and
+    /// the manager's list. One classifier, one digest (memoised), one answer.
+    fn code_consent_state(&self, plugin_id: &PluginId) -> CodeConsentState {
+        let Some(record) = self.inner.record(plugin_id) else {
+            return CodeConsentState::Uncheckable;
+        };
+        if record.manifest.is_declarative_only() {
+            return CodeConsentState::NoCode;
+        }
+        let Ok(conn) = self.inner.conn() else {
+            return CodeConsentState::Uncheckable;
+        };
+        let Ok(answered) = store::script_consent(&conn, plugin_id) else {
+            return CodeConsentState::Uncheckable;
+        };
+        if answered != Some(true) {
+            return CodeConsentState::NotAnswered;
+        }
+        let Ok(consented) = store::script_consent_code_hash(&conn, plugin_id) else {
+            return CodeConsentState::Uncheckable;
+        };
+        let Ok(current) = self.code_digest_for(plugin_id, &record.manifest, &record.install_dir)
+        else {
+            return CodeConsentState::Uncheckable;
+        };
+        CodeConsentState::classify(answered, consented.as_deref(), current.as_deref())
+    }
+
+    /// Whether the stored yes was given for code other than what is on disk now.
+    fn code_consent_is_stale(&self, plugin_id: &PluginId) -> bool {
+        self.code_consent_state(plugin_id) == CodeConsentState::Stale
+    }
+
+    /// Allow or disallow one plugin's scripts. Independent per plugin and
+    /// changeable at any time; disallowing stops it now.
+    pub fn set_scripts_allowed(
+        &self,
+        plugin_id: &PluginId,
+        allowed: bool,
+    ) -> LauncherResult<PluginSummary> {
+        // Read from the database, not the last resolution: this is a decision
+        // about what is installed now.
+        let conn = self.inner.conn()?;
+        let record = store::get(&conn, plugin_id)?
+            .filter(|record| !store::is_tombstone(record))
+            .ok_or_else(|| LauncherError::Generic {
+                code: "ERR_PLUGIN_NOT_FOUND".into(),
+                message: format!("`{plugin_id}` is not installed"),
+            })?;
+        if record.manifest.is_declarative_only() {
+            return Err(LauncherError::Generic {
+                code: "ERR_PLUGIN_NO_CODE".into(),
+                message: format!("`{plugin_id}` has no code to allow or stop"),
+            });
+        }
+        let code_digest = install::script_digest(&record.manifest, &record.install_dir)?;
+        store::set_script_consent(
+            &conn,
+            plugin_id,
+            allowed,
+            code_digest.as_deref(),
+            &now(&self.inner.ctx),
+        )?;
+        drop(conn);
+        if !allowed {
+            self.inner.host.cancel(plugin_id);
+            let _ = self.deactivate(plugin_id);
+        }
+        self.reload()?;
+        self.summary(plugin_id)
     }
 
     // -- reading -----------------------------------------------------------
@@ -399,10 +976,55 @@ impl PluginService {
     /// Re-read the install records and work out what can run.
     pub fn reload(&self) -> LauncherResult<()> {
         let conn = self.inner.conn()?;
-        let records = store::list(&conn)?;
-        let resolution = registry::resolve(records, &agora_plugin_api::HOST_API_VERSION);
+        let snapshot = store::load_snapshot(&conn)?;
+        // A plugin that is official, or borrows an official id, and does not
+        // verify is blocked outright: it is not runnable, and the status says
+        // why. An error reading the records is an error here, not "nothing is
+        // blocked".
+        let official = super::official::verify_snapshot(
+            &snapshot,
+            self.inner.ctx.paths.root(),
+            &self.inner.registry_trust,
+        )?;
+        let store::PluginLoadSnapshot {
+            guard,
+            records,
+            pending,
+        } = snapshot;
+        drop(guard);
+        let blocked: BTreeMap<String, String> = official
+            .iter()
+            .filter_map(|(id, status)| match status {
+                super::official::OfficialStatus::Unverified { reason } => {
+                    Some((id.clone(), reason.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        // A plugin that has just become blocked (revoked by a newer registry,
+        // edited on disk), or whose catalog standing can no longer allow its
+        // scripts, stops now rather than at the next launch.
+        for (id, status) in &official {
+            if status.scripts_allowed_by_status() {
+                continue;
+            }
+            if let Ok(plugin_id) = PluginId::parse(id) {
+                if self.inner.host.is_active(&plugin_id) {
+                    self.inner.host.cancel(&plugin_id);
+                    let _ = self.deactivate(&plugin_id);
+                }
+            }
+        }
+        let resolution =
+            registry::resolve_with_blocks(records, &agora_plugin_api::HOST_API_VERSION, &blocked);
+        for reason in pending.into_values() {
+            eprintln!("[plugins] {reason}");
+        }
         if let Ok(mut slot) = self.inner.resolution.write() {
             *slot = resolution;
+        }
+        if let Ok(mut slot) = self.inner.official.write() {
+            *slot = official;
         }
         Ok(())
     }
@@ -416,12 +1038,23 @@ impl PluginService {
         // per row for information that changes only on install or check.
         let (trust, checks) = self.trust_for_display();
         let checkpoints = self.checkpoints_for_display();
+        let official = self
+            .inner
+            .official
+            .read()
+            .map(|statuses| statuses.clone())
+            .unwrap_or_default();
+        let consent = self.code_consent_for_display();
         resolution
             .plugins
             .iter()
             .map(|resolved| {
                 let id = resolved.id().clone();
                 let manifest = &resolved.record.manifest;
+                let code_state = consent
+                    .get(id.as_str())
+                    .copied()
+                    .unwrap_or(CodeConsentState::Uncheckable);
                 PluginSummary {
                     id: id.to_string(),
                     name: manifest.name.clone(),
@@ -454,9 +1087,72 @@ impl PluginService {
                     last_update_check: checks.get(id.as_str()).cloned(),
                     restorable_data: checkpoints.get(id.as_str()).cloned(),
                     dropped_events: self.bus.dropped_count(&id),
+                    official: official
+                        .get(id.as_str())
+                        .cloned()
+                        .unwrap_or(super::official::OfficialStatus::Community),
+                    runs_code: !manifest.is_declarative_only(),
+                    scripts_allowed: !manifest.is_declarative_only() && code_state.permitted(),
+                    scripts_consent_text: code_state.label().to_string(),
                 }
             })
             .collect()
+    }
+
+    /// Consent states for every installed plugin, keyed by id. The answers and
+    /// their digests are read in one query each rather than per row, then each
+    /// code identity goes through the same memoised digest as the runtime gate.
+    /// An unreadable answer is Uncheckable, which shows no permission.
+    #[allow(clippy::type_complexity)]
+    fn code_consent_for_display(&self) -> BTreeMap<String, CodeConsentState> {
+        let Ok(conn) = self.inner.conn() else {
+            return BTreeMap::new();
+        };
+        let Ok(guard) = store::guard_package_reads(&conn) else {
+            return BTreeMap::new();
+        };
+        let Ok(pending) = store::journal_ids(&guard) else {
+            return BTreeMap::new();
+        };
+        let answers = match store::list_script_consent(&conn) {
+            Ok(answers) => answers,
+            Err(e) => {
+                eprintln!("[plugins] could not read script choices: {e}");
+                return BTreeMap::new();
+            }
+        };
+        let hashes = match store::list_script_consent_code_hashes(&conn) {
+            Ok(hashes) => hashes,
+            Err(e) => {
+                eprintln!("[plugins] could not read consented code digests: {e}");
+                return BTreeMap::new();
+            }
+        };
+        let Ok(resolution) = self.inner.resolution.read() else {
+            return BTreeMap::new();
+        };
+        let mut out = BTreeMap::new();
+        for resolved in &resolution.plugins {
+            let id = resolved.id();
+            if pending.iter().any(|value| value == id.as_str()) {
+                continue;
+            }
+            let manifest = &resolved.record.manifest;
+            let state = if manifest.is_declarative_only() {
+                CodeConsentState::NoCode
+            } else {
+                let answered = answers.get(id.as_str()).copied();
+                let consented = hashes.get(id.as_str()).and_then(|hash| hash.as_deref());
+                match self.code_digest_for(id, manifest, &resolved.record.install_dir) {
+                    Ok(current) => {
+                        CodeConsentState::classify(answered, consented, current.as_deref())
+                    }
+                    Err(_) => CodeConsentState::Uncheckable,
+                }
+            };
+            out.insert(id.as_str().to_string(), state);
+        }
+        out
     }
 
     /// Pinned update sources and last check results, keyed by plugin id.
@@ -672,7 +1368,7 @@ impl PluginService {
 
     /// Contributions from every plugin that is currently runnable.
     pub fn contributions(&self) -> Vec<NamespacedContribution> {
-        if !self.is_enabled() {
+        if !self.plugin_code_allowed() {
             return Vec::new();
         }
         self.inner
@@ -680,6 +1376,69 @@ impl PluginService {
             .read()
             .map(|resolution| resolution.contributions.clone())
             .unwrap_or_default()
+            .into_iter()
+            .filter(|contribution| {
+                PluginId::parse(&contribution.plugin_id)
+                    .is_ok_and(|plugin_id| self.scripts_permitted(&plugin_id))
+            })
+            .collect()
+    }
+
+    /// Load every runnable plugin's crash packs.
+    ///
+    /// One plugin's broken pack is reported and the rest still load. A plugin
+    /// that is disabled or cannot run contributes nothing, because its rules
+    /// must not speak for a game it is not part of.
+    pub fn crash_packs(&self) -> crate::crash_packs::CrashPackReport {
+        // Which copies are verified official decides only which primary reads a file. A catalog
+        // that cannot be read leaves them community, which is the safe, quieter answer.
+        let official: BTreeMap<String, bool> = self
+            .inner
+            .conn()
+            .and_then(|conn| {
+                super::official::verify_installed(
+                    &conn,
+                    self.inner.ctx.paths.root(),
+                    &self.inner.registry_trust,
+                )
+            })
+            .map(|statuses| {
+                statuses
+                    .into_iter()
+                    .map(|(id, status)| (id, status.is_official()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let installed: Vec<(String, PathBuf, PluginManifest, bool)> = self
+            .inner
+            .resolution
+            .read()
+            .map(|resolution| {
+                resolution
+                    .runnable()
+                    .map(|plugin| {
+                        (
+                            plugin.id().as_str().to_string(),
+                            plugin.record.install_dir.clone(),
+                            plugin.record.manifest.clone(),
+                            official.get(plugin.id().as_str()).copied().unwrap_or(false),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let sources: Vec<crate::crash_packs::PluginPackSource<'_>> = installed
+            .iter()
+            .map(
+                |(plugin_id, root, manifest, official)| crate::crash_packs::PluginPackSource {
+                    plugin_id,
+                    root,
+                    manifest,
+                    official: *official,
+                },
+            )
+            .collect();
+        crate::crash_packs::load_for_plugins(&sources)
     }
 
     pub fn logs(&self, plugin_id: &PluginId, lines: usize) -> Vec<String> {
@@ -689,9 +1448,14 @@ impl PluginService {
     // -- installing --------------------------------------------------------
 
     pub fn preview_package(&self, archive: &Path) -> LauncherResult<InstallPreview> {
-        let existing = self.existing_install(archive_id(archive).as_ref());
-        install::preview_package(
-            archive,
+        self.preview_package_bytes(&install::read_package_file(archive)?)
+    }
+
+    /// [`Self::preview_package`] over package bytes already in memory.
+    pub fn preview_package_bytes(&self, bytes: &[u8]) -> LauncherResult<InstallPreview> {
+        let existing = self.existing_install(archive_id(bytes).as_ref());
+        install::preview_package_bytes(
+            bytes,
             existing.as_ref().map(ExistingRecord::as_ref).as_ref(),
         )
     }
@@ -715,10 +1479,21 @@ impl PluginService {
         let conn = self.inner.conn().ok()?;
         match store::get(&conn, plugin_id) {
             Ok(Some(record)) if !store::is_tombstone(&record) => Some(ExistingRecord {
+                runs_code: !record.manifest.is_declarative_only(),
                 version: record.manifest.version.clone(),
                 data_version: record.data_version,
                 hosts: record.manifest.network.hosts.clone(),
                 granted: record.granted,
+                trusted_keys: store::get_trust(&conn, plugin_id)
+                    .ok()
+                    .flatten()
+                    .map(|trust| trust.keys)
+                    .unwrap_or_default(),
+                // Failing to read it reads as "changed", which asks again
+                // rather than reusing an answer we cannot see.
+                code_hash: store::script_consent_code_hash(&conn, plugin_id)
+                    .ok()
+                    .flatten(),
             }),
             _ => None,
         }
@@ -733,24 +1508,79 @@ impl PluginService {
     pub fn install_package(
         &self,
         archive: &Path,
-        accept_capabilities: bool,
+        consent: impl Into<Consent>,
     ) -> LauncherResult<PluginSummary> {
-        let contents = install::read_package_manifest(archive)?;
+        // Read once; every step below works from these bytes, not the path.
+        let bytes = install::read_package_file(archive)?;
+        self.install_package_bytes(&bytes, consent)
+    }
+
+    /// [`Self::install_package`] from package bytes already in memory.
+    ///
+    /// The manifest is read from, and the files are unpacked from, the same
+    /// buffer, so nothing can swap the package between the check and the use.
+    pub fn install_package_bytes(
+        &self,
+        bytes: &[u8],
+        consent: impl Into<Consent>,
+    ) -> LauncherResult<PluginSummary> {
+        self.install_package_with_provenance(bytes, consent.into(), None)
+    }
+
+    pub(super) fn install_package_with_provenance(
+        &self,
+        bytes: &[u8],
+        consent: Consent,
+        provenance: Option<&store::OfficialProvenance>,
+    ) -> LauncherResult<PluginSummary> {
+        crate::settings::admit_major_action(&self.inner.ctx)?;
+        if let Some(expected) = consent.previewed_digest.as_deref() {
+            if install::package_digest(bytes) != expected {
+                return Err(preview_changed());
+            }
+        }
+        let accept_capabilities = consent.capabilities;
+        let contents = install::read_package_manifest_bytes(bytes)?;
         let manifest = contents.manifest;
 
         let destination =
             install::package_dir(&self.inner.ctx.paths.plugin_packages_root(), &manifest.id);
-        let rollback = self
-            .inner
-            .ctx
-            .paths
-            .plugin_rollback_root()
-            .join(manifest.id.as_str());
-
-        let conn = self.inner.conn()?;
+        let lock = self.inner.ctx.lock_manager.acquire(
+            crate::lock_manager::LockResource::PluginInstall,
+            "plugin-install",
+        )?;
+        let mut conn = self.inner.conn()?;
+        if let Some(line) = install::settle_before_install(
+            &conn,
+            &self.inner.ctx.paths,
+            &manifest.id,
+            &lock,
+            &*self.inner.ctx.process_view(),
+        )? {
+            logs::append(
+                &self.inner.logs_root,
+                &manifest.id,
+                agora_plugin_api::protocol::LogLevel::Info,
+                &line,
+            );
+            self.reload()?;
+        }
         let previous = store::get(&conn, &manifest.id)?;
         let live = self.existing_install(Some(&manifest.id));
-        self.guard_consent(&manifest, live.as_ref(), accept_capabilities)?;
+        // The keys pinned at install. A package naming different keys is a
+        // different publisher, and the user has to be told before it replaces
+        // the one they trusted.
+        let previous_trust = store::get_trust(&conn, &manifest.id)?;
+        let publisher_changed = install::publisher_changed(
+            previous_trust.as_ref().map(|trust| trust.keys.as_slice()),
+            contents.update_source.as_ref(),
+        );
+        self.guard_consent(
+            &manifest,
+            live.as_ref(),
+            accept_capabilities,
+            publisher_changed,
+        )?;
 
         // Resolved before anything moves. `grant_for` rejects a manifest that
         // requires a capability this build cannot provide, and discovering
@@ -773,61 +1603,117 @@ impl PluginService {
             }
         }
 
-        let had_files = destination.exists();
-        if had_files {
-            install::stash_for_rollback(&destination, &rollback)?;
-        }
-
-        if let Err(error) = install::extract_package(archive, &destination) {
-            if had_files {
-                // Best effort: if this also fails the user is told, rather
-                // than being left believing the old version is back.
-                install::restore_rollback(&rollback, &destination)?;
-            }
-            return Err(error);
-        }
-
-        // Updating something the user had switched off must not switch it back
-        // on. Only a first install defaults to enabled; a replacement inherits
-        // the state the user chose, and a reinstall over a tombstone is a
-        // first install again.
-        let enabled = match &previous {
-            Some(record) if !store::is_tombstone(record) => record.enabled,
-            _ => true,
-        };
-
-        if let Err(error) = store::upsert(
+        let ctx = &self.inner.ctx;
+        let mut journal = install::InstallJournal::begin(
             &conn,
-            &manifest,
-            &granted,
-            &PluginSource::Package,
-            &destination,
-            enabled,
-            &now(&self.inner.ctx),
-        ) {
-            // The files are already swapped. Leaving them there would put the
-            // new version on disk under the old version's record — the install
-            // would look like it never happened while the code on disk had in
-            // fact changed.
-            if had_files {
-                let _ = std::fs::remove_dir_all(&destination);
-                install::restore_rollback(&rollback, &destination)?;
+            &ctx.paths,
+            &manifest.id,
+            manifest.version.to_string(),
+        )?;
+        install::crash_point(ctx, install::InstallCrashPoint::JournalWritten);
+        let result = (|| -> LauncherResult<()> {
+            journal.swap_files(&conn, ctx, &lock, bytes)?;
+            if let Some(provenance) = provenance {
+                let unpacked = super::official::tree_digest(&destination).map_err(|error| {
+                    LauncherError::Generic {
+                        code: "ERR_OFFICIAL_PLUGIN_RECORD".into(),
+                        message: format!(
+                            "Could not verify the unpacked files for `{}`: {error}",
+                            manifest.id
+                        ),
+                    }
+                })?;
+                if unpacked != provenance.tree_sha256 {
+                    return Err(LauncherError::Generic {
+                        code: "ERR_OFFICIAL_PLUGIN_TREE".into(),
+                        message: format!(
+                            "The unpacked files for `{}` differ from the signed catalog",
+                            manifest.id
+                        ),
+                    });
+                }
+            }
+            let new_code_digest = install::script_digest(&manifest, &destination)?;
+            let tx = conn.transaction().map_err(plugin_install_db_error)?;
+            // Updating something the user had switched off must not switch it back
+            // on. Only a first install defaults to enabled; a replacement inherits
+            // the state the user chose, and a reinstall over a tombstone is a
+            // first install again.
+            let enabled = match &previous {
+                Some(record) if !store::is_tombstone(record) => record.enabled,
+                _ => true,
+            };
+
+            store::upsert(
+                &tx,
+                &manifest,
+                &granted,
+                &PluginSource::Package,
+                &destination,
+                enabled,
+                &now(ctx),
+            )?;
+            install::crash_point(ctx, install::InstallCrashPoint::Recorded);
+            if let Some(provenance) = provenance {
+                store::set_official(&tx, &manifest.id, provenance)?;
+            }
+            // Pinned at the moment consent was given, and only then. A package
+            // that declares no update source clears any previous pin rather than
+            // inheriting it, so a plugin cannot acquire an update channel by
+            // shipping a version that simply omits the file.
+            match &contents.update_source {
+                Some(source) => store::put_trust(&tx, &manifest.id, &source.url, &source.keys)?,
+                None => store::clear_trust(&tx, &manifest.id)?,
+            }
+
+            // Whether its code may run is tied to the code it was given for. A
+            // replacement with the same entrypoint keeps the answer already given;
+            // a version that newly has code, changed code, or a plugin never
+            // answered for, is denied until the user allows it. A version with no
+            // code clears the answer, so code that comes back later asks again.
+            let first_install = previous.as_ref().is_none_or(store::is_tombstone);
+            if manifest.is_declarative_only() {
+                store::clear_script_consent(&tx, &manifest.id)?;
             } else {
-                let _ = std::fs::remove_dir_all(&destination);
+                let previous_runs_code = previous
+                    .as_ref()
+                    .filter(|record| !store::is_tombstone(record))
+                    .is_some_and(|record| !record.manifest.is_declarative_only());
+                let previous_digest = if first_install {
+                    None
+                } else {
+                    store::script_consent_code_hash(&tx, &manifest.id)?
+                };
+                let code_is_new =
+                    first_install || !previous_runs_code || previous_digest != new_code_digest;
+                if code_is_new || publisher_changed {
+                    store::set_script_consent(
+                        &tx,
+                        &manifest.id,
+                        consent.scripts,
+                        new_code_digest.as_deref(),
+                        &now(&self.inner.ctx),
+                    )?;
+                }
+            }
+
+            journal.advance(&tx, install::PluginInstallState::Committed)?;
+            install::crash_point(ctx, install::InstallCrashPoint::CommitMarked);
+            tx.commit().map_err(plugin_install_db_error)?;
+            install::crash_point(ctx, install::InstallCrashPoint::Committed);
+            Ok(())
+        })();
+        let settled = journal.finish(&conn, ctx, &lock);
+        if let Err(error) = result {
+            if let Err(recovery) = settled {
+                return Err(LauncherError::Generic {
+                    code: error.code(),
+                    message: format!("{error}. The install was interrupted: {recovery}"),
+                });
             }
             return Err(error);
         }
-        let _ = std::fs::remove_dir_all(&rollback);
-
-        // Pinned at the moment consent was given, and only then. A package
-        // that declares no update source clears any previous pin rather than
-        // inheriting it, so a plugin cannot acquire an update channel by
-        // shipping a version that simply omits the file.
-        match &contents.update_source {
-            Some(source) => store::put_trust(&conn, &manifest.id, &source.url, &source.keys)?,
-            None => store::clear_trust(&conn, &manifest.id)?,
-        }
-
+        settled?;
         self.reload()?;
         self.summary(&manifest.id)
     }
@@ -903,6 +1789,21 @@ impl PluginService {
         store::latest_checkpoint(&conn, plugin_id).ok().flatten()
     }
 
+    /// Finish or undo an install that a crash interrupted, for `agora plugin recover`
+    /// (MASTER_SPEC §32.11).
+    ///
+    /// `None` resolves every interrupted install the way the startup pass does. A person's answer to
+    /// one that needs a hand is [`install::InstallResolution::Restore`] (put the previous version
+    /// back, replacing what is in the plugin's folder now) or
+    /// [`install::InstallResolution::Discard`] (keep what is installed, drop the stashed copy).
+    pub fn recover_interrupted_installs(
+        &self,
+        plugin_id: Option<&PluginId>,
+        resolution: install::InstallResolution,
+    ) -> LauncherResult<Vec<(PluginId, install::InstallRecovery)>> {
+        install::resolve_installs(&self.inner.ctx, plugin_id, resolution)
+    }
+
     /// Put a plugin's stored data back to its most recent checkpoint.
     ///
     /// Never automatic, and deliberately so. Restoring after a failed
@@ -940,21 +1841,19 @@ impl PluginService {
 
     /// Whether the user asked for update checks to happen on their own.
     ///
-    /// Separate from [`PLUGINS_ENABLED_SETTING`] because they are different
-    /// questions: one is whether plugins run at all, the other is whether
+    /// Separate from [`PLUGINS_EMERGENCY_STOP_SETTING`] because they are different
+    /// questions: one is whether plugin code may run at all, the other is whether
     /// Agora contacts a publisher without being asked. Off by default, like
     /// everything else here that reaches the network.
     pub fn automatic_updates_enabled(&self) -> bool {
-        self.inner
-            .conn()
-            .ok()
-            .and_then(|conn| {
-                crate::db::get_setting(&conn, PLUGIN_UPDATES_ENABLED_SETTING)
-                    .ok()
-                    .flatten()
-            })
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false)
+        let Ok(conn) = self.inner.conn() else {
+            return false;
+        };
+        match crate::settings_registry::read_bool(&conn, PLUGIN_UPDATES_ENABLED_SETTING) {
+            Ok(Some(enabled)) => enabled,
+            // Missing, undeclared or unreadable: automatic updates stay off.
+            Ok(None) | Err(_) => false,
+        }
     }
 
     /// Check every plugin that has somewhere to check, if that was asked for.
@@ -968,7 +1867,7 @@ impl PluginService {
     /// failure, so the reason is recorded on the trust record for the manager
     /// to show and nothing is raised at the user.
     pub async fn check_all_updates(&self) -> Vec<(String, Result<UpdateVerdict, String>)> {
-        if !self.automatic_updates_enabled() || !self.is_enabled() {
+        if !self.automatic_updates_enabled() || !self.plugin_code_allowed() {
             return Vec::new();
         }
         let Ok(conn) = self.inner.conn() else {
@@ -1005,8 +1904,9 @@ impl PluginService {
     pub async fn apply_update(
         &self,
         plugin_id: &PluginId,
-        accept_capabilities: bool,
+        consent: impl Into<Consent>,
     ) -> LauncherResult<UpdateOutcome> {
+        crate::settings::admit_major_action(&self.inner.ctx)?;
         let verdict = self.check_update(plugin_id).await?;
         let UpdateVerdict::Available {
             to,
@@ -1026,7 +1926,7 @@ impl PluginService {
         };
 
         let bytes = self.fetch_update_package(url, *size).await?;
-        self.install_downloaded_update(plugin_id, to, sha256, *size, &bytes, accept_capabilities)
+        self.install_downloaded_update(plugin_id, to, sha256, *size, &bytes, consent)
     }
 
     /// Check downloaded bytes against the signed release and install them.
@@ -1048,8 +1948,9 @@ impl PluginService {
         sha256: &str,
         size: u64,
         bytes: &[u8],
-        accept_capabilities: bool,
+        consent: impl Into<Consent>,
     ) -> LauncherResult<UpdateOutcome> {
+        let consent = consent.into();
         // The signed document said what these bytes must be. The host that
         // served them is trusted for nothing else: it may refuse, and it may
         // serve something different, but something different fails here.
@@ -1096,7 +1997,7 @@ impl PluginService {
             .as_ref()
             .map(|preview| preview.requires_capability_consent())
             .unwrap_or(false);
-        if needs_consent && !accept_capabilities {
+        if needs_consent && !consent.capabilities {
             let _ = std::fs::remove_dir_all(&staging);
             return Ok(UpdateOutcome::NeedsConsent {
                 preview: Box::new(preview.expect("checked above")),
@@ -1107,7 +2008,7 @@ impl PluginService {
         // a privileged path: it gets the same capability comparison, the same
         // data checkpoint, the same staging and rollback, and the same refusal
         // when it asks for more than was granted.
-        let result = self.install_package(&archive, accept_capabilities);
+        let result = self.install_package(&archive, consent);
         let _ = std::fs::remove_file(&archive);
 
         // The downloaded bytes are not kept. Retaining them would be a second
@@ -1124,12 +2025,6 @@ impl PluginService {
         &self,
         plugin_id: &PluginId,
     ) -> LauncherResult<(store::PluginRecord, store::TrustRecord)> {
-        if !self.is_enabled() {
-            return Err(LauncherError::Generic {
-                code: "ERR_PLUGINS_DISABLED".into(),
-                message: "the plugin system is switched off".into(),
-            });
-        }
         let conn = self.inner.conn()?;
         let record = store::get(&conn, plugin_id)?
             .filter(|record| !store::is_tombstone(record))
@@ -1209,13 +2104,31 @@ impl PluginService {
     pub fn add_development_folder(
         &self,
         folder: &Path,
-        accept_capabilities: bool,
+        consent: impl Into<Consent>,
     ) -> LauncherResult<PluginSummary> {
+        let consent = consent.into();
+        if let Some(expected) = consent.previewed_digest.as_deref() {
+            if install::folder_digest(folder)? != expected {
+                return Err(preview_changed());
+            }
+        }
+        let accept_capabilities = consent.capabilities;
         let manifest = install::read_folder_manifest(folder)?;
 
+        let lock = self.inner.ctx.lock_manager.acquire(
+            crate::lock_manager::LockResource::PluginInstall,
+            "plugin-add-folder",
+        )?;
         let conn = self.inner.conn()?;
+        install::check_for_interrupted_install(
+            &conn,
+            &self.inner.ctx.paths,
+            &manifest.id,
+            &lock,
+            &*self.inner.ctx.process_view(),
+        )?;
         let live = self.existing_install(Some(&manifest.id));
-        self.guard_consent(&manifest, live.as_ref(), accept_capabilities)?;
+        self.guard_consent(&manifest, live.as_ref(), accept_capabilities, false)?;
 
         if let Some(existing) = store::get(&conn, &manifest.id)? {
             if !store::is_tombstone(&existing) && !existing.source.is_development() {
@@ -1232,6 +2145,8 @@ impl PluginService {
 
         let _ = self.deactivate(&manifest.id);
         let granted = install::grant_for(&manifest)?;
+        let first_install = live.is_none();
+        let code_digest = install::script_digest(&manifest, folder)?;
         store::upsert(
             &conn,
             &manifest,
@@ -1243,6 +2158,27 @@ impl PluginService {
             true,
             &now(&self.inner.ctx),
         )?;
+        if manifest.is_declarative_only() {
+            store::clear_script_consent(&conn, &manifest.id)?;
+        } else {
+            let previous_runs_code = live.as_ref().is_some_and(|record| record.runs_code);
+            let previous_digest = if first_install {
+                None
+            } else {
+                store::script_consent_code_hash(&conn, &manifest.id)?
+            };
+            let code_is_new =
+                first_install || !previous_runs_code || previous_digest != code_digest;
+            if code_is_new {
+                store::set_script_consent(
+                    &conn,
+                    &manifest.id,
+                    consent.scripts,
+                    code_digest.as_deref(),
+                    &now(&self.inner.ctx),
+                )?;
+            }
+        }
         self.reload()?;
         self.summary(&manifest.id)
     }
@@ -1258,6 +2194,7 @@ impl PluginService {
         manifest: &agora_plugin_api::PluginManifest,
         previous: Option<&ExistingRecord>,
         accepted: bool,
+        publisher_changed: bool,
     ) -> LauncherResult<()> {
         // Reaching any host, or a list too long to review, is allowed — but
         // only once the user has chosen reduced security mode. Checked before
@@ -1277,6 +2214,19 @@ impl PluginService {
                     } else {
                         format!("{} websites", manifest.network.hosts.len())
                     }
+                ),
+            });
+        }
+        // A differently signed update is a new decision even when it asks for
+        // nothing new. Refused until the user says yes to the preview that
+        // names the publisher change.
+        if publisher_changed && !accepted {
+            return Err(LauncherError::Generic {
+                code: "ERR_PLUGIN_PUBLISHER_CHANGED".into(),
+                message: format!(
+                    "`{}` is now signed by a different publisher. It was not installed; \
+                     check where this update came from before allowing it.",
+                    manifest.id
                 ),
             });
         }
@@ -1311,18 +2261,75 @@ impl PluginService {
     }
 
     pub fn set_enabled(&self, plugin_id: &PluginId, enabled: bool) -> LauncherResult<()> {
+        crate::settings::admit_major_action(&self.inner.ctx)?;
         let conn = self.inner.conn()?;
-        if !store::set_enabled(&conn, plugin_id, enabled, &now(&self.inner.ctx))? {
-            return Err(LauncherError::Generic {
-                code: "ERR_PLUGIN_NOT_FOUND".into(),
-                message: format!("`{plugin_id}` is not installed"),
-            });
-        }
-        // Clearing the recorded failure is what makes "turn it off and on
-        // again" a real recovery rather than a no-op.
+        let records = store::list(&conn)?;
+        let name_of = |id: &PluginId| {
+            records
+                .iter()
+                .find(|record| record.id() == id)
+                .map(|record| record.manifest.name.clone())
+                .unwrap_or_else(|| id.to_string())
+        };
+
         if enabled {
-            store::set_last_error(&conn, plugin_id, None)?;
+            // Turning a plugin on brings the plugins it depends on along, because without them it
+            // cannot work. A dependency that is not installed is left to the resolver, which says
+            // why the plugin is not available.
+            let mut wanted = vec![plugin_id.clone()];
+            let mut seen: std::collections::BTreeSet<PluginId> =
+                std::iter::once(plugin_id.clone()).collect();
+            let mut index = 0;
+            while index < wanted.len() {
+                let current = wanted[index].clone();
+                index += 1;
+                let Some(record) = records.iter().find(|record| record.id() == &current) else {
+                    continue;
+                };
+                for dependency in record.manifest.dependencies.keys() {
+                    if seen.insert(dependency.clone())
+                        && records.iter().any(|record| record.id() == dependency)
+                    {
+                        wanted.push(dependency.clone());
+                    }
+                }
+            }
+            for id in &wanted {
+                let changed = store::set_enabled(&conn, id, true, &now(&self.inner.ctx))?;
+                if id == plugin_id && !changed {
+                    return Err(LauncherError::Generic {
+                        code: "ERR_PLUGIN_NOT_FOUND".into(),
+                        message: format!("`{plugin_id}` is not installed"),
+                    });
+                }
+                // Clearing the recorded failure is what makes "turn it off and on
+                // again" a real recovery rather than a no-op.
+                store::set_last_error(&conn, id, None)?;
+            }
         } else {
+            // A plugin another enabled plugin needs cannot be turned off on its own: that would
+            // leave the other one unable to run with no explanation of why.
+            if let Some(dependent) = records.iter().find(|record| {
+                record.enabled
+                    && record.id() != plugin_id
+                    && record.manifest.dependencies.contains_key(plugin_id)
+            }) {
+                return Err(LauncherError::Generic {
+                    code: "ERR_PLUGIN_NEEDED".into(),
+                    message: format!(
+                        "{} is needed by {}. Turn {} off first.",
+                        name_of(plugin_id),
+                        name_of(dependent.id()),
+                        name_of(dependent.id())
+                    ),
+                });
+            }
+            if !store::set_enabled(&conn, plugin_id, false, &now(&self.inner.ctx))? {
+                return Err(LauncherError::Generic {
+                    code: "ERR_PLUGIN_NOT_FOUND".into(),
+                    message: format!("`{plugin_id}` is not installed"),
+                });
+            }
             self.deactivate(plugin_id)?;
         }
         self.reload()
@@ -1330,17 +2337,28 @@ impl PluginService {
 
     /// Remove a plugin. `purge_data` is a separate decision from removing it.
     pub fn uninstall(&self, plugin_id: &PluginId, purge_data: bool) -> LauncherResult<()> {
-        self.deactivate(plugin_id)?;
+        crate::settings::admit_major_action(&self.inner.ctx)?;
+        let lock = self.inner.ctx.lock_manager.acquire(
+            crate::lock_manager::LockResource::PluginInstall,
+            "plugin-uninstall",
+        )?;
         let conn = self.inner.conn()?;
+        install::check_for_interrupted_install(
+            &conn,
+            &self.inner.ctx.paths,
+            plugin_id,
+            &lock,
+            &*self.inner.ctx.process_view(),
+        )?;
+        self.deactivate(plugin_id)?;
         let Some(record) = store::get(&conn, plugin_id)? else {
             return Err(LauncherError::Generic {
                 code: "ERR_PLUGIN_NOT_FOUND".into(),
                 message: format!("`{plugin_id}` is not installed"),
             });
         };
-        install::remove_package_files(&record.source, &record.install_dir)?;
+        install::uninstall(&conn, &self.inner.ctx, &lock, &record, purge_data)?;
         logs::remove(&self.inner.logs_root, plugin_id);
-        store::remove(&conn, plugin_id, purge_data)?;
         self.reload()
     }
 
@@ -1358,7 +2376,7 @@ impl PluginService {
     /// start. One broken plugin disabling the others would make the system
     /// exactly as fragile as having no isolation at all.
     pub fn activate_all(&self) -> LauncherResult<Vec<(PluginId, PluginError)>> {
-        if !self.is_enabled() {
+        if !self.plugin_code_allowed() {
             return Ok(Vec::new());
         }
         self.reload()?;
@@ -1370,6 +2388,7 @@ impl PluginService {
                 resolution
                     .activation_order
                     .iter()
+                    .filter(|plugin_id| self.scripts_permitted(plugin_id))
                     .filter(|plugin_id| {
                         resolution
                             .get(plugin_id)
@@ -1403,7 +2422,7 @@ impl PluginService {
         event: agora_plugin_api::protocol::PluginEvent,
         operation_id: Option<String>,
     ) -> usize {
-        if !self.is_enabled() {
+        if !self.plugin_code_allowed() {
             return 0;
         }
         self.activate_waiting_for_event(event.name());
@@ -1419,6 +2438,7 @@ impl PluginService {
             .map(|resolution| {
                 resolution
                     .runnable()
+                    .filter(|resolved| self.scripts_permitted(resolved.id()))
                     .filter(|resolved| {
                         resolved.record.manifest.activation.iter().any(|activation| {
                             matches!(activation, ActivationEvent::Event(name) if name == event_name)
@@ -1443,7 +2463,7 @@ impl PluginService {
     /// exists for a plugin that wants to react to an instance being opened
     /// without putting anything on screen.
     pub fn notify_instance_opened(&self) -> usize {
-        if !self.is_enabled() {
+        if !self.plugin_code_allowed() {
             return 0;
         }
         let waiting: Vec<PluginId> = self
@@ -1453,6 +2473,7 @@ impl PluginService {
             .map(|resolution| {
                 resolution
                     .runnable()
+                    .filter(|resolved| self.scripts_permitted(resolved.id()))
                     .filter(|resolved| {
                         resolved
                             .record
@@ -1489,11 +2510,23 @@ impl PluginService {
         if self.inner.host.is_active(plugin_id) {
             return Ok(());
         }
+        // The first check after an activation always hashes the code that is
+        // being loaded, rather than trusting a memo from an earlier session of
+        // this process.
+        if let Ok(mut cache) = self.inner.code_identities.write() {
+            cache.remove(plugin_id.as_str());
+        }
+        // The one place a script runtime starts. A data-only plugin returned
+        // above and needs neither the user's permission nor the stop to be off.
+        if !self.scripts_permitted(plugin_id) {
+            return Err(self.scripts_refused(plugin_id));
+        }
 
         let settings = self.settings_snapshot(plugin_id, &record);
         let request = ActivationRequest {
             plugin_id: plugin_id.clone(),
             package_root: record.install_dir.clone(),
+            data_root: self.inner.ctx.paths.root().to_path_buf(),
             entrypoint: record.manifest.entrypoint.clone().unwrap_or_default(),
             memory_limit_bytes: ActivationRequest::DEFAULT_MEMORY_LIMIT,
             stack_limit_bytes: ActivationRequest::DEFAULT_STACK_LIMIT,
@@ -1629,6 +2662,40 @@ impl PluginService {
 
     // -- calling into plugins ---------------------------------------------
 
+    /// Call an export on behalf of a scripted game package. The consent check
+    /// and the runtime are the same as every other call into a plugin.
+    fn invoke_behaviour(
+        &self,
+        plugin_id: &PluginId,
+        export: &str,
+        args: serde_json::Value,
+        timeout: Duration,
+        reads: Option<Arc<dyn GameReads>>,
+        blobs: Option<Arc<dyn StoredBlobs>>,
+    ) -> Result<serde_json::Value, PluginError> {
+        self.ensure_running(plugin_id)?;
+        self.inner
+            .host
+            .invoke_with_scopes(plugin_id, export, args, timeout, reads, blobs)
+    }
+
+    /// This plugin's own blob store, as a wasm `stored` mount sees it.
+    fn blobs_for(&self, plugin_id: &PluginId) -> Arc<dyn StoredBlobs> {
+        Arc::new(crate::plugins::blobs::PluginBlobs {
+            ctx: self.inner.ctx.clone(),
+            plugin_id: plugin_id.clone(),
+        })
+    }
+
+    /// Open a budget session for one top-level call into a plugin.
+    fn budget_guard(&self, plugin_id: &PluginId) -> crate::game_script::BudgetGuard {
+        self.inner
+            .ctx
+            .extensions
+            .get_or_insert_with(crate::game_script::GameBudgets::default)
+            .begin(plugin_id.as_str())
+    }
+
     /// Render a contributed view.
     pub fn render_view(
         &self,
@@ -1636,11 +2703,17 @@ impl PluginService {
         export: &str,
         args: serde_json::Value,
     ) -> Result<ViewModel, PluginError> {
+        let _budget = self.budget_guard(plugin_id);
         self.ensure_running(plugin_id)?;
-        let value = self
-            .inner
-            .host
-            .invoke(plugin_id, export, args, INVOKE_TIMEOUT)?;
+        let blobs = self.blobs_for(plugin_id);
+        let value = self.inner.host.invoke_with_scopes(
+            plugin_id,
+            export,
+            args,
+            INVOKE_TIMEOUT,
+            None,
+            Some(blobs),
+        )?;
         let model: ViewModel = serde_json::from_value(value).map_err(|e| {
             PluginError::new(
                 PluginErrorCode::ScriptError,
@@ -1658,10 +2731,17 @@ impl PluginService {
         export: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, PluginError> {
+        let _budget = self.budget_guard(plugin_id);
         self.ensure_running(plugin_id)?;
-        self.inner
-            .host
-            .invoke(plugin_id, export, args, INVOKE_TIMEOUT)
+        let blobs = self.blobs_for(plugin_id);
+        self.inner.host.invoke_with_scopes(
+            plugin_id,
+            export,
+            args,
+            INVOKE_TIMEOUT,
+            None,
+            Some(blobs),
+        )
     }
 
     /// Run a diagnostic and return what it found.
@@ -1671,11 +2751,17 @@ impl PluginService {
         export: &str,
         args: serde_json::Value,
     ) -> Result<DiagnosticReport, PluginError> {
+        let _budget = self.budget_guard(plugin_id);
         self.ensure_running(plugin_id)?;
-        let value = self
-            .inner
-            .host
-            .invoke(plugin_id, export, args, DIAGNOSTIC_TIMEOUT)?;
+        let blobs = self.blobs_for(plugin_id);
+        let value = self.inner.host.invoke_with_scopes(
+            plugin_id,
+            export,
+            args,
+            DIAGNOSTIC_TIMEOUT,
+            None,
+            Some(blobs),
+        )?;
         let report: DiagnosticReport = serde_json::from_value(value).map_err(|e| {
             PluginError::new(
                 PluginErrorCode::ScriptError,
@@ -1699,7 +2785,7 @@ impl PluginService {
     /// consent, never the manifest: a provider the user did not agree to never
     /// appears, even if an update added one.
     pub fn content_providers(&self) -> Vec<PluginContentProvider> {
-        if !self.is_enabled() {
+        if !self.plugin_code_allowed() {
             return Vec::new();
         }
         let Ok(resolution) = self.inner.resolution.read() else {
@@ -1708,6 +2794,7 @@ impl PluginService {
         resolution
             .plugins
             .iter()
+            .filter(|resolved| self.scripts_permitted(resolved.id()))
             .filter(|resolved| {
                 resolved
                     .record
@@ -1744,6 +2831,7 @@ impl PluginService {
         export: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, PluginError> {
+        let _budget = self.budget_guard(plugin_id);
         let granted = self.inner.record(plugin_id).is_some_and(|record| {
             record
                 .granted
@@ -1756,9 +2844,15 @@ impl PluginService {
             ));
         }
         self.ensure_running(plugin_id)?;
-        self.inner
-            .host
-            .invoke(plugin_id, export, args, PROVIDER_TIMEOUT)
+        let blobs = self.blobs_for(plugin_id);
+        self.inner.host.invoke_with_scopes(
+            plugin_id,
+            export,
+            args,
+            PROVIDER_TIMEOUT,
+            None,
+            Some(blobs),
+        )
     }
 
     /// Run every contributed launch check for an instance.
@@ -1769,7 +2863,7 @@ impl PluginService {
     /// slow plugin nor a broken one can stop someone launching their game.
     pub fn run_launch_checks(&self, instance_id: &str) -> LaunchCheckOutcome {
         let mut outcome = LaunchCheckOutcome::default();
-        if !self.is_enabled() {
+        if !self.plugin_code_allowed() {
             return outcome;
         }
         let Ok(resolution) = self.inner.resolution.read() else {
@@ -1777,6 +2871,7 @@ impl PluginService {
         };
         let runnable: Vec<_> = resolution
             .runnable()
+            .filter(|resolved| self.scripts_permitted(resolved.id()))
             .map(|resolved| resolved.record.clone())
             .collect();
         drop(resolution);
@@ -1790,6 +2885,7 @@ impl PluginService {
             }
             for check in &record.manifest.contributions.launch_checks {
                 let plugin_id = record.id().clone();
+                let _budget = self.budget_guard(&plugin_id);
                 if let Err(error) = self.ensure_running(&plugin_id) {
                     outcome
                         .errors
@@ -1798,11 +2894,15 @@ impl PluginService {
                 }
                 let timeout = Duration::from_millis(check.timeout_ms.min(MAX_LAUNCH_CHECK_MS));
                 let args = serde_json::json!({ "instanceId": instance_id });
-                match self
-                    .inner
-                    .host
-                    .invoke(&plugin_id, &check.export, args, timeout)
-                {
+                let blobs = self.blobs_for(&plugin_id);
+                match self.inner.host.invoke_with_scopes(
+                    &plugin_id,
+                    &check.export,
+                    args,
+                    timeout,
+                    None,
+                    Some(blobs),
+                ) {
                     Ok(value) => match serde_json::from_value::<DiagnosticReport>(value) {
                         Ok(report) if report.validate().is_ok() => {
                             outcome.results.push(LaunchCheckResult {
@@ -1829,12 +2929,23 @@ impl PluginService {
         outcome
     }
 
+    /// Why a script was refused, in words for the person who has to fix it.
+    fn scripts_refused(&self, plugin_id: &PluginId) -> PluginError {
+        let reason = if self.emergency_stop_engaged() {
+            "All plugin code is stopped (emergency stop)".to_string()
+        } else if self.code_consent_is_stale(plugin_id) {
+            format!(
+                "`{plugin_id}`'s code changed after you consented to it. Consent again to the new code before it can run."
+            )
+        } else {
+            format!("`{plugin_id}` has not been allowed to run code")
+        };
+        PluginError::new(PluginErrorCode::NotActivated, reason)
+    }
+
     fn ensure_running(&self, plugin_id: &PluginId) -> Result<(), PluginError> {
-        if !self.is_enabled() {
-            return Err(PluginError::new(
-                PluginErrorCode::NotActivated,
-                "Plugins are turned off",
-            ));
+        if !self.scripts_permitted(plugin_id) {
+            return Err(self.scripts_refused(plugin_id));
         }
         if self.inner.host.is_active(plugin_id) {
             return Ok(());
@@ -1932,10 +3043,10 @@ impl PluginService {
                 code: "ERR_PLUGIN_DISABLED".into(),
                 message: "Plugin is unavailable or disabled".into(),
             })?;
-        if !self.is_enabled() {
+        if !self.scripts_permitted(plugin_id) {
             return Err(LauncherError::Generic {
                 code: "ERR_PLUGIN_DISABLED".into(),
-                message: "Plugins are turned off".into(),
+                message: self.scripts_refused(plugin_id).message,
             });
         }
         for action in &proposal.actions {
@@ -1981,9 +3092,14 @@ impl PluginService {
     /// Check that an action still makes sense before performing it.
     fn revalidate(&self, action: &RepairAction) -> Result<(), String> {
         let instance_id = action.instance_id();
-        let service = crate::instance_service::InstanceService::new(self.inner.ctx.clone());
-        let detail = match service.get(instance_id) {
-            Ok(Some(detail)) => detail,
+        let backend = self
+            .inner
+            .ctx
+            .games
+            .instance_backend()
+            .map_err(|e| e.to_string())?;
+        let (row, manifest) = match backend.get(&self.inner.ctx, instance_id) {
+            Ok(Some(found)) => found,
             Ok(None) => return Err(format!("instance `{instance_id}` no longer exists")),
             Err(error) => return Err(error.to_string()),
         };
@@ -1993,26 +3109,18 @@ impl PluginService {
             | RepairAction::EnableContent { key, .. }
             | RepairAction::PinContentUpdate { key, .. }
             | RepairAction::UnpinContentUpdate { key, .. } => {
-                if detail.row.is_locked {
+                if row.is_locked {
                     return Err("the instance is locked".to_string());
                 }
-                let Some(manifest) = detail.manifest else {
+                if manifest.is_none() {
                     return Err("the instance has no manifest to read".to_string());
-                };
-                let instance_dir = self
-                    .inner
-                    .ctx
-                    .paths
-                    .instance_dir(instance_id)
-                    .map_err(|e| e.to_string())?;
-                let present = crate::installed_content::list_installed_content(
-                    &instance_dir,
-                    &manifest,
-                    None,
-                    None,
-                )
-                .into_iter()
-                .any(|row| &row.key == key);
+                }
+                let present = backend
+                    .content(&self.inner.ctx, instance_id, None)
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or_default()
+                    .into_iter()
+                    .any(|entry| &entry.key == key);
                 if !present {
                     return Err(format!("`{key}` is no longer installed"));
                 }
@@ -2040,45 +3148,50 @@ impl PluginService {
             | RepairAction::UnpinContentUpdate { instance_id, key } => {
                 let filename = self.filename_for(instance_id, key)?;
                 let pinned = matches!(action, RepairAction::PinContentUpdate { .. });
-                crate::install_service::InstallService::new(ctx)
-                    .set_update_pinned(instance_id, &filename, pinned)
+                self.inner
+                    .ctx
+                    .games
+                    .instance_backend()?
+                    .set_update_pinned(&ctx, instance_id, &filename, pinned)
                     .map(|_| ())
             }
             RepairAction::SetJvmMemory {
                 instance_id,
                 memory_mb,
             } => {
-                let service = crate::instance_service::InstanceService::new(ctx);
-                let Some(detail) = service.get(instance_id)? else {
+                let backend = self.inner.ctx.games.instance_backend()?;
+                let Some((row, _)) = backend.get(&ctx, instance_id)? else {
                     return Err(LauncherError::Generic {
                         code: "ERR_INSTANCE_NOT_FOUND".into(),
                         message: format!("no instance `{instance_id}`"),
                     });
                 };
-                service.update_jvm(
+                backend.update_jvm(
+                    &ctx,
                     instance_id,
                     *memory_mb,
-                    &detail.row.jvm_gc,
-                    detail.row.jvm_always_pre_touch,
-                    &detail.row.jvm_custom_args,
+                    &row.jvm_gc,
+                    row.jvm_always_pre_touch,
+                    &row.jvm_custom_args,
                     "manual",
                 )
             }
             RepairAction::ResetJvmArgs { instance_id } => {
-                let service = crate::instance_service::InstanceService::new(ctx);
-                let Some(detail) = service.get(instance_id)? else {
+                let backend = self.inner.ctx.games.instance_backend()?;
+                let Some((row, _)) = backend.get(&ctx, instance_id)? else {
                     return Err(LauncherError::Generic {
                         code: "ERR_INSTANCE_NOT_FOUND".into(),
                         message: format!("no instance `{instance_id}`"),
                     });
                 };
-                service.update_jvm(
+                backend.update_jvm(
+                    &ctx,
                     instance_id,
-                    detail.row.jvm_memory_mb,
-                    &detail.row.jvm_gc,
-                    detail.row.jvm_always_pre_touch,
+                    row.jvm_memory_mb,
+                    &row.jvm_gc,
+                    row.jvm_always_pre_touch,
                     "",
-                    &detail.row.jvm_memory_mode,
+                    &row.jvm_memory_mode,
                 )
             }
             RepairAction::CreateSnapshot { instance_id, label } => {
@@ -2090,21 +3203,23 @@ impl PluginService {
     }
 
     fn filename_for(&self, instance_id: &str, key: &str) -> LauncherResult<String> {
-        let service = crate::instance_service::InstanceService::new(self.inner.ctx.clone());
-        let Some(detail) = service.get(instance_id)? else {
+        let backend = self.inner.ctx.games.instance_backend()?;
+        let Some((_, manifest)) = backend.get(&self.inner.ctx, instance_id)? else {
             return Err(LauncherError::Generic {
                 code: "ERR_INSTANCE_NOT_FOUND".into(),
                 message: format!("no instance `{instance_id}`"),
             });
         };
-        let Some(manifest) = detail.manifest else {
+        if manifest.is_none() {
             return Err(LauncherError::Generic {
                 code: "ERR_INSTANCE_MANIFEST_MISSING".into(),
                 message: format!("`{instance_id}` has no manifest"),
             });
-        };
-        let instance_dir = self.inner.ctx.paths.instance_dir(instance_id)?;
-        crate::installed_content::list_installed_content(&instance_dir, &manifest, None, None)
+        }
+        let entries = backend
+            .content(&self.inner.ctx, instance_id, None)?
+            .unwrap_or_default();
+        entries
             .into_iter()
             .find(|row| row.key == key)
             .map(|row| row.filename)
@@ -2114,7 +3229,7 @@ impl PluginService {
             })
     }
 
-    fn summary(&self, plugin_id: &PluginId) -> LauncherResult<PluginSummary> {
+    pub(super) fn summary(&self, plugin_id: &PluginId) -> LauncherResult<PluginSummary> {
         self.list()
             .into_iter()
             .find(|summary| summary.id == plugin_id.as_str())
@@ -2143,9 +3258,23 @@ fn now(ctx: &Ctx) -> String {
     chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()).to_rfc3339()
 }
 
+/// The refusal for a package (or folder) that is not the one previewed.
+///
+/// Reached when the caller passed the digest of the answer it collected and the
+/// bytes it is now installing are different. Failing closed is the point: the
+/// capabilities and code the user agreed to may not be what this package has.
+fn preview_changed() -> LauncherError {
+    LauncherError::Generic {
+        code: "ERR_PLUGIN_PREVIEW_CHANGED".into(),
+        message: "The plugin changed since you approved it. Preview it again before \
+                  installing."
+            .into(),
+    }
+}
+
 /// The plugin id an archive claims, when it can be read cheaply.
-fn archive_id(archive: &Path) -> Option<PluginId> {
-    install::read_package_manifest(archive)
+fn archive_id(bytes: &[u8]) -> Option<PluginId> {
+    install::read_package_manifest_bytes(bytes)
         .ok()
         .map(|contents| contents.manifest.id)
 }
@@ -2153,10 +3282,13 @@ fn archive_id(archive: &Path) -> Option<PluginId> {
 /// Capabilities a stored grant covers, for display.
 /// An install read out of the database, owned so the connection can be closed.
 struct ExistingRecord {
+    runs_code: bool,
     version: semver::Version,
     data_version: u32,
     hosts: Vec<String>,
     granted: CapabilitySet,
+    trusted_keys: Vec<agora_plugin_api::distribution::PublicKey>,
+    code_hash: Option<String>,
 }
 
 impl ExistingRecord {
@@ -2166,6 +3298,9 @@ impl ExistingRecord {
             data_version: self.data_version,
             granted: &self.granted,
             hosts: &self.hosts,
+            runs_code: self.runs_code,
+            trusted_keys: Some(&self.trusted_keys),
+            code_hash: self.code_hash.as_deref(),
         }
     }
 }

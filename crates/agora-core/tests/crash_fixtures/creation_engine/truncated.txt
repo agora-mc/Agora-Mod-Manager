@@ -1,0 +1,12 @@
+Skyrim SSE v1.6.640
+CrashLoggerSSE v1-15-0-0 Jan  1 2025 00:00:00
+
+Unhandled exception "EXCEPTION_ACCESS_VIOLATION" at 0x7FF600001000 ExampleGame.dll+001000
+
+SYSTEM SPECS:
+	OS: Microsoft Windows 11 Home v10.0.26100
+	CPU: InventedVendor Invented CPU 9100
+
+PROBABLE CALL STACK:
+	[ 0] 0x7FF600001000                   ExampleGame.dll+001000 -> 22222+0x10
+	[ 1] 0x7FF6000020

@@ -13,28 +13,31 @@
 //! install record all complete before anything is activated, so a plugin that
 //! crashes on activation is still a plugin the user can see and remove.
 
+use super::store;
 use super::store::PluginSource;
 use crate::error::{LauncherError, LauncherResult};
+use agora_game_api::{ArchiveLimits, NamePolicy, SafeArchive};
 use agora_plugin_api::capability::{CapabilityRequest, CapabilitySet};
-use agora_plugin_api::distribution::{UpdateSource, UPDATE_SOURCE_FILENAME};
-use agora_plugin_api::manifest::{PluginManifest, MANIFEST_FILENAME};
-use std::io::Read;
-use std::path::{Component, Path, PathBuf};
+use agora_plugin_api::distribution::{PublicKey, UpdateSource, UPDATE_SOURCE_FILENAME};
+use agora_plugin_api::manifest::{PluginId, PluginManifest, MANIFEST_FILENAME};
+use std::path::{Path, PathBuf};
 
+// A package's limits are a preset of the one archive reader (MASTER_SPEC §32.3). These names stay
+// because the download cap and the catalog code ask them, and they must not drift from the preset.
 /// How many files one plugin package may contain.
-pub const MAX_ENTRIES: usize = 2_000;
+pub const MAX_ENTRIES: usize = ArchiveLimits::PLUGIN_PACKAGE.max_entries;
 
 /// How large one file inside a package may be once expanded.
-pub const MAX_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_ENTRY_BYTES: u64 = ArchiveLimits::PLUGIN_PACKAGE.max_entry_bytes;
 
 /// How large a whole package may be once expanded.
-pub const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_TOTAL_BYTES: u64 = ArchiveLimits::PLUGIN_PACKAGE.max_total_bytes;
 
 /// Largest expansion ratio a package may have before it is treated as hostile.
 ///
 /// A legitimately compressible plugin (JSON, JavaScript) reaches perhaps 20:1.
 /// Past 200:1 the archive is not a plugin, it is a decompression bomb.
-pub const MAX_EXPANSION_RATIO: u64 = 200;
+pub const MAX_EXPANSION_RATIO: u64 = ArchiveLimits::PLUGIN_PACKAGE.max_ratio;
 
 fn invalid_package(message: impl Into<String>) -> LauncherError {
     LauncherError::Generic {
@@ -137,6 +140,13 @@ pub struct ExistingInstall<'a> {
     /// host list are two different agreements. Keeping the capability while
     /// changing the list is still asking for something new.
     pub hosts: &'a [String],
+    /// The installed version has code.
+    pub runs_code: bool,
+    /// The publisher keys pinned when this plugin was installed, if it had an
+    /// update source. A package naming different keys is a publisher change.
+    pub trusted_keys: Option<&'a [PublicKey]>,
+    /// The code digest the script consent was given for, if the user answered.
+    pub code_hash: Option<&'a str>,
 }
 
 /// What the user is agreeing to when they install something.
@@ -175,6 +185,10 @@ pub struct InstallPreview {
     /// is being agreed to, and because it is the only moment at which the key
     /// can be compared against something the author published elsewhere.
     pub update_source: Option<UpdateSourceSummary>,
+    /// This update is signed by a different publisher key than the install
+    /// pinned. The user has to confirm it explicitly, and script consent is
+    /// asked again because it was given for the old publisher's code.
+    pub publisher_changed: bool,
     /// True when the upgrade changes the plugin's stored data shape.
     pub migrates_data: bool,
     /// It asks to reach any host, or more hosts than can reasonably be
@@ -182,6 +196,35 @@ pub struct InstallPreview {
     pub needs_reduced_security: bool,
     pub file_count: usize,
     pub uncompressed_bytes: u64,
+    /// The plugin has code (an entrypoint). The install prompt asks, once,
+    /// whether to allow it to run ("<name> runs code. Allow it?").
+    pub runs_code: bool,
+    /// The plugin has code and the installed version did not, or nothing is
+    /// installed. An update that adds code does not inherit permission to run it.
+    pub adds_code: bool,
+    /// This package's code is not the code the user's answer was given for
+    /// (new, changed, or a changed publisher). The code prompt is asked again,
+    /// and until it is answered the scripts do not run.
+    pub code_changed: bool,
+    /// Official dependencies this install will write too, dependencies first.
+    ///
+    /// Set on the target's preview in a `needsConsent` reply so the player can
+    /// see everything one consent covers. Empty for a single package.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also_installs: Vec<InstallPreview>,
+    /// This package comes from the signed official catalog. Set by the official
+    /// install paths so the prompt can recommend allowing its code; a community
+    /// package is never marked here.
+    #[serde(default)]
+    pub official: bool,
+    /// Identifies the bytes this preview described: SHA-256 of the package, or
+    /// of the folder's manifest and files for a development folder.
+    ///
+    /// The install prompt passes it back, and the installer refuses a package
+    /// that no longer matches, so a yes given for one package cannot be used
+    /// for a different one that replaced it between preview and install.
+    #[serde(default)]
+    pub package_digest: String,
 }
 
 impl InstallPreview {
@@ -190,7 +233,9 @@ impl InstallPreview {
     /// Kept on the core-owned preview so adapters do not duplicate the
     /// consent rule while deciding whether to show their own prompt.
     pub fn requires_capability_consent(&self) -> bool {
-        !self.added_capabilities.is_empty() || !self.added_hosts.is_empty()
+        !self.added_capabilities.is_empty()
+            || !self.added_hosts.is_empty()
+            || self.publisher_changed
     }
 }
 
@@ -311,74 +356,65 @@ pub struct PackageContents {
     /// nothing to declare, and requiring a distribution block would make the
     /// simplest case carry the most complicated file.
     pub update_source: Option<UpdateSource>,
+    /// Digest of the manifest's entrypoint, so a preview can tell whether this
+    /// is code the user already answered for.
+    pub code_digest: Option<String>,
     pub file_count: usize,
     pub uncompressed_bytes: u64,
 }
 
+/// Read a package file into memory, once.
+///
+/// Every later step (reading the manifest, extracting) works from these bytes
+/// rather than re-opening the path, so the file cannot change between the check
+/// and the use. A package larger than the expanded-size limit cannot be valid,
+/// so it is refused before it is read.
+pub fn read_package_file(archive: &Path) -> LauncherResult<Vec<u8>> {
+    let length = std::fs::metadata(archive)
+        .map_err(|e| io_error(format!("could not open {}: {e}", archive.display())))?
+        .len();
+    if length > MAX_TOTAL_BYTES {
+        return Err(invalid_package(format!(
+            "the package file is {length} bytes; a plugin package may not exceed {MAX_TOTAL_BYTES}"
+        )));
+    }
+    std::fs::read(archive)
+        .map_err(|e| io_error(format!("could not read {}: {e}", archive.display())))
+}
+
 /// Read and validate a package without extracting it.
 pub fn read_package_manifest(archive: &Path) -> LauncherResult<PackageContents> {
-    let file = std::fs::File::open(archive)
-        .map_err(|e| io_error(format!("could not open {}: {e}", archive.display())))?;
-    let compressed = file.metadata().map(|meta| meta.len()).unwrap_or(0).max(1);
-    let mut zip = zip::ZipArchive::new(file)
-        .map_err(|e| invalid_package(format!("not a readable plugin package: {e}")))?;
+    read_package_manifest_bytes(&read_package_file(archive)?)
+}
 
-    if zip.len() > MAX_ENTRIES {
-        return Err(invalid_package(format!(
-            "the package contains {} files; the limit is {MAX_ENTRIES}",
-            zip.len()
-        )));
-    }
+/// [`read_package_manifest`] over bytes already in memory.
+pub fn read_package_manifest_bytes(bytes: &[u8]) -> LauncherResult<PackageContents> {
+    let mut archive = SafeArchive::open_bytes(bytes.to_vec(), ArchiveLimits::PLUGIN_PACKAGE)
+        .map_err(|error| invalid_package(error.to_string()))?;
 
-    let mut total = 0u64;
+    // A preview must not pass a package the install would then refuse, so the names are decided
+    // here by the same rule the extraction uses, and nothing is written either way.
+    archive
+        .left_out_names(NamePolicy::Refuse)
+        .map_err(|error| invalid_package(error.to_string()))?;
+
+    let package_files: Vec<(String, u64)> = archive
+        .file_entries()
+        .map(|entry| (entry.name.clone(), entry.size))
+        .collect();
+    let file_count = package_files.len();
+    let total: u64 = package_files.iter().map(|(_, size)| *size).sum();
+
     let mut manifest_text: Option<String> = None;
     let mut source_text: Option<String> = None;
-    for index in 0..zip.len() {
-        let mut entry = zip
-            .by_index(index)
-            .map_err(|e| invalid_package(format!("unreadable entry in the package: {e}")))?;
-        let name = entry
-            .name()
-            .map_err(|e| invalid_package(format!("unreadable entry in the package: {e}")))?
-            .into_owned();
-        if entry.is_dir() {
-            continue;
-        }
-        validate_entry_path(&name)?;
-        let size = entry.size();
-        if size > MAX_ENTRY_BYTES {
-            return Err(invalid_package(format!(
-                "`{name}` expands to {size} bytes; the per-file limit is {MAX_ENTRY_BYTES}"
-            )));
-        }
-        total = total.saturating_add(size);
-        if total > MAX_TOTAL_BYTES {
-            return Err(invalid_package(format!(
-                "the package expands past {MAX_TOTAL_BYTES} bytes"
-            )));
-        }
+    for (name, _) in &package_files {
         if name == MANIFEST_FILENAME {
-            let mut text = String::new();
-            entry
-                .read_to_string(&mut text)
-                .map_err(|e| invalid_package(format!("could not read {MANIFEST_FILENAME}: {e}")))?;
+            let text = read_package_text(&mut archive, name)?;
             manifest_text = Some(text);
         } else if name == UPDATE_SOURCE_FILENAME {
-            let mut text = String::new();
-            entry.read_to_string(&mut text).map_err(|e| {
-                invalid_package(format!("could not read {UPDATE_SOURCE_FILENAME}: {e}"))
-            })?;
+            let text = read_package_text(&mut archive, name)?;
             source_text = Some(text);
         }
-    }
-
-    // Checked after the walk so the ratio is against the real expanded size,
-    // not the declared one for a single entry.
-    if total / compressed > MAX_EXPANSION_RATIO {
-        return Err(invalid_package(format!(
-            "the package expands {}x, past the {MAX_EXPANSION_RATIO}x limit",
-            total / compressed
-        )));
     }
 
     let Some(text) = manifest_text else {
@@ -388,22 +424,36 @@ pub fn read_package_manifest(archive: &Path) -> LauncherResult<PackageContents> 
     };
     let manifest = PluginManifest::parse(&text).map_err(|e| invalid_package(e.message))?;
 
-    if let Some(entrypoint) = &manifest.entrypoint {
-        let present = (0..zip.len()).any(|index| {
-            zip.by_index(index)
-                .map(|entry| {
-                    entry
-                        .name()
-                        .is_ok_and(|name| name.replace('\\', "/") == *entrypoint)
-                })
-                .unwrap_or(false)
-        });
-        if !present {
+    // The digest covers every file the host could load as a module, not only
+    // the entrypoint: `import "./util.js"` is resolved inside the package, so
+    // changing util.js must count as changing the code. The manifest and update
+    // source are host metadata and are never loaded as modules, so they are
+    // left out (their changes are handled by their own rules).
+    let code_digest = if let Some(entrypoint) = &manifest.entrypoint {
+        use sha2::{Digest, Sha256};
+        let mut files = std::collections::BTreeMap::new();
+        for (entry_name, _) in &package_files {
+            let name = normalize_relative(entry_name);
+            if name == MANIFEST_FILENAME || name == UPDATE_SOURCE_FILENAME {
+                continue;
+            }
+            let bytes = archive
+                .read(entry_name)
+                .map_err(|e| invalid_package(format!("could not read `{name}`: {e}")))?;
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            files.insert(name, hex::encode(hasher.finalize()));
+        }
+        let entrypoint = normalize_relative(entrypoint);
+        if !files.contains_key(&entrypoint) {
             return Err(invalid_package(format!(
                 "the manifest names `{entrypoint}` as the entrypoint, but the package does not contain it"
             )));
         }
-    }
+        Some(finish_script_digest(&files))
+    } else {
+        None
+    };
 
     // A malformed distribution block fails the install rather than being
     // ignored. Silently dropping it would leave a plugin that looks like it
@@ -416,9 +466,18 @@ pub fn read_package_manifest(archive: &Path) -> LauncherResult<PackageContents> 
     Ok(PackageContents {
         manifest,
         update_source,
-        file_count: zip.len(),
+        code_digest,
+        file_count,
         uncompressed_bytes: total,
     })
+}
+
+/// One text file out of a package, refused if it is not UTF-8.
+fn read_package_text(archive: &mut SafeArchive, name: &str) -> LauncherResult<String> {
+    let bytes = archive
+        .read(name)
+        .map_err(|error| invalid_package(error.to_string()))?;
+    String::from_utf8(bytes).map_err(|_| invalid_package(format!("`{name}` is not UTF-8 text")))
 }
 
 /// Describe what installing a package would do.
@@ -426,13 +485,23 @@ pub fn preview_package(
     archive: &Path,
     existing: Option<&ExistingInstall<'_>>,
 ) -> LauncherResult<InstallPreview> {
-    let contents = read_package_manifest(archive)?;
+    preview_package_bytes(&read_package_file(archive)?, existing)
+}
+
+/// [`preview_package`] over bytes already in memory.
+pub fn preview_package_bytes(
+    bytes: &[u8],
+    existing: Option<&ExistingInstall<'_>>,
+) -> LauncherResult<InstallPreview> {
+    let contents = read_package_manifest_bytes(bytes)?;
     Ok(build_preview(
         contents.manifest,
         contents.update_source,
+        contents.code_digest,
         existing,
         contents.file_count,
         contents.uncompressed_bytes,
+        package_digest(bytes),
     ))
 }
 
@@ -442,24 +511,52 @@ pub fn preview_folder(
     existing: Option<&ExistingInstall<'_>>,
 ) -> LauncherResult<InstallPreview> {
     let manifest = read_folder_manifest(folder)?;
+    let code_digest = script_digest(&manifest, folder)?;
+    let digest = folder_digest(folder)?;
     // A development folder is never enrolled for updates: the author is the
     // one editing it, and an update that overwrote their working copy would be
     // the opposite of helpful.
-    Ok(build_preview(manifest, None, existing, 0, 0))
+    Ok(build_preview(
+        manifest,
+        None,
+        code_digest,
+        existing,
+        0,
+        0,
+        digest,
+    ))
 }
 
 fn build_preview(
     manifest: PluginManifest,
     update_source: Option<UpdateSource>,
+    new_code_digest: Option<String>,
     existing: Option<&ExistingInstall<'_>>,
     file_count: usize,
     uncompressed_bytes: u64,
+    package_digest: String,
 ) -> InstallPreview {
     let (required, optional, unsupported) = describe(&manifest.capabilities);
+    let runs_code = !manifest.is_declarative_only();
+    let publisher_changed = publisher_changed(
+        existing.and_then(|current| current.trusted_keys),
+        update_source.as_ref(),
+    );
+    // New code, changed code, or code whose publisher changed: the answer the
+    // user gave (if any) does not cover it, so the prompt asks again.
+    let code_changed = runs_code
+        && (publisher_changed
+            || existing.is_none_or(|current| {
+                !current.runs_code || current.code_hash != new_code_digest.as_deref()
+            }));
     InstallPreview {
+        runs_code,
+        code_changed,
+        adds_code: runs_code && !existing.is_some_and(|e| e.runs_code),
         replaces_version: existing.map(|current| current.version.to_string()),
         added_capabilities: added_capabilities(existing.map(|current| current.granted), &manifest),
         added_hosts: added_hosts(existing.map(|current| current.hosts), &manifest),
+        publisher_changed,
         update_source: update_source.as_ref().map(UpdateSourceSummary::of),
         // Only a *change* is a migration. A first install has nothing to
         // migrate, and a reinstall of the same data version does not either.
@@ -472,6 +569,9 @@ fn build_preview(
         file_count,
         uncompressed_bytes,
         manifest,
+        also_installs: Vec::new(),
+        official: false,
+        package_digest,
     }
 }
 
@@ -484,7 +584,7 @@ fn build_preview(
 /// `destination` must not exist. Extraction goes to a sibling staging
 /// directory and is renamed into place at the end, so an interrupted install
 /// leaves either the old plugin or nothing — never a partial one.
-pub fn extract_package(archive: &Path, destination: &Path) -> LauncherResult<()> {
+pub fn extract_package(bytes: &[u8], destination: &Path) -> LauncherResult<()> {
     if destination.exists() {
         return Err(io_error(format!(
             "{} already exists",
@@ -510,7 +610,7 @@ pub fn extract_package(archive: &Path, destination: &Path) -> LauncherResult<()>
     std::fs::create_dir_all(&staging)
         .map_err(|e| io_error(format!("could not create {}: {e}", staging.display())))?;
 
-    let result = extract_into(archive, &staging);
+    let result = extract_into(bytes, &staging);
     if let Err(error) = result {
         let _ = std::fs::remove_dir_all(&staging);
         return Err(error);
@@ -525,121 +625,252 @@ pub fn extract_package(archive: &Path, destination: &Path) -> LauncherResult<()>
     })
 }
 
-fn extract_into(archive: &Path, staging: &Path) -> LauncherResult<()> {
-    let file = std::fs::File::open(archive)
-        .map_err(|e| io_error(format!("could not open {}: {e}", archive.display())))?;
-    let mut zip = zip::ZipArchive::new(file)
-        .map_err(|e| invalid_package(format!("not a readable plugin package: {e}")))?;
-
-    let mut written = 0u64;
-    for index in 0..zip.len() {
-        let mut entry = zip
-            .by_index(index)
-            .map_err(|e| invalid_package(format!("unreadable entry in the package: {e}")))?;
-        let name = entry
-            .name()
-            .map_err(|e| invalid_package(format!("unreadable entry in the package: {e}")))?
-            .into_owned();
-        if entry.is_dir() {
-            continue;
-        }
-        // Re-validated here rather than trusted from the preview pass: the
-        // file on disk could have been swapped between the two reads, and this
-        // is the pass that actually creates files.
-        validate_entry_path(&name)?;
-        let target = staging.join(name.replace('\\', "/"));
-        if !target.starts_with(staging) {
-            return Err(invalid_package(format!("`{name}` escapes the package")));
-        }
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| io_error(format!("could not create {}: {e}", parent.display())))?;
-        }
-        written = written.saturating_add(entry.size());
-        if written > MAX_TOTAL_BYTES {
-            return Err(invalid_package("the package expands past its size limit"));
-        }
-        let mut out = std::fs::File::create(&target)
-            .map_err(|e| io_error(format!("could not write {}: {e}", target.display())))?;
-        std::io::copy(&mut entry, &mut out)
-            .map_err(|e| io_error(format!("could not write {}: {e}", target.display())))?;
-    }
-    Ok(())
-}
-
-/// Reject any archive entry that is not a plain relative path.
-///
-/// Separate from the manifest's own path check because this runs over every
-/// file in the archive, including ones the manifest never mentions.
-pub fn validate_entry_path(name: &str) -> LauncherResult<()> {
-    if name.is_empty() {
-        return Err(invalid_package("the package contains an unnamed entry"));
-    }
-    if name.contains('\0') {
-        return Err(invalid_package("a package entry name contains a NUL byte"));
-    }
-    let normalized = name.replace('\\', "/");
-    if normalized.starts_with('/') {
-        return Err(invalid_package(format!("`{name}` is an absolute path")));
-    }
-    if normalized.len() >= 2 && normalized.as_bytes()[1] == b':' {
-        return Err(invalid_package(format!("`{name}` is an absolute path")));
-    }
-    for component in Path::new(&normalized).components() {
-        match component {
-            Component::ParentDir => {
-                return Err(invalid_package(format!(
-                    "`{name}` climbs out of the package"
-                )))
-            }
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(invalid_package(format!("`{name}` is an absolute path")))
-            }
-            Component::Normal(part) => {
-                if part.to_string_lossy().contains(':') {
-                    return Err(invalid_package(format!(
-                        "`{name}` contains a `:` in a path segment"
-                    )));
-                }
-            }
-            Component::CurDir => {}
-        }
-    }
-    Ok(())
+fn extract_into(bytes: &[u8], staging: &Path) -> LauncherResult<()> {
+    let mut archive = SafeArchive::open_bytes(bytes.to_vec(), ArchiveLimits::PLUGIN_PACKAGE)
+        .map_err(|error| invalid_package(error.to_string()))?;
+    // A plugin package is Agora's own install, not a user's import: there is no "extract without
+    // the awkward names" here, so a name a disk cannot hold refuses the package (MASTER_SPEC §32.3).
+    archive
+        .extract(staging, NamePolicy::Refuse)
+        .map(|_| ())
+        .map_err(|error| invalid_package(error.to_string()))
 }
 
 // ---------------------------------------------------------------------------
 // Rollback
 // ---------------------------------------------------------------------------
 
-/// Move an installed plugin's files aside so a failed replacement can undo.
-pub fn stash_for_rollback(install_dir: &Path, rollback_dir: &Path) -> LauncherResult<()> {
-    if rollback_dir.exists() {
-        std::fs::remove_dir_all(rollback_dir)
-            .map_err(|e| io_error(format!("could not clear {}: {e}", rollback_dir.display())))?;
+/// Flush a freshly unpacked package — every file, then every directory — to the disk.
+///
+/// Unpacking writes through the OS cache, and a record saying a plugin is installed is only true
+/// if the files it names survive a power loss. This runs before the record is written, so a crash
+/// in the window leaves the previous version in place (and recoverable from the journal) rather
+/// than a record pointing at files that were never written.
+///
+/// Windows flushes files through handles opened for writing. The publisher uses a write-through
+/// rename for the directory. On Unix, each directory is synced after its children.
+pub fn flush_tree(root: &Path) -> LauncherResult<()> {
+    let entries = std::fs::read_dir(root)
+        .map_err(|e| io_error(format!("could not read {}: {e}", root.display())))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| io_error(format!("could not read {}: {e}", root.display())))?;
+        let path = entry.path();
+        let kind = entry
+            .file_type()
+            .map_err(|e| io_error(format!("could not examine {}: {e}", path.display())))?;
+        if kind.is_dir() {
+            flush_tree(&path)?;
+        } else if kind.is_file() {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.sync_all())
+                .map_err(|e| {
+                    io_error(format!(
+                        "could not flush {} to the disk: {e}",
+                        path.display()
+                    ))
+                })?;
+        }
     }
-    if let Some(parent) = rollback_dir.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| io_error(format!("could not create {}: {e}", parent.display())))?;
+    #[cfg(unix)]
+    {
+        std::fs::File::open(root)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| {
+                io_error(format!(
+                    "could not flush {} to the disk: {e}",
+                    root.display()
+                ))
+            })?;
     }
-    std::fs::rename(install_dir, rollback_dir)
-        .map_err(|e| io_error(format!("could not set aside the previous version: {e}")))
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+    }
+    Ok(())
 }
 
-/// Put stashed files back after a failed replacement.
-pub fn restore_rollback(rollback_dir: &Path, install_dir: &Path) -> LauncherResult<()> {
-    if install_dir.exists() {
-        let _ = std::fs::remove_dir_all(install_dir);
-    }
-    std::fs::rename(rollback_dir, install_dir)
-        .map_err(|e| io_error(format!("could not restore the previous version: {e}")))
-}
+// ---------------------------------------------------------------------------
+#[path = "install_recovery.rs"]
+mod journal;
+pub(super) use journal::{
+    check_for_interrupted_install, settle_before_install, uninstall, InstallJournal,
+};
+pub use journal::{
+    crash_point, direction, install_journal_path, journal_report, recover_interrupted_installs,
+    recover_interrupted_installs_with, resolve_installs, resolve_installs_at_startup,
+    InstallCrashPoint, InstallDirection, InstallJournalReport, InstallRecovery, InstallResolution,
+    PluginInstallState,
+};
 
 /// The directory a package version is installed into.
 pub fn package_dir(packages_root: &Path, plugin_id: &agora_plugin_api::PluginId) -> PathBuf {
     // `PluginId` is already constrained to lowercase ASCII, digits, hyphens
     // and one dot, so it is a safe single path component by construction.
     packages_root.join(plugin_id.as_str())
+}
+
+/// Whether an update changes the publisher key it is signed by.
+///
+/// The keys are pinned when the plugin is first installed. If a later package
+/// under the same id names different keys, the person has to be told: the new
+/// key has not been vouched for by anyone they trusted.
+pub fn publisher_changed(
+    previous: Option<&[agora_plugin_api::distribution::PublicKey]>,
+    source: Option<&UpdateSource>,
+) -> bool {
+    use std::collections::BTreeSet;
+    let (Some(previous), Some(source)) = (previous, source) else {
+        return false;
+    };
+    let keys = |keys: &[agora_plugin_api::distribution::PublicKey]| -> BTreeSet<(String, String)> {
+        keys.iter()
+            .map(|key| (key.id.clone(), key.fingerprint()))
+            .collect()
+    };
+    let previous = keys(previous);
+    let next = keys(&source.keys);
+    !previous.is_empty() && !next.is_empty() && previous != next
+}
+
+/// A digest of the code the manifest names, for tying script consent to it.
+///
+/// The entrypoint is the file Agora starts, so it identifies the code the user
+/// allowed. A version that brings a different entrypoint file is new code and
+/// must be asked about again.
+pub fn script_digest(
+    manifest: &PluginManifest,
+    plugin_dir: &Path,
+) -> LauncherResult<Option<String>> {
+    let Some(entrypoint) = &manifest.entrypoint else {
+        return Ok(None);
+    };
+    // The host's module loader reads and parses any file inside the package
+    // that a module names, not just `.js` files. So every file except the two
+    // host metadata files is part of the code identity; excluding data by
+    // extension would leave a way to smuggle a module behind an unchanged
+    // entrypoint.
+    let mut files = std::collections::BTreeMap::new();
+    let mut entries = 0usize;
+    let mut total = 0u64;
+    collect_script_files(plugin_dir, plugin_dir, &mut files, &mut entries, &mut total)?;
+    let entrypoint = normalize_relative(entrypoint);
+    if !files.contains_key(&entrypoint) {
+        return Err(io_error(format!(
+            "the plugin entrypoint `{entrypoint}` is missing"
+        )));
+    }
+    Ok(Some(finish_script_digest(&files)))
+}
+
+fn collect_script_files(
+    root: &Path,
+    dir: &Path,
+    files: &mut std::collections::BTreeMap<String, String>,
+    entries: &mut usize,
+    total: &mut u64,
+) -> LauncherResult<()> {
+    use sha2::{Digest, Sha256};
+    let read = std::fs::read_dir(dir)
+        .map_err(|e| io_error(format!("could not read {}: {e}", dir.display())))?;
+    for item in read {
+        let item = item.map_err(|e| io_error(format!("could not read {}: {e}", dir.display())))?;
+        let path = item.path();
+        let rel = path
+            .strip_prefix(root)
+            .map_err(|_| io_error("a plugin file is outside its folder"))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|e| io_error(format!("could not inspect {}: {e}", path.display())))?;
+        if meta.is_dir() {
+            collect_script_files(root, &path, files, entries, total)?;
+            continue;
+        }
+        if rel == MANIFEST_FILENAME || rel == UPDATE_SOURCE_FILENAME {
+            continue;
+        }
+        *entries += 1;
+        if *entries > MAX_ENTRIES {
+            return Err(io_error("the plugin folder holds too many files to check"));
+        }
+        if meta.is_file() {
+            *total = total.saturating_add(meta.len());
+            if *total > MAX_TOTAL_BYTES {
+                return Err(io_error("the plugin folder is too large to check"));
+            }
+            let bytes = std::fs::read(&path)
+                .map_err(|e| io_error(format!("could not read {}: {e}", path.display())))?;
+            files.insert(rel, hex::encode(Sha256::digest(&bytes)));
+        } else {
+            // A link or device is not read as code here, but adding or removing
+            // one must still change the identity. The loader rejects links out
+            // of the package; a link inside it resolves to a file hashed above.
+            files.insert(rel, "other".into());
+        }
+    }
+    Ok(())
+}
+
+/// Collapse `.` and empty segments, so the same file has one name whether it
+/// came from a zip entry or from walking a folder.
+fn normalize_relative(name: &str) -> String {
+    name.replace('\\', "/")
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// A stable digest over the file map: relative paths and content hashes, sorted.
+fn finish_script_digest(files: &std::collections::BTreeMap<String, String>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for (rel, hash) in files {
+        hasher.update(rel.as_bytes());
+        hasher.update([0]);
+        hasher.update(hash.as_bytes());
+        hasher.update(b"\n");
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// SHA-256 of a package's bytes, as the preview read them.
+///
+/// Consent names the package it was given for. The installer hashes the bytes
+/// it is about to unpack and refuses when it is not the previewed package, so
+/// a file swapped between the prompt and the install cannot ride on the old
+/// answer.
+pub fn package_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// The folder counterpart of [`package_digest`]: the manifest plus every file
+/// the loader could read, by relative path and content.
+///
+/// A development folder is edited in place. The author's answer covers the
+/// manifest and files they previewed, not whatever the folder holds when the
+/// install runs.
+pub fn folder_digest(folder: &Path) -> LauncherResult<String> {
+    use sha2::{Digest, Sha256};
+    let manifest = std::fs::read(folder.join(MANIFEST_FILENAME)).map_err(|e| {
+        io_error(format!(
+            "could not read {MANIFEST_FILENAME} in {}: {e}",
+            folder.display()
+        ))
+    })?;
+    let mut files = std::collections::BTreeMap::new();
+    let mut entries = 0usize;
+    let mut total = 0u64;
+    collect_script_files(folder, folder, &mut files, &mut entries, &mut total)?;
+    let mut hasher = Sha256::new();
+    hasher.update(&manifest);
+    hasher.update([0]);
+    hasher.update(finish_script_digest(&files).as_bytes());
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Resolve which capabilities a fresh install should be granted.
@@ -665,20 +896,6 @@ pub fn widens_capabilities(granted: &CapabilitySet, manifest: &PluginManifest) -
         .filter(|cap| !granted.contains(*cap))
         .map(|cap| cap.as_str().to_string())
         .collect()
-}
-
-/// Remove an installed package's files. Development folders are never touched.
-pub fn remove_package_files(source: &PluginSource, install_dir: &Path) -> LauncherResult<()> {
-    if source.is_development() {
-        // The user's own working copy. Removing the plugin from Agora must not
-        // remove the code they are writing.
-        return Ok(());
-    }
-    if install_dir.exists() {
-        std::fs::remove_dir_all(install_dir)
-            .map_err(|e| io_error(format!("could not remove {}: {e}", install_dir.display())))?;
-    }
-    Ok(())
 }
 
 /// Re-export so callers do not have to reach into `store` for this one type.
@@ -759,33 +976,54 @@ mod tests {
             ("../escape.js", b"x"),
         ]);
         let err = read_package_manifest(&path).unwrap_err();
-        assert!(err.to_string().contains("climbs out"), "{err}");
+        assert!(
+            err.to_string().contains("leaves the extraction root"),
+            "{err}"
+        );
     }
 
     #[test]
-    fn absolute_and_traversing_entry_paths_are_all_refused() {
-        for bad in [
-            "/etc/passwd",
-            "C:/windows/system32/evil.dll",
-            "..",
-            "a/../../b.js",
-            "a/b:stream.js",
+    fn absolute_and_drive_letter_entries_are_refused() {
+        for (name, expected) in [
+            ("/etc/passwd", "it is absolute"),
+            ("C:/windows/system32/evil.dll", "drive letter"),
+            ("a/../../b.js", "'..' component"),
         ] {
+            let (_dir, path) = write_package(&[
+                (MANIFEST_FILENAME, manifest_json("acme.one").as_bytes()),
+                (name, b"x"),
+            ]);
+            let err = read_package_manifest(&path).unwrap_err();
             assert!(
-                validate_entry_path(bad).is_err(),
-                "`{bad}` should have been rejected"
+                err.to_string().contains(expected),
+                "`{name}` should have been refused with `{expected}`: {err}"
             );
         }
     }
 
     #[test]
-    fn ordinary_relative_entry_paths_are_accepted() {
-        for good in ["main.js", "dist/main.js", "assets/icon.png", "./main.js"] {
-            assert!(
-                validate_entry_path(good).is_ok(),
-                "`{good}` should have been accepted"
-            );
-        }
+    fn a_package_naming_a_file_windows_reserves_is_refused_with_the_name() {
+        // An internal install never skips quietly: the whole package is refused, and the message
+        // names the entry and the rule (MASTER_SPEC §32.3).
+        let (_dir, path) = write_package(&[
+            (MANIFEST_FILENAME, manifest_json("acme.one").as_bytes()),
+            ("main.js", b"x"),
+            ("textures/aux.dds", b"x"),
+        ]);
+        let err = read_package_manifest(&path).unwrap_err();
+        assert!(err.to_string().contains("textures/aux.dds"), "{err}");
+        assert!(err.to_string().contains("device name"), "{err}");
+    }
+
+    #[test]
+    fn ordinary_relative_entry_names_are_accepted() {
+        let (_dir, path) = write_package(&[
+            (MANIFEST_FILENAME, manifest_json("acme.one").as_bytes()),
+            ("./main.js", b"x"),
+            ("dist/util.js", b"x"),
+            ("assets/icon.png", b"x"),
+        ]);
+        assert!(read_package_manifest(&path).is_ok());
     }
 
     #[test]
@@ -797,7 +1035,7 @@ mod tests {
         ]);
         let target = tempfile::tempdir().unwrap();
         let destination = target.path().join("acme.one");
-        extract_package(&path, &destination).unwrap();
+        extract_package(&std::fs::read(&path).unwrap(), &destination).unwrap();
         assert!(destination.join(MANIFEST_FILENAME).is_file());
         assert!(destination.join("main.js").is_file());
         assert!(destination.join("lib/util.js").is_file());
@@ -812,7 +1050,7 @@ mod tests {
         let target = tempfile::tempdir().unwrap();
         let destination = target.path().join("acme.one");
         std::fs::create_dir_all(&destination).unwrap();
-        assert!(extract_package(&path, &destination).is_err());
+        assert!(extract_package(&std::fs::read(&path).unwrap(), &destination).is_err());
     }
 
     #[test]
@@ -824,7 +1062,7 @@ mod tests {
         ]);
         let target = tempfile::tempdir().unwrap();
         let destination = target.path().join("acme.one");
-        assert!(extract_package(&path, &destination).is_err());
+        assert!(extract_package(&std::fs::read(&path).unwrap(), &destination).is_err());
         assert!(!destination.exists());
         // The staging directory goes too.
         let leftovers: Vec<_> = std::fs::read_dir(target.path())
@@ -858,27 +1096,6 @@ mod tests {
         .unwrap();
         let err = read_folder_manifest(dir.path()).unwrap_err();
         assert!(err.to_string().contains("main.js"), "{err}");
-    }
-
-    #[test]
-    fn removing_a_development_plugin_never_deletes_the_authors_folder() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("main.js"), "x").unwrap();
-        let source = PluginSource::Development {
-            path: dir.path().to_path_buf(),
-        };
-        remove_package_files(&source, dir.path()).unwrap();
-        assert!(dir.path().join("main.js").is_file());
-    }
-
-    #[test]
-    fn removing_an_installed_package_deletes_its_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let install = dir.path().join("acme.one");
-        std::fs::create_dir_all(&install).unwrap();
-        std::fs::write(install.join("main.js"), "x").unwrap();
-        remove_package_files(&PluginSource::Package, &install).unwrap();
-        assert!(!install.exists());
     }
 
     #[test]
@@ -925,7 +1142,7 @@ mod tests {
     #[test]
     fn a_first_install_is_not_a_data_migration() {
         let manifest: PluginManifest = serde_json::from_str(&manifest_json("acme.one")).unwrap();
-        let preview = build_preview(manifest, None, None, 2, 100);
+        let preview = build_preview(manifest, None, None, None, 2, 100, String::new());
         assert!(!preview.migrates_data);
         assert!(preview.replaces_version.is_none());
     }
@@ -941,14 +1158,19 @@ mod tests {
         let preview = build_preview(
             manifest,
             None,
+            None,
             Some(&ExistingInstall {
                 version: &installed,
                 data_version: 1,
                 granted: &granted,
                 hosts: &[],
+                runs_code: false,
+                trusted_keys: None,
+                code_hash: None,
             }),
             2,
             100,
+            String::new(),
         );
         assert!(preview.migrates_data);
         assert_eq!(preview.replaces_version.as_deref(), Some("1.0.0"));
@@ -970,6 +1192,9 @@ mod tests {
             data_version: 1,
             granted: &granted,
             hosts: &[],
+            runs_code: false,
+            trusted_keys: None,
+            code_hash: None,
         };
 
         let same: PluginManifest = serde_json::from_value(serde_json::json!({
@@ -983,7 +1208,7 @@ mod tests {
             "capabilities": { "required": ["instance:read"] }
         }))
         .unwrap();
-        let preview = build_preview(same, None, Some(&existing), 2, 100);
+        let preview = build_preview(same, None, None, Some(&existing), 2, 100, String::new());
         assert!(
             !preview.requires_capability_consent(),
             "re-granting what is already granted is not a new decision"
@@ -1000,7 +1225,7 @@ mod tests {
             "capabilities": { "required": ["instance:read", "content:write"] }
         }))
         .unwrap();
-        let preview = build_preview(wider, None, Some(&existing), 2, 100);
+        let preview = build_preview(wider, None, None, Some(&existing), 2, 100, String::new());
         assert_eq!(
             preview.added_capabilities,
             vec!["content:write".to_string()]
@@ -1023,7 +1248,7 @@ mod tests {
             "capabilities": { "required": ["instance:read"], "optional": ["content:read"] }
         }))
         .unwrap();
-        let preview = build_preview(manifest, None, None, 2, 100);
+        let preview = build_preview(manifest, None, None, None, 2, 100, String::new());
         assert_eq!(
             preview.added_capabilities,
             vec!["instance:read".to_string(), "content:read".to_string()]

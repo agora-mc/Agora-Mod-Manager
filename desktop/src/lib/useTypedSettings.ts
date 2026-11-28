@@ -114,6 +114,12 @@ export const SETTINGS = {
   versionSortByDate: boolDef('version_sort_by_date'),
   updateSweepIntervalHours: numberDef('update_sweep_interval_hours', 12),
   showUpdateChangelogs: boolDef('show_update_changelogs', true),
+  noticeModDownloads: boolDef('notice_mod_downloads'),
+  modDownloadsFolder: nullableDef(
+    'mod_downloads_watch_folder',
+    stringDef('mod_downloads_watch_folder'),
+  ),
+  downloadsToast: boolDef('mod_downloads_toast', true),
 } as const;
 
 // ---------------------------------------------------------------------------
