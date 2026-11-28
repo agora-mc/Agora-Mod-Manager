@@ -3764,9 +3764,9 @@ pub fn replace_instance_import(
     record: &InstanceImportRecord,
     files: &[InstanceImportFileRecord],
 ) -> anyhow::Result<()> {
-    let tx = conn.unchecked_transaction()?;
-    tx.execute(
-        "INSERT INTO instance_imports (
+    in_one_transaction(conn, |tx| -> anyhow::Result<()> {
+        tx.execute(
+            "INSERT INTO instance_imports (
              instance_id, launcher_kind, installation_key, source_instance_key,
              source_path, source_metadata_json, imported_settings_json,
              source_fingerprint, imported_at, updated_at, last_result
@@ -3781,42 +3781,42 @@ pub fn replace_instance_import(
              source_fingerprint = excluded.source_fingerprint,
              updated_at = excluded.updated_at,
              last_result = excluded.last_result",
-        rusqlite::params![
-            record.instance_id,
-            record.launcher_kind,
-            record.installation_key,
-            record.source_instance_key,
-            record.source_path,
-            record.source_metadata_json,
-            record.imported_settings_json,
-            record.source_fingerprint,
-            record.imported_at,
-            record.updated_at,
-            record.last_result,
-        ],
-    )?;
-    tx.execute(
-        "DELETE FROM instance_import_files WHERE instance_id = ?1",
-        [record.instance_id.as_str()],
-    )?;
-    {
-        let mut stmt = tx.prepare(
-            "INSERT INTO instance_import_files
+            rusqlite::params![
+                record.instance_id,
+                record.launcher_kind,
+                record.installation_key,
+                record.source_instance_key,
+                record.source_path,
+                record.source_metadata_json,
+                record.imported_settings_json,
+                record.source_fingerprint,
+                record.imported_at,
+                record.updated_at,
+                record.last_result,
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM instance_import_files WHERE instance_id = ?1",
+            [record.instance_id.as_str()],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO instance_import_files
                  (instance_id, relative_path, sha256, size, source_modified_ns)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-        )?;
-        for file in files {
-            stmt.execute(rusqlite::params![
-                record.instance_id,
-                file.relative_path,
-                file.sha256,
-                file.size as i64,
-                file.source_modified_ns,
-            ])?;
+            )?;
+            for file in files {
+                stmt.execute(rusqlite::params![
+                    record.instance_id,
+                    file.relative_path,
+                    file.sha256,
+                    file.size as i64,
+                    file.source_modified_ns,
+                ])?;
+            }
         }
-    }
-    tx.commit()?;
-    Ok(())
+        Ok(())
+    })
 }
 
 /// A file contributed by the instance's pack, stored in `instance_pack_files`.
@@ -3867,12 +3867,11 @@ pub fn replace_instance_pack_files(
     instance_id: &str,
     files: &[InstancePackFile],
 ) -> anyhow::Result<()> {
-    let tx = conn.unchecked_transaction()?;
-    tx.execute(
-        "DELETE FROM instance_pack_files WHERE instance_id = ?1",
-        [instance_id],
-    )?;
-    {
+    in_one_transaction(conn, |tx| -> anyhow::Result<()> {
+        tx.execute(
+            "DELETE FROM instance_pack_files WHERE instance_id = ?1",
+            [instance_id],
+        )?;
         let mut stmt = tx.prepare(
             "INSERT INTO instance_pack_files (instance_id, relative_path, sha256, size) VALUES (?1, ?2, ?3, ?4)",
         )?;
@@ -3884,9 +3883,30 @@ pub fn replace_instance_pack_files(
                 file.size as i64
             ])?;
         }
-    }
-    tx.commit()?;
-    Ok(())
+        Ok(())
+    })
+}
+
+/// Register an imported instance: its row, its import record and (when given) its pack inventory,
+/// in **one** transaction (MASTER_SPEC §32.4's receipt rule). The import record's fingerprint is
+/// the import's receipt: recovery decides roll back or finish by it, so it must never be written
+/// without the row it describes, nor the row without it.
+pub fn commit_instance_import(
+    conn: &Connection,
+    game: &str,
+    row: &InstanceRow,
+    record: &InstanceImportRecord,
+    files: &[InstanceImportFileRecord],
+    pack_files: Option<&[InstancePackFile]>,
+) -> anyhow::Result<()> {
+    in_one_transaction(conn, |tx| -> anyhow::Result<()> {
+        upsert_instance(tx, game, row)?;
+        replace_instance_import(tx, record, files)?;
+        if let Some(pack_files) = pack_files {
+            replace_instance_pack_files(tx, &row.instance_id, pack_files)?;
+        }
+        Ok(())
+    })
 }
 
 /// A pack entry that is still missing from an instance.
@@ -4799,6 +4819,93 @@ mod tests {
         assert_eq!(results[0].confirm_count, 2);
         assert_eq!(results[1].mod_id, "mod_b");
         assert_eq!(results[1].confirm_count, 1);
+    }
+
+    fn import_test_row(name: &str) -> InstanceRow {
+        InstanceRow {
+            instance_id: "imported".into(),
+            name: name.into(),
+            minecraft_version: "1.21.1".into(),
+            loader: "fabric".into(),
+            loader_version: "0.16.9".into(),
+            is_modpack: false,
+            is_locked: false,
+            last_launched_at: None,
+            jvm_memory_mb: 4096,
+            jvm_memory_mode: "manual".into(),
+            jvm_gc: "auto".into(),
+            jvm_custom_args: String::new(),
+            jvm_always_pre_touch: false,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            java_path: None,
+            java_incompatible_override: false,
+            icon_path: None,
+            launch_mode_override: "auto".into(),
+            import_source: Some("prism".into()),
+            total_play_ms: 0,
+        }
+    }
+
+    fn import_test_record(fingerprint: &str) -> InstanceImportRecord {
+        InstanceImportRecord {
+            instance_id: "imported".into(),
+            launcher_kind: "prism".into(),
+            installation_key: "key".into(),
+            source_instance_key: "src".into(),
+            source_path: "/src".into(),
+            source_metadata_json: "{}".into(),
+            imported_settings_json: "{}".into(),
+            source_fingerprint: fingerprint.into(),
+            imported_at: "2026-11-28T00:00:00Z".into(),
+            updated_at: "2026-11-28T00:00:00Z".into(),
+            last_result: "imported".into(),
+        }
+    }
+
+    /// The instance row, its import record (the import's receipt: recovery judges an interrupted
+    /// import by its fingerprint) and the pack inventory are one unit. A failure writing any of
+    /// them leaves every one as it was, so recovery never pairs old files with new metadata.
+    #[test]
+    fn an_imports_row_record_and_inventory_commit_together_or_not_at_all() {
+        let (conn, _path) = test_db();
+        let pack = |sha: &str| InstancePackFile {
+            relative_path: "mods/a.jar".into(),
+            sha256: sha.into(),
+            size: 1,
+        };
+        commit_instance_import(
+            &conn,
+            "minecraft",
+            &import_test_row("Before"),
+            &import_test_record("fp-old"),
+            &[],
+            Some(&[pack("old")]),
+        )
+        .unwrap();
+
+        // The import record cannot be written this time.
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER refuse_record BEFORE UPDATE ON instance_imports
+             BEGIN SELECT RAISE(ABORT, 'the disk is full'); END;",
+        )
+        .unwrap();
+        let error = commit_instance_import(
+            &conn,
+            "minecraft",
+            &import_test_row("After"),
+            &import_test_record("fp-new"),
+            &[],
+            Some(&[pack("new")]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("disk is full"), "{error}");
+
+        let row = get_instance(&conn, "imported").unwrap().unwrap();
+        assert_eq!(row.name, "Before", "the instance row is not the new one");
+        let record = get_instance_import(&conn, "imported").unwrap().unwrap();
+        assert_eq!(record.source_fingerprint, "fp-old");
+        let files = list_instance_pack_files(&conn, "imported").unwrap();
+        assert_eq!(files, vec![pack("old")]);
     }
 
     #[test]

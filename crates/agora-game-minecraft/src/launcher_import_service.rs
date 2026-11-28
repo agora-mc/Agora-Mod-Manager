@@ -25,8 +25,8 @@
 
 use agora_core::ctx::Ctx;
 use agora_core::db::{
-    self, find_instance_import_by_source, replace_instance_import, InstanceImportFileRecord,
-    InstanceImportJob, InstanceImportRecord,
+    self, find_instance_import_by_source, InstanceImportFileRecord, InstanceImportJob,
+    InstanceImportRecord,
 };
 #[cfg(test)]
 use agora_core::download::sha256_hex;
@@ -1931,15 +1931,6 @@ impl LauncherImportService {
                     }
                 };
 
-                if let Err(e) = agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row) {
-                    let _ = std::fs::rename(&final_dir, &staging);
-                    let _ = rollback_staging();
-                    return Err(LauncherError::Generic {
-                        code: "ERR_LOCAL_STATE_FAILED".into(),
-                        message: format!("Failed to register imported instance: {e}"),
-                    });
-                }
-
                 // ── Persist import provenance ────────────────────────────
                 let import_record = InstanceImportRecord {
                     instance_id: dest_id.clone(),
@@ -1968,23 +1959,34 @@ impl LauncherImportService {
                     last_result: "imported".to_string(),
                 };
 
-                if let Err(e) = replace_instance_import(&conn, &import_record, &file_inventory) {
-                    // Non-fatal: instance was registered but provenance write failed.
-                    let msg = format!("Import succeeded but provenance record failed: {e}");
+                // ── Register: row, provenance and pack inventory together ─
+                // The import record is this import's receipt (recovery judges an interrupted job
+                // by its fingerprint), so it is written in the row's own transaction: never one
+                // without the other (MASTER_SPEC §32.4).
+                let pack_files = match crate::pack_inventory::collect_pack_inventory(&final_dir) {
+                    Ok(files) => Some(files),
+                    // The import stands without it; the next pack merge then has no baseline and
+                    // treats the files as the user's, which is the safe reading.
+                    Err(error) => {
+                        eprintln!("[launcher-import] no pack inventory for {dest_id}: {error}");
+                        None
+                    }
+                };
+                if let Err(e) = db::commit_instance_import(
+                    &conn,
+                    crate::GAME_ID,
+                    &row,
+                    &import_record,
+                    &file_inventory,
+                    pack_files.as_deref(),
+                ) {
+                    // Nothing was registered: unpublish the folder and clean up.
+                    let _ = std::fs::rename(&final_dir, &staging);
                     let _ = rollback_staging();
-                    // Clean up the instance to avoid unregistered orphan.
-                    let _ = std::fs::remove_dir_all(&final_dir);
-                    let _ = db::delete_instance(&conn, dest_id);
                     return Err(LauncherError::Generic {
                         code: "ERR_LOCAL_STATE_FAILED".into(),
-                        message: msg,
+                        message: format!("Failed to register imported instance: {e}"),
                     });
-                }
-
-                // ── Persist pack file inventory for three-way merge (M1b) ─
-                if let Ok(pack_files) = crate::pack_inventory::collect_pack_inventory(&final_dir) {
-                    let _ =
-                        agora_core::db::replace_instance_pack_files(&conn, dest_id, &pack_files);
                 }
 
                 // ── Clean up job ─────────────────────────────────────────
@@ -2253,20 +2255,6 @@ impl LauncherImportService {
                     total_play_ms: 0,
                 };
 
-                if let Err(e) = agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row) {
-                    // Restore from quarantine, then remove failed staging.
-                    let _ = std::fs::rename(&final_dir, &staging);
-                    if quarantine.exists() {
-                        let _ = std::fs::rename(quarantine, &final_dir);
-                        remove_import_owner_marker(&final_dir);
-                    }
-                    let _ = rollback_staging();
-                    return Err(LauncherError::Generic {
-                        code: "ERR_LOCAL_STATE_FAILED".into(),
-                        message: format!("Failed to update instance: {e}"),
-                    });
-                }
-
                 // ── Update provenance ────────────────────────────────────
                 let import_record = InstanceImportRecord {
                     instance_id: dest_id.clone(),
@@ -2292,11 +2280,27 @@ impl LauncherImportService {
                     last_result: "updated".to_string(),
                 };
 
-                if let Err(e) = replace_instance_import(&conn, &import_record, &file_inventory) {
-                    if let Some(previous_row) = &previous_row {
-                        let _ =
-                            agora_core::db::upsert_instance(&conn, crate::GAME_ID, previous_row);
+                // ── Commit: row, provenance and pack inventory together ───
+                // One transaction: the new row is never kept with the old files (recovery restores
+                // the old files whenever the new import record, its receipt, is absent).
+                let pack_files = match crate::pack_inventory::collect_pack_inventory(&final_dir) {
+                    Ok(files) => Some(files),
+                    // The import stands without it; the next pack merge then has no baseline and
+                    // treats the files as the user's, which is the safe reading.
+                    Err(error) => {
+                        eprintln!("[launcher-import] no pack inventory for {dest_id}: {error}");
+                        None
                     }
+                };
+                if let Err(e) = db::commit_instance_import(
+                    &conn,
+                    crate::GAME_ID,
+                    &row,
+                    &import_record,
+                    &file_inventory,
+                    pack_files.as_deref(),
+                ) {
+                    // Nothing was written: put the old instance back, then remove failed staging.
                     let _ = std::fs::rename(&final_dir, &staging);
                     if quarantine.exists() {
                         let _ = std::fs::rename(quarantine, &final_dir);
@@ -2305,14 +2309,8 @@ impl LauncherImportService {
                     let _ = rollback_staging();
                     return Err(LauncherError::Generic {
                         code: "ERR_LOCAL_STATE_FAILED".into(),
-                        message: format!("Failed to commit import provenance: {e}"),
+                        message: format!("Failed to commit the updated instance: {e}"),
                     });
-                }
-
-                // ── Persist pack file inventory for three-way merge (M1b) ─
-                if let Ok(pack_files) = crate::pack_inventory::collect_pack_inventory(&final_dir) {
-                    let _ =
-                        agora_core::db::replace_instance_pack_files(&conn, dest_id, &pack_files);
                 }
 
                 // ── Clean up quarantine ──────────────────────────────────
@@ -4107,6 +4105,102 @@ name=Dup Instance
             }
             other => panic!("Expected Updated, got {other:?}"),
         }
+    }
+
+    /// An update whose registration fails leaves the old instance whole: its files, its row and its
+    /// import record (the receipt recovery judges by) together, never the new row with old files.
+    #[tokio::test]
+    async fn test_update_whose_registration_fails_keeps_the_old_row_with_the_old_files() {
+        let ctx = test_ctx();
+        let svc = LauncherImportService::new(ctx.clone());
+        let src_root = test_tmp("upd-fail-src");
+        std::fs::create_dir_all(src_root.join("mods")).unwrap();
+        std::fs::write(src_root.join("mods").join("a.jar"), b"mod a").unwrap();
+        let item = |action: ItemAction, minecraft: &str, existing| PerItemPlan {
+            fingerprint: plan_fingerprint(
+                "upd-fail-key",
+                LauncherKind::Prism,
+                "upd-fail",
+                &action,
+                false,
+            ),
+            destination_id: "upd-fail".to_string(),
+            destination_name: "Update Fail".to_string(),
+            action,
+            source_key: "upd-fail-key".to_string(),
+            launcher_kind: LauncherKind::Prism,
+            installation_key: "prism:upd-fail".to_string(),
+            source_path: src_root.to_string_lossy().to_string(),
+            loader_tuple: Some(LoaderTuple {
+                loader: "vanilla".to_string(),
+                loader_version: String::new(),
+                minecraft_version: minecraft.to_string(),
+            }),
+            total_bytes: 6,
+            total_files: 1,
+            preserve_settings: false,
+            sanitized_settings: LaunchSettingsPreview {
+                memory_mb: None,
+                java_path: None,
+                jvm_args: Vec::new(),
+            },
+            existing_import: existing,
+            blockers: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let plan = |item| LauncherImportPlan {
+            batch_fingerprint: String::new(),
+            items: vec![item],
+            peak_bytes: 6,
+            total_files: 1,
+            batch_blockers: Vec::new(),
+        };
+        svc.execute(plan(item(ItemAction::New, "1.20.1", None)))
+            .await
+            .unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let existing =
+            find_instance_import_by_source(&conn, "prism", "prism:upd-fail", "upd-fail-key")
+                .unwrap()
+                .unwrap();
+        let row_before = db::get_instance(&conn, "upd-fail").unwrap().unwrap();
+        let record_before = db::get_instance_import(&conn, "upd-fail").unwrap().unwrap();
+
+        // The source changed, and this time the import record cannot be written.
+        std::fs::write(src_root.join("mods").join("a.jar"), b"mod a v2").unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_import_record BEFORE UPDATE ON instance_imports
+             BEGIN SELECT RAISE(ABORT, 'the disk is full'); END;",
+        )
+        .unwrap();
+        let result = svc
+            .execute(plan(item(ItemAction::Update, "1.21.1", Some(existing))))
+            .await;
+        conn.execute_batch("DROP TRIGGER refuse_import_record")
+            .unwrap();
+        if let Ok(result) = &result {
+            assert!(
+                !matches!(result.outcomes[0], PerItemOutcome::Updated { .. }),
+                "{:?}",
+                result.outcomes[0]
+            );
+        }
+
+        let final_dir = ctx.paths.instance_dir("upd-fail").unwrap();
+        assert_eq!(
+            std::fs::read(final_dir.join("mods").join("a.jar")).unwrap(),
+            b"mod a",
+            "the old files are back"
+        );
+        let row_after = db::get_instance(&conn, "upd-fail").unwrap().unwrap();
+        assert_eq!(row_after.minecraft_version, row_before.minecraft_version);
+        assert_eq!(
+            db::get_instance_import(&conn, "upd-fail")
+                .unwrap()
+                .unwrap()
+                .source_fingerprint,
+            record_before.source_fingerprint
+        );
     }
 
     #[test]
