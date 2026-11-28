@@ -206,7 +206,7 @@ A variant of the existing Minecraft crash screen, never a new page.
 | 5 | Inspectors 1 and 2, then families 3 and 4 | DeepSeek builds, Opus writes rules | The biggest expected gain |
 | 6 | Engine facts §6 and live wiring §8 | DeepSeek; Sonnet review needs approval | Stateful; touches the launch path |
 | 7 | Answer screen §9 | **Opus** designs and words it, DeepSeek rolls out | Screenshot the result |
-| 8 | Minecraft comparison and switch §7 | DeepSeek; Opus adjudicates differences | Old tool deleted only after the owner agrees |
+| 8 | Minecraft comparison and switch §7 | DeepSeek; Opus adjudicates differences | Owner 2026-11-12: switch and delete the old tool, no further approval needed |
 | 9 | Round 2 key, label second read, test-set score | Haiku reads labels; Opus freezes | Milestone measurement |
 
 Slices 3 and 2 can run side by side (rules do not need the contract change to start). Real game
