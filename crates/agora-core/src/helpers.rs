@@ -205,15 +205,24 @@ pub(crate) fn fail_manifest_writes_on_this_thread() -> impl Drop {
     Restore
 }
 
-fn write_manifest_with_hook(
+/// What writing `manifest` over the file at `manifest_path` takes: the new bytes (`None` when the
+/// file already says exactly this), and, when the file is an older manifest version being
+/// upgraded, the backup of its original bytes still to be published (`None` when one with the same
+/// bytes is already there). A backup with different bytes is a conflict, and a file written by a
+/// newer Agora is read-only.
+///
+/// The one rule behind [`atomic_write_manifest`] and [`crate::staged_apply::Stage::write_manifest`].
+pub(crate) struct ManifestParts {
+    pub(crate) text: Option<Vec<u8>>,
+    /// The file is an older version: writing it upgrades it (a backup exists or is in `backup`).
+    pub(crate) upgrades: bool,
+    pub(crate) backup: Option<(std::path::PathBuf, Vec<u8>)>,
+}
+
+pub(crate) fn manifest_write_parts(
     manifest_path: &Path,
     manifest: &InstanceManifest,
-    mut checkpoint: impl FnMut(ManifestWriteStage) -> LauncherResult<()>,
-) -> LauncherResult<()> {
-    #[cfg(test)]
-    if FAIL_MANIFEST_WRITES.with(|flag| flag.get()) {
-        return Err(LauncherError::InstanceCreateFailed);
-    }
+) -> LauncherResult<ManifestParts> {
     if manifest.is_read_only() {
         return Err(manifest_read_only_error());
     }
@@ -239,35 +248,66 @@ fn write_manifest_with_hook(
     // Re-running the upgrade must preserve bytes and timestamps, including
     // an already-current file's formatting, when no actual edit was made.
     if original_value.as_ref() == Some(&value) {
-        return Ok(());
+        return Ok(ManifestParts {
+            text: None,
+            upgrades: false,
+            backup: None,
+        });
     }
+    let mut upgrades = false;
+    let mut backup = None;
     if let (Some(bytes), Some(old_value)) = (&original, &original_value) {
         let old_version = disk_manifest_version(old_value);
         if old_version < u64::from(CURRENT_MANIFEST_VERSION) {
-            let backup = manifest_path.with_extension(format!("json.v{old_version}.bak"));
-            if backup.exists() {
-                if std::fs::read(&backup).map_err(|_| LauncherError::InstanceCreateFailed)?
-                    != *bytes
+            upgrades = true;
+            let path = manifest_path.with_extension(format!("json.v{old_version}.bak"));
+            if path.exists() {
+                if std::fs::read(&path).map_err(|_| LauncherError::InstanceCreateFailed)? != *bytes
                 {
                     return Err(LauncherError::MigrationConflict {
                         message: format!(
                             "Manifest backup '{}' differs from the original; both were kept.",
-                            backup.display()
+                            path.display()
                         ),
                     });
                 }
             } else {
-                // Publish the backup only after all its bytes are durable. A
-                // partial temporary backup after a crash is never treated as it.
-                let temp = synced_manifest_temp(manifest_path, bytes)?;
-                checkpoint(ManifestWriteStage::BackupTemporarySynced)?;
-                std::fs::rename(&temp, &backup).map_err(|_| LauncherError::InstanceCreateFailed)?;
+                backup = Some((path, bytes.clone()));
             }
-            checkpoint(ManifestWriteStage::OriginalBackedUp)?;
         }
     }
     let text =
         serde_json::to_vec_pretty(&value).map_err(|_| LauncherError::InstanceCreateFailed)?;
+    Ok(ManifestParts {
+        text: Some(text),
+        upgrades,
+        backup,
+    })
+}
+
+fn write_manifest_with_hook(
+    manifest_path: &Path,
+    manifest: &InstanceManifest,
+    mut checkpoint: impl FnMut(ManifestWriteStage) -> LauncherResult<()>,
+) -> LauncherResult<()> {
+    #[cfg(test)]
+    if FAIL_MANIFEST_WRITES.with(|flag| flag.get()) {
+        return Err(LauncherError::InstanceCreateFailed);
+    }
+    let parts = manifest_write_parts(manifest_path, manifest)?;
+    let Some(text) = parts.text else {
+        return Ok(());
+    };
+    if let Some((backup, bytes)) = &parts.backup {
+        // Publish the backup only after all its bytes are durable. A
+        // partial temporary backup after a crash is never treated as it.
+        let temp = synced_manifest_temp(manifest_path, bytes)?;
+        checkpoint(ManifestWriteStage::BackupTemporarySynced)?;
+        std::fs::rename(&temp, backup).map_err(|_| LauncherError::InstanceCreateFailed)?;
+    }
+    if parts.upgrades {
+        checkpoint(ManifestWriteStage::OriginalBackedUp)?;
+    }
     let tmp_path = synced_manifest_temp(manifest_path, &text)?;
     checkpoint(ManifestWriteStage::TemporarySynced)?;
     std::fs::rename(&tmp_path, manifest_path).map_err(|_| LauncherError::InstanceCreateFailed)?;

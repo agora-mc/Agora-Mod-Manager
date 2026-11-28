@@ -15,9 +15,10 @@
 //!    interrupted launcher-import jobs there).
 //! 2. Interrupted tool swaps ([`game_tool_swap::recover_all_nowait`]).
 //! 3. User-files sessions of finished runs ([`game_user_files::recover_finished_sessions`]).
-//! 4. Interrupted Recently deleted (trash) entries
+//! 4. Interrupted staged applies in every instance ([`staged_apply::recover_instances`](crate::staged_apply::recover_instances)).
+//! 5. Interrupted Recently deleted (trash) entries
 //!    ([`game_instance::trash::recover_interrupted_reporting`]).
-//! 5. Pre-B3a snapshot object migration ([`migrate_snapshot_objects`]).
+//! 6. Pre-B3a snapshot object migration ([`migrate_snapshot_objects`]).
 //!
 //! The one recovery that does NOT run here is the interrupted plugin install
 //! ([`plugins::install::recover_interrupted_installs`]): it must finish before the plugin
@@ -115,7 +116,14 @@ pub fn run_before_snapshot_migration(ctx: &Ctx) -> StartupRecoveryReport {
     report.actions.extend(actions);
     report.warnings.extend(warnings);
 
-    // 4. Interrupted Recently deleted (trash) deletes and restores.
+    // 4. Interrupted staged applies (MASTER_SPEC §32.4), in every instance: before the commit point
+    //    the old instance is put back, after it the cleanup is finished. Nowait: an instance
+    //    another Agora is changing right now is left alone and reported.
+    let (actions, warnings) = crate::staged_apply::recover_instances(ctx);
+    report.actions.extend(actions);
+    report.warnings.extend(warnings);
+
+    // 5. Interrupted Recently deleted (trash) deletes and restores.
     let (actions, warnings) = crate::game_instance::trash::recover_interrupted_reporting(ctx);
     report.actions.extend(actions);
     report.warnings.extend(warnings);
@@ -123,7 +131,7 @@ pub fn run_before_snapshot_migration(ctx: &Ctx) -> StartupRecoveryReport {
     report
 }
 
-// 5. Move legacy snapshot objects while the content store is idle.
+// 6. Move legacy snapshot objects while the content store is idle.
 fn recover_snapshot_objects(ctx: &Ctx, report: &mut StartupRecoveryReport) {
     match migrate_snapshot_objects(ctx) {
         Ok(MigrationOutcome::NothingToDo) => {}

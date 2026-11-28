@@ -315,6 +315,90 @@ impl<'g> Stage<'g> {
         Ok(())
     }
 
+    /// Stage the file at `source` to become the file at `path`, moving it into the stage (it must be
+    /// a file the caller owns, on the instance's disk or not: a move that cannot be a rename is a
+    /// copy, synced, and the source removed).
+    pub fn write_moving(
+        &mut self,
+        path: &StrictRelPath,
+        source: &Path,
+        expect: Expect,
+    ) -> LauncherResult<()> {
+        self.claim(path)?;
+        let staged = self.new_name("new");
+        let file = self.dir.join(&staged);
+        if std::fs::rename(source, &file).is_err() {
+            std::fs::copy(source, &file).map_err(|error| io(source, error))?;
+            sync_file(&file)?;
+            std::fs::remove_file(source).map_err(|error| io(source, error))?;
+        }
+        self.pending.push(Pending::Write {
+            path: path.clone(),
+            staged,
+            expect,
+        });
+        Ok(())
+    }
+
+    /// Stage a file the caller makes itself at the stage path it is given (a content-store link,
+    /// for example), to become the file at `path`. The caller is responsible for the file's bytes
+    /// being durable: a content-store object already is.
+    pub fn write_with(
+        &mut self,
+        path: &StrictRelPath,
+        expect: Expect,
+        make: impl FnOnce(&Path) -> LauncherResult<()>,
+    ) -> LauncherResult<()> {
+        self.claim(path)?;
+        let staged = self.new_name("new");
+        make(&self.dir.join(&staged))?;
+        self.pending.push(Pending::Write {
+            path: path.clone(),
+            staged,
+            expect,
+        });
+        Ok(())
+    }
+
+    /// Stage the instance manifest (`instance_manifest.json`) becoming `manifest`, by the same rule
+    /// [`crate::helpers::atomic_write_manifest`] follows: the same bytes; nothing when the file
+    /// already says exactly this; and, for an older manifest version, its original bytes kept in
+    /// `instance_manifest.json.v<N>.bak` (a backup with different bytes refuses).
+    pub fn write_manifest(
+        &mut self,
+        manifest: &crate::models::InstanceManifest,
+    ) -> LauncherResult<()> {
+        let live = self.root.join("instance_manifest.json");
+        let parts = crate::helpers::manifest_write_parts(&live, manifest)?;
+        let Some(text) = parts.text else {
+            return Ok(());
+        };
+        if let Some((backup, bytes)) = parts.backup {
+            let name = backup
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| refused(format!("{} has no usable name", backup.display())))?
+                .to_string();
+            let backup = agora_game_api::RelPath::strict(name.as_str())
+                .map_err(|error| refused(error.to_string()))?;
+            self.write(&backup, &bytes, Expect::Absent)?;
+        }
+        let expect = match std::fs::read(&live) {
+            Ok(bytes) => Expect::Agora(format!("{:x}", Sha256::digest(&bytes))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Expect::Absent,
+            Err(error) => return Err(io(&live, error)),
+        };
+        let path = agora_game_api::RelPath::strict("instance_manifest.json")
+            .map_err(|error| refused(error.to_string()))?;
+        self.write(&path, &text, expect)
+    }
+
+    /// The stage folder, for a caller that must prepare it (grant a right the platform needs to
+    /// move a protected file out of it, for example). Nothing in it is the caller's to change.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// Stage the removal of the file at `path`. A path with nothing there is not an error.
     pub fn remove(&mut self, path: &StrictRelPath, expect: Expect) -> LauncherResult<()> {
         self.claim(path)?;
@@ -640,6 +724,63 @@ fn previous_location(root: &Path, dir: &Path, previous: &Previous) -> PathBuf {
 /// before every apply.
 pub fn recover(locks: &LockManager, instance_id: &str, root: &Path) -> Vec<StagedRecovery> {
     recover_inner(locks, instance_id, root, None)
+}
+
+/// Settle the interrupted applies of every instance in the context's instances folder, for the
+/// startup pass: what was done comes back as `actions`, what could not be as `warnings`.
+pub fn recover_instances(ctx: &crate::ctx::Ctx) -> (Vec<String>, Vec<String>) {
+    let mut actions = Vec::new();
+    let mut warnings = Vec::new();
+    let root = ctx.paths.instances_root();
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (actions, warnings),
+        Err(error) => {
+            warnings.push(format!(
+                "Agora could not look for interrupted changes in {}: {error}",
+                root.display()
+            ));
+            return (actions, warnings);
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                warnings.push(format!(
+                    "Agora could not look for interrupted changes in {}: {error}",
+                    root.display()
+                ));
+                continue;
+            }
+        };
+        let instance = entry.path();
+        match std::fs::symlink_metadata(&instance) {
+            Ok(kind) if kind.is_dir() && !agora_game_api::is_a_reparse_point(&kind) => {}
+            _ => continue,
+        }
+        if !has_stage(&instance) {
+            continue;
+        }
+        let id = entry.file_name().to_string_lossy().to_string();
+        for outcome in recover(&ctx.lock_manager, &id, &instance) {
+            match outcome {
+                StagedRecovery::RolledBack { .. } => actions.push(format!(
+                    "Put instance '{id}' back as it was before a change that was interrupted."
+                )),
+                StagedRecovery::Finished { .. } => actions.push(format!(
+                    "Finished a change to instance '{id}' that was interrupted after it was made."
+                )),
+                StagedRecovery::Busy(reason) => warnings.push(format!(
+                    "An interrupted change to instance '{id}' was left alone: {reason}"
+                )),
+                StagedRecovery::NeedsHand(reason) => warnings.push(format!(
+                    "An interrupted change to instance '{id}' needs a hand: {reason}"
+                )),
+            }
+        }
+    }
+    (actions, warnings)
 }
 
 /// [`recover`] cut off after `moves` of its rollback moves, as a second crash would (test seam).

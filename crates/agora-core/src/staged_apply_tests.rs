@@ -633,3 +633,50 @@ fn make_folder_link(target: &Path, link: &Path) -> bool {
         std::os::unix::fs::symlink(target, link).is_ok()
     }
 }
+
+// ---------------------------------------------------------------------------
+// 5. Where recovery runs
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_startup_pass_puts_back_an_apply_cut_off_before_its_commit() {
+    let (_dir, ctx, root) = fixture();
+    old_instance(&root);
+    {
+        let guard = guard(&ctx);
+        let mut stage = stage_the_apply(&guard, &root);
+        stage.crash_at(Boundary::AfterMove(5));
+        assert!(stage.commit().is_err());
+    }
+
+    let report = crate::startup_recovery::run_at_startup(&ctx);
+
+    assert_eq!(tree(&root), old_tree());
+    assert!(
+        report.actions.iter().any(|line| line.contains(ID)),
+        "the pass says what it put back: {report:?}"
+    );
+    no_stage_left(&root);
+}
+
+#[test]
+fn the_startup_pass_finishes_an_apply_cut_off_after_its_commit() {
+    let (_dir, ctx, root) = fixture();
+    old_instance(&root);
+    {
+        let guard = guard(&ctx);
+        let mut stage = stage_the_apply(&guard, &root);
+        stage.crash_at(Boundary::AfterCommit);
+        assert!(stage.commit().is_err());
+    }
+
+    let report = crate::startup_recovery::run_at_startup(&ctx);
+
+    assert_eq!(without(tree(&root), ASIDE), new_tree());
+    assert_eq!(copies_of_the_users_edit(&root), 1);
+    assert!(
+        report.actions.iter().any(|line| line.contains(ID)),
+        "{report:?}"
+    );
+    no_stage_left(&root);
+}
