@@ -166,6 +166,11 @@ mod tests {
         .unwrap();
     }
 
+    /// The worker inspect mock and the outbound gate are process-wide, and each guard restores
+    /// what it found: two of these tests overlapping under `cargo test` would leave the later one
+    /// with no mock (it then tries to download its runtime). Held for each test's whole run.
+    static PROCESS_STATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn mocked_inspect() -> crate::java::WorkerMockInspectGuard {
         crate::java::set_mock_inspect_for_workers(Some(|path| {
             Some(crate::java::JavaInstallation {
@@ -190,6 +195,7 @@ mod tests {
 
     #[tokio::test]
     async fn c4_lockdown_lets_a_runtime_that_is_already_installed_through() {
+        let _serial = PROCESS_STATE.lock().await;
         let (_root, ctx) = locked_down_context();
         let _inspect = mocked_inspect();
         let entry = catalog_entry();
@@ -208,6 +214,7 @@ mod tests {
 
     #[tokio::test]
     async fn c4_lockdown_refuses_a_runtime_it_would_have_to_download() {
+        let _serial = PROCESS_STATE.lock().await;
         let (_root, ctx) = locked_down_context();
         let _inspect = mocked_inspect();
         let _entry = catalog_entry();

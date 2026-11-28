@@ -884,48 +884,25 @@ fn review_store_item(ctx: &Ctx, source: &Path, rel: &str, game_id: Option<&str>)
     crate::content_bridge::store_review_item(ctx, source, rel, game_id)
 }
 
-#[cfg(windows)]
 /// Make replacing the instance manifest fail, as another program holding it would, until the
 /// value is dropped. Staged apply replaces the manifest by a rename, which a read-only attribute
-/// does not stop: on Windows the file is held open with no sharing, which does; elsewhere the
-/// instance folder is made read-only, so nothing can be renamed in it.
+/// does not stop; a handle opened with no sharing does. Windows only: elsewhere the only way to
+/// stop the rename is a read-only instance folder, which stops the stage from being created at
+/// all, so the test would fail before the step it is about.
+#[cfg(windows)]
 struct ManifestReplaceBlocked {
-    #[cfg(windows)]
     _held: std::fs::File,
-    #[cfg(not(windows))]
-    folder: (std::path::PathBuf, std::fs::Permissions),
 }
 
+#[cfg(windows)]
 fn review_block_manifest_replace(manifest: &Path) -> ManifestReplaceBlocked {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        let held = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(0)
-            .open(manifest)
-            .unwrap();
-        ManifestReplaceBlocked { _held: held }
-    }
-    #[cfg(not(windows))]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let folder = manifest.parent().unwrap().to_path_buf();
-        let before = std::fs::metadata(&folder).unwrap().permissions();
-        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
-        ManifestReplaceBlocked {
-            folder: (folder, before),
-        }
-    }
-}
-
-impl Drop for ManifestReplaceBlocked {
-    fn drop(&mut self) {
-        #[cfg(not(windows))]
-        {
-            let _ = std::fs::set_permissions(&self.folder.0, self.folder.1.clone());
-        }
-    }
+    use std::os::windows::fs::OpenOptionsExt;
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(manifest)
+        .unwrap();
+    ManifestReplaceBlocked { _held: held }
 }
 
 #[test]
