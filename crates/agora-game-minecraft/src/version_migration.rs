@@ -92,7 +92,7 @@ use agora_core::{
     error::{LauncherError, LauncherResult},
     instance_runtime::InstanceGuard,
     models::{InstalledMod, InstanceManifest},
-    staged_apply::{Expect, Stage},
+    staged_apply::{Expect, NotApplied, Stage},
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -889,35 +889,59 @@ pub async fn execute_migration(
             }
         })
     });
-    if let Err(error) = committed {
-        let _ = std::fs::remove_dir_all(&staging_dir);
-        let phase = if row_failed.get() {
-            "db-commit"
-        } else {
-            "apply"
-        };
-        let message = error.to_string();
-        return if message.contains("nothing in the instance was changed") {
-            MigrationOutcome::RolledBack {
-                phase: phase.into(),
-                error: if row_failed.get() {
-                    format!("The instance row could not be committed; files and manifest were restored: {message}")
-                } else {
-                    format!("Apply failed before commit; every change was reversed: {message}")
+    let report = match committed {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            let phase = if row_failed.get() {
+                "db-commit"
+            } else {
+                "apply"
+            };
+            let message = error.to_string();
+            // What the instance is now comes from the commit's own answer, never from its text.
+            return match error.state {
+                NotApplied::Unchanged => MigrationOutcome::Failed {
+                    phase: phase.into(),
+                    error: format!(
+                        "The migration was refused before anything was changed: {message}"
+                    ),
+                    rolled_back: false,
+                    instance_changed: false,
+                    snapshot_id: Some(snapshot_id),
                 },
-                snapshot_id: Some(snapshot_id),
-                health_report: None,
-            }
-        } else {
-            MigrationOutcome::Failed {
-                phase: phase.into(),
-                error: format!("{message}; restore snapshot {snapshot_id} to recover"),
-                rolled_back: false,
-                instance_changed: true,
-                snapshot_id: Some(snapshot_id),
-            }
-        };
-    }
+                NotApplied::RolledBack => MigrationOutcome::RolledBack {
+                    phase: phase.into(),
+                    error: if row_failed.get() {
+                        format!("The instance row could not be committed; files and manifest were restored: {message}")
+                    } else {
+                        format!("Apply failed before commit; every change was reversed: {message}")
+                    },
+                    snapshot_id: Some(snapshot_id),
+                    health_report: None,
+                },
+                NotApplied::RecoveryPending => MigrationOutcome::Failed {
+                    phase: phase.into(),
+                    error: format!("{message}; restore snapshot {snapshot_id} to recover"),
+                    rolled_back: false,
+                    instance_changed: true,
+                    snapshot_id: Some(snapshot_id),
+                },
+            };
+        }
+    };
+    // A file the user had changed was kept, not replaced: say where, so it can be found.
+    let kept_aside: Vec<String> = report
+        .kept_aside
+        .iter()
+        .map(|kept| {
+            format!(
+                "{} was changed outside Agora, so it was kept at {} instead of being replaced.",
+                kept.path.as_str(),
+                kept.kept_at.display()
+            )
+        })
+        .collect();
 
     // 7. Post-commit cache invalidation (advisory), then the health gate.
     let _ = agora_core::snapshot::mark_instance_mutated(&instance_dir);
@@ -1007,7 +1031,7 @@ pub async fn execute_migration(
             .map(|swap| swap.old_filename.clone())
             .collect(),
         snapshot_id,
-        warnings: plan.warnings.clone(),
+        warnings: plan.warnings.iter().cloned().chain(kept_aside).collect(),
         health,
     }
 }

@@ -1068,3 +1068,89 @@ fn a_stage_without_a_journal_whose_marker_names_another_change_needs_a_hand() {
     );
     assert!(folder.join(".owner.json").exists());
 }
+
+// ---------------------------------------------------------------------------
+// 8. What a failed commit says about the instance
+// ---------------------------------------------------------------------------
+
+use crate::staged_apply::NotApplied;
+
+#[test]
+fn a_refusal_before_any_move_says_the_instance_never_changed() {
+    let (_dir, ctx, root) = fixture();
+    put(&root, "mods/taken.jar", b"already here");
+    let guard = guard(&ctx);
+    let mut stage = Stage::begin(&guard, &root).unwrap();
+    stage
+        .write(&rel("mods/taken.jar"), b"new", Expect::Absent)
+        .unwrap();
+
+    let failure = stage.commit().unwrap_err();
+
+    assert_eq!(failure.state, NotApplied::Unchanged, "{failure}");
+    assert_eq!(
+        fs::read(root.join("mods/taken.jar")).unwrap(),
+        b"already here"
+    );
+}
+
+#[test]
+fn a_failed_database_change_says_every_move_was_undone() {
+    let (_dir, ctx, root) = fixture();
+    old_instance(&root);
+    let mut conn = state(&ctx);
+    let guard = guard(&ctx);
+    let stage = stage_the_apply(&guard, &root);
+
+    let failure = stage
+        .commit_with_receipt(&mut conn, |_| {
+            Err(crate::error::LauncherError::Generic {
+                code: "ERR_TEST".into(),
+                message: "the row would not go in".into(),
+            })
+        })
+        .unwrap_err();
+
+    assert_eq!(failure.state, NotApplied::RolledBack, "{failure}");
+    assert_eq!(tree(&root), old_tree());
+}
+
+#[test]
+fn a_receipt_apply_whose_committed_record_cannot_be_written_still_succeeds() {
+    let (_dir, ctx, root) = fixture();
+    old_instance(&root);
+    let mut conn = state(&ctx);
+    {
+        let guard = guard(&ctx);
+        let mut stage = stage_the_apply(&guard, &root);
+        stage.crash_at(Boundary::CommittedRecordFails);
+        let report = stage.commit_with_receipt(&mut conn, insert_row);
+        assert!(
+            report.is_ok(),
+            "the receipt is the commit point, so the change was made: {:?}",
+            report.err()
+        );
+    }
+    assert_eq!(without(tree(&root), ASIDE), new_tree());
+    assert_eq!(rows(&conn).len(), 1, "the database change stands");
+    no_stage_left(&root);
+}
+
+#[test]
+fn an_apply_whose_committed_record_cannot_be_written_is_put_back() {
+    let (_dir, ctx, root) = fixture();
+    old_instance(&root);
+    {
+        let guard = guard(&ctx);
+        let mut stage = stage_the_apply(&guard, &root);
+        stage.crash_at(Boundary::CommittedRecordFails);
+        let failure = stage.commit().unwrap_err();
+        assert_eq!(
+            failure.state,
+            NotApplied::RolledBack,
+            "without a receipt the record is the commit point, and it was not reached: {failure}"
+        );
+    }
+    assert_eq!(tree(&root), old_tree());
+    no_stage_left(&root);
+}

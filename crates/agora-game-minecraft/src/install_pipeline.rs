@@ -1821,8 +1821,7 @@ impl InstallPipeline {
             moved_aside = moved;
         });
         if let Err(apply_error) = apply_result {
-            let fast_rollback_performed =
-                apply_error.contains("pre-commit file moves were reversed");
+            let fast_rollback_performed = apply_error.instance_unchanged;
             let restore_dir = instance_dir.to_path_buf();
             let restore_id = snapshot.id.clone();
             let restore = run_blocking_phase(scheduler, "install rollback", move || {
@@ -3946,13 +3945,43 @@ fn prepare_manifest(
 /// added file and the new manifest are staged first, then made in one journaled commit. A crash
 /// leaves the old instance or the new one after recovery, never a mix; a file the user changed is
 /// kept in `.agora/moved-aside/` and returned here, never deleted.
+/// Why an apply did not make its change, and whether the instance is still exactly as it was.
+#[derive(Debug)]
+struct ApplyFailed {
+    message: String,
+    /// Nothing moved, or every move was undone. False only when undoing did not finish.
+    instance_unchanged: bool,
+}
+
+impl std::fmt::Display for ApplyFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Every failure before the stage commits leaves the instance as it was.
+impl From<String> for ApplyFailed {
+    fn from(message: String) -> Self {
+        ApplyFailed {
+            message,
+            instance_unchanged: true,
+        }
+    }
+}
+
+impl From<&str> for ApplyFailed {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
 fn apply_transaction(
     guard: &InstanceGuard,
     plan: &ResolvedInstallPlan,
     instance_dir: &Path,
     staging_dir: &Path,
     content_store: Option<&Ctx>,
-) -> Result<Vec<std::path::PathBuf>, String> {
+) -> Result<Vec<std::path::PathBuf>, ApplyFailed> {
     apply_transaction_crashing(guard, plan, instance_dir, staging_dir, content_store, None)
 }
 
@@ -3965,7 +3994,7 @@ fn apply_transaction_crashing(
     staging_dir: &Path,
     content_store: Option<&Ctx>,
     crash: Option<staged_apply::Boundary>,
-) -> Result<Vec<std::path::PathBuf>, String> {
+) -> Result<Vec<std::path::PathBuf>, ApplyFailed> {
     let manifest_path = instance_dir.join("instance_manifest.json");
     let manifest = agora_core::helpers::read_manifest(&manifest_path)
         .map_err(|e| format!("failed to parse current manifest during apply: {e}"))?;
@@ -4161,7 +4190,7 @@ fn apply_transaction_crashing(
     if let Err(error) = staged {
         // Nothing in the instance changed yet: dropping the stage removes it.
         drop(stage);
-        return Err(format!("{error}; pre-commit file moves were reversed"));
+        return Err(format!("{error}; nothing in the instance was changed").into());
     }
     #[cfg(test)]
     if let Some(boundary) = crash {
@@ -4169,13 +4198,9 @@ fn apply_transaction_crashing(
     }
     #[cfg(not(test))]
     let _ = crash;
-    let report = stage.commit().map_err(|error| {
-        let message = error.to_string();
-        if message.contains("did not finish") {
-            format!("{message}; fast rollback failed")
-        } else {
-            format!("{message}; pre-commit file moves were reversed")
-        }
+    let report = stage.commit().map_err(|failure| ApplyFailed {
+        message: failure.to_string(),
+        instance_unchanged: failure.state != staged_apply::NotApplied::RecoveryPending,
     })?;
     // Tracked content changed; the next launch must not reuse a pre-install
     // recovery snapshot from before the apply.

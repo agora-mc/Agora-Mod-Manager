@@ -74,6 +74,64 @@ pub enum Expect {
 pub struct ApplyReport {
     /// Files the user had changed, kept rather than replaced or removed.
     pub kept_aside: Vec<KeptAside>,
+    /// The change is made, but removing Agora's backups of the old files did not finish. The next
+    /// settle (an apply to this instance, or the next start) finishes it; nothing is wrong with the
+    /// instance.
+    pub cleanup_pending: bool,
+}
+
+/// What a commit that did not make its change left in the instance. Callers decide what to tell the
+/// user from this, never from an error's text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotApplied {
+    /// Refused before any file moved: the instance never changed.
+    Unchanged,
+    /// Files moved, and every move was undone: the instance is as it was.
+    RolledBack,
+    /// Files moved, and putting them back did not finish. The journal is kept, and the next settle
+    /// (an apply to this instance, or the next start) tries again; until then the instance may be
+    /// part old, part new.
+    RecoveryPending,
+}
+
+/// A commit that did not make its change: why, and what it left.
+#[derive(Debug)]
+pub struct ApplyError {
+    /// What the instance is now.
+    pub state: NotApplied,
+    /// What went wrong.
+    pub error: LauncherError,
+}
+
+impl std::fmt::Display for ApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let left = match self.state {
+            NotApplied::Unchanged => "nothing in the instance was changed",
+            NotApplied::RolledBack => "every change to the instance was undone",
+            NotApplied::RecoveryPending => {
+                "putting the instance back did not finish; it will be tried again the next time \
+                 Agora starts or changes this instance"
+            }
+        };
+        write!(f, "{}; {left}.", self.error)
+    }
+}
+
+impl std::error::Error for ApplyError {}
+
+impl From<ApplyError> for LauncherError {
+    fn from(failure: ApplyError) -> Self {
+        LauncherError::Generic {
+            code: failure.error.code().to_string(),
+            message: failure.to_string(),
+        }
+    }
+}
+
+impl ApplyError {
+    fn new(state: NotApplied, error: LauncherError) -> Self {
+        ApplyError { state, error }
+    }
 }
 
 /// A file the user changed, and where it was kept.
@@ -119,6 +177,9 @@ pub enum Boundary {
     AfterCommit,
     /// After this many backups were removed by the cleanup.
     AfterCleanup(usize),
+    /// Not a crash: writing the journal's `committed` record fails, as a full or failing disk
+    /// would make it.
+    CommittedRecordFails,
 }
 
 // ---------------------------------------------------------------------------
@@ -468,7 +529,7 @@ impl<'g> Stage<'g> {
     }
 
     /// Make the staged changes: all of them, or (after recovery) none.
-    pub fn commit(self) -> LauncherResult<ApplyReport> {
+    pub fn commit(self) -> Result<ApplyReport, ApplyError> {
         self.commit_inner(None)
     }
 
@@ -481,7 +542,7 @@ impl<'g> Stage<'g> {
         self,
         conn: &'c mut rusqlite::Connection,
         change: impl FnOnce(&rusqlite::Transaction<'_>) -> LauncherResult<()> + 'c,
-    ) -> LauncherResult<ApplyReport> {
+    ) -> Result<ApplyReport, ApplyError> {
         self.commit_inner(Some(Box::new(ReceiptCommit {
             conn,
             change: Some(Box::new(change)),
@@ -491,31 +552,29 @@ impl<'g> Stage<'g> {
     fn commit_inner(
         mut self,
         mut receipt: Option<Box<ReceiptCommit<'_>>>,
-    ) -> LauncherResult<ApplyReport> {
+    ) -> Result<ApplyReport, ApplyError> {
+        let unchanged = |error| ApplyError::new(NotApplied::Unchanged, error);
         self.journal.receipt = receipt.is_some();
         if self.crash == Some(Boundary::BeforePlan) {
             return self.crashed();
         }
-        let (ops, report) = match self.plan() {
-            Ok(planned) => planned,
-            Err(error) => {
-                // Nothing in the instance has changed: drop the stage the ordinary way.
-                return Err(error);
-            }
-        };
+        // Nothing in the instance has changed if either fails: dropping the stage clears it.
+        let (ops, mut report) = self.plan().map_err(unchanged)?;
         self.journal.ops = ops;
-        recovery::write(&self.journal_path, &self.journal)?;
+        recovery::write(&self.journal_path, &self.journal).map_err(unchanged)?;
         if self.crash == Some(Boundary::AfterPlan) {
             return self.crashed();
         }
 
         let mut moves = 0usize;
+        let mut crashed = false;
         let applied = (|| -> LauncherResult<()> {
             for op in self.journal.ops.clone() {
                 for (from, to) in forward_moves(&self.root, &self.dir, &op) {
                     move_file(&self.root, &from, &to)?;
                     moves += 1;
                     if self.crash == Some(Boundary::AfterMove(moves)) {
+                        crashed = true;
                         return Err(crash_error());
                     }
                 }
@@ -523,30 +582,14 @@ impl<'g> Stage<'g> {
             Ok(())
         })();
         if let Err(error) = applied {
-            if self.crash.is_some() {
+            if crashed {
                 return self.crashed();
             }
             // A real failure before the commit point: roll back now, through the same recovery
             // that would run after a crash.
             self.settled = true;
             let outcomes = self.settle_here(None, receipt.as_deref());
-            let undone = outcomes
-                .iter()
-                .any(|outcome| matches!(outcome, StagedRecovery::RolledBack { .. }));
-            return Err(if undone {
-                LauncherError::Generic {
-                    code: "ERR_STAGED_APPLY".into(),
-                    message: format!("{error}; nothing in the instance was changed."),
-                }
-            } else {
-                LauncherError::Generic {
-                    code: "ERR_STAGED_APPLY".into(),
-                    message: format!(
-                        "{error}; putting the instance back did not finish ({outcomes:?}). It will \
-                         be tried again the next time Agora starts or changes this instance."
-                    ),
-                }
-            });
+            return Err(ApplyError::new(rolled_back_or_pending(&outcomes), error));
         }
 
         if let Some(receipt) = receipt.as_deref_mut() {
@@ -554,33 +597,45 @@ impl<'g> Stage<'g> {
             if let Err(error) = receipt.commit(&self.journal.envelope.operation_id) {
                 self.settled = true;
                 let outcomes = self.settle_here(None, Some(&*receipt));
-                let undone = outcomes
-                    .iter()
-                    .any(|outcome| matches!(outcome, StagedRecovery::RolledBack { .. }));
-                return Err(LauncherError::Generic {
-                    code: "ERR_STAGED_APPLY".into(),
-                    message: if undone {
-                        format!("{error}; nothing in the instance was changed.")
-                    } else {
-                        format!(
-                            "{error}; putting the instance back did not finish ({outcomes:?}). It \
-                             will be tried again the next time Agora starts."
-                        )
-                    },
-                });
+                return Err(ApplyError::new(rolled_back_or_pending(&outcomes), error));
             }
+            // Committed: from here on the change is made, whatever else fails.
+            self.settled = true;
             if self.crash == Some(Boundary::AfterReceipt) {
-                self.settled = true;
-                return Err(crash_error());
+                return Err(ApplyError::new(NotApplied::RecoveryPending, crash_error()));
             }
         }
 
         // The commit point (for an apply without a receipt), and the record that it was reached.
         self.journal.envelope.state = State::Committed;
-        recovery::write(&self.journal_path, &self.journal)?;
+        let recorded = if self.crash == Some(Boundary::CommittedRecordFails) {
+            Err(LauncherError::Generic {
+                code: "ERR_STAGED_APPLY".into(),
+                message: "the journal's committed record could not be written (test seam)".into(),
+            })
+        } else {
+            recovery::write(&self.journal_path, &self.journal)
+        };
         self.settled = true;
+        if let Err(error) = recorded {
+            // The journal on disk still says `applying` (it is replaced whole, or not at all), so
+            // settling judges the apply by its real commit point: the receipt, if it has one, or
+            // else that record, which was not reached.
+            let outcomes = self.settle_here(None, receipt.as_deref());
+            if receipt.is_some()
+                || outcomes
+                    .iter()
+                    .any(|outcome| matches!(outcome, StagedRecovery::Finished { .. }))
+            {
+                report.cleanup_pending = !outcomes
+                    .iter()
+                    .all(|outcome| matches!(outcome, StagedRecovery::Finished { .. }));
+                return Ok(report);
+            }
+            return Err(ApplyError::new(rolled_back_or_pending(&outcomes), error));
+        }
         if self.crash == Some(Boundary::AfterCommit) {
-            return Err(crash_error());
+            return Err(ApplyError::new(NotApplied::RecoveryPending, crash_error()));
         }
         let cleanup_crash = match self.crash {
             Some(Boundary::AfterCleanup(n)) => Some(n),
@@ -588,7 +643,7 @@ impl<'g> Stage<'g> {
         };
         let outcomes = self.settle_here(cleanup_crash, receipt.as_deref());
         if cleanup_crash.is_some() {
-            return Err(crash_error());
+            return Err(ApplyError::new(NotApplied::RecoveryPending, crash_error()));
         }
         if let Some(problem) = outcomes.iter().find(|outcome| {
             matches!(
@@ -600,6 +655,7 @@ impl<'g> Stage<'g> {
             eprintln!(
                 "[staged-apply] the change was made, but its cleanup did not finish: {problem:?}"
             );
+            report.cleanup_pending = true;
         }
         Ok(report)
     }
@@ -632,9 +688,9 @@ impl<'g> Stage<'g> {
         }
     }
 
-    fn crashed(mut self) -> LauncherResult<ApplyReport> {
+    fn crashed(mut self) -> Result<ApplyReport, ApplyError> {
         self.settled = true;
-        Err(crash_error())
+        Err(ApplyError::new(NotApplied::RecoveryPending, crash_error()))
     }
 
     /// Turn the staged changes into journaled moves, deciding where each replaced or removed file
@@ -793,6 +849,18 @@ impl Drop for Stage<'_> {
             None,
             None,
         );
+    }
+}
+
+/// What a rollback the commit ran itself left: undone, or not yet.
+fn rolled_back_or_pending(outcomes: &[StagedRecovery]) -> NotApplied {
+    if outcomes
+        .iter()
+        .any(|outcome| matches!(outcome, StagedRecovery::RolledBack { .. }))
+    {
+        NotApplied::RolledBack
+    } else {
+        NotApplied::RecoveryPending
     }
 }
 
