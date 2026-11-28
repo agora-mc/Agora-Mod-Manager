@@ -6,7 +6,7 @@ use agora_core::db::instance_id_exists;
 use agora_core::error::{LauncherError, LauncherResult};
 use agora_core::event_sink::{CoreEvent, EventStatus, ProgressEvent, ProgressPhase};
 use agora_core::models::{InstanceManifest, InstanceRow};
-use agora_core::{ctx::Ctx, lock_manager::LockResource};
+use agora_core::{ctx::Ctx, lock_manager::LockResource, staged_apply::new_instance};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -1574,13 +1574,16 @@ impl InstanceService {
         ));
 
         // Build in staging then atomically rename
-        let staging = self
-            .ctx
-            .paths
-            .staging_dir(&format!("clone-{}", uuid::Uuid::new_v4()))?;
+        let staging = new_instance_staging(&new_id, &dest_dir)?;
         let src_dir = self.ctx.paths.instance_dir(&source_id)?;
 
-        if let Err(error) = crate::clone::clone_instance(&src_dir, &staging, &request.prefs) {
+        // The clone builds its copy aside and renames it into `staging` itself; the publication
+        // record goes into it at once (MASTER_SPEC §32.4).
+        if let Err(error) = crate::clone::clone_instance(&src_dir, &staging, &request.prefs)
+            .and_then(|_| {
+                new_instance::adopt(&staging, &new_id, &dest_dir).map_err(|error| error.to_string())
+            })
+        {
             let _ = std::fs::remove_dir_all(&staging);
             op.fail(error.clone());
             return Err(LauncherError::Generic {
@@ -1617,25 +1620,9 @@ impl InstanceService {
         }
 
         // Mark staging complete
-        if let Err(error) = std::fs::write(staging.join("staging-complete"), b"complete") {
-            let _ = std::fs::remove_dir_all(&staging);
-            op.fail(error.to_string());
-            return Err(LauncherError::Generic {
-                code: "ERR_CLONE".into(),
-                message: error.to_string(),
-            });
-        }
 
         // Promote staging to destination
-        if let Err(error) = std::fs::remove_file(staging.join("staging-complete")) {
-            let _ = std::fs::remove_dir_all(&staging);
-            op.fail(format!("Cannot finalize clone staging: {error}"));
-            return Err(LauncherError::Generic {
-                code: "ERR_CLONE".into(),
-                message: format!("Cannot finalize clone staging: {error}"),
-            });
-        }
-        if let Err(error) = std::fs::rename(&staging, &dest_dir) {
+        if let Err(error) = new_instance::publish(&staging, &dest_dir) {
             let _ = std::fs::remove_dir_all(&staging);
             op.fail(format!("Cannot promote clone: {error}"));
             return Err(LauncherError::Generic {
@@ -1653,7 +1640,8 @@ impl InstanceService {
                 return Err(error);
             }
         };
-        if let Err(error) = agora_core::db::upsert_instance(&conn, crate::GAME_ID, &new_row) {
+        let mut conn = conn;
+        if let Err(error) = register_new_instance(&dest_dir, &mut conn, &new_row) {
             let _ = std::fs::remove_dir_all(&dest_dir);
             op.fail(error.to_string());
             return Err(LauncherError::Generic {
@@ -1845,10 +1833,7 @@ impl InstanceService {
                 return Err(error);
             }
         }
-        let staging_dir = self
-            .ctx
-            .paths
-            .staging_dir(&format!("instance-{}", uuid::Uuid::new_v4()))?;
+        let staging_dir = begin_new_instance(&instance_id, &dir)?;
         let operation_id = op.id().clone();
         self.ctx.progress_sink.report(ProgressEvent::new(
             operation_id.clone(),
@@ -1897,14 +1882,6 @@ impl InstanceService {
                     message: error,
                 });
             }
-        }
-        if let Err(error) = std::fs::write(staging_dir.join("staging-complete"), b"complete") {
-            let _ = std::fs::remove_dir_all(&staging_dir);
-            op.fail(error.to_string());
-            return Err(LauncherError::Generic {
-                code: "ERR_INSTANCE_STAGING".into(),
-                message: error.to_string(),
-            });
         }
 
         let minecraft_root = self.ctx.paths.minecraft_runtime_root();
@@ -1972,15 +1949,7 @@ impl InstanceService {
             }
         }
 
-        if let Err(error) = std::fs::remove_file(staging_dir.join("staging-complete")) {
-            let _ = std::fs::remove_dir_all(&staging_dir);
-            op.fail(error.to_string());
-            return Err(LauncherError::Generic {
-                code: "ERR_INSTANCE_STAGING".into(),
-                message: error.to_string(),
-            });
-        }
-        if let Err(error) = std::fs::rename(&staging_dir, &dir) {
+        if let Err(error) = new_instance::publish(&staging_dir, &dir) {
             let _ = std::fs::remove_dir_all(&staging_dir);
             op.fail(error.to_string());
             return Err(LauncherError::Generic {
@@ -1997,7 +1966,9 @@ impl InstanceService {
                 return Err(error);
             }
         };
-        if let Err(error) = agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row) {
+        // The commit point: the row and the publication's receipt together (MASTER_SPEC §32.4).
+        let mut conn = conn;
+        if let Err(error) = register_new_instance(&dir, &mut conn, &row) {
             let _ = std::fs::remove_dir_all(&dir);
             op.fail(error.to_string());
             return Err(LauncherError::Generic {
@@ -3010,6 +2981,14 @@ mod tests {
         let cloned_dir = ctx.paths.instance_dir("Clone").unwrap();
         assert!(cloned_dir.join("mods").join("test.jar").exists());
         assert!(cloned_dir.join("saves").join("world.dat").exists());
+        // Registered, so the publication record is gone, and no staging folder is left beside it.
+        assert!(!cloned_dir.join(new_instance::JOURNAL).exists());
+        let beside: Vec<String> = std::fs::read_dir(ctx.paths.instances_root())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with('.'))
+            .collect();
+        assert!(beside.is_empty(), "{beside:?}");
 
         let cloned_conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let cloned_detail = agora_core::db::get_instance(&cloned_conn, "Clone").unwrap();
@@ -4457,6 +4436,49 @@ $#
 
 /// The name a player sees for a loader id. The id itself is what the manifest
 /// and the loader catalog key on, so only the label changes.
+/// A new instance's staging folder: beside its final folder `dir`, so publishing it is one rename,
+/// and carrying its publication record before anything else is written (MASTER_SPEC §32.4). The
+/// `.agora-import-` prefix is the one every instances-root scanner already skips.
+fn begin_new_instance(instance_id: &str, dir: &Path) -> LauncherResult<std::path::PathBuf> {
+    let staging = new_instance_staging(instance_id, dir)?;
+    new_instance::begin(&staging, instance_id, dir)?;
+    Ok(staging)
+}
+
+/// Where a new instance at `dir` is staged (nothing is created there yet).
+fn new_instance_staging(instance_id: &str, dir: &Path) -> LauncherResult<std::path::PathBuf> {
+    let root = dir.parent().ok_or_else(|| LauncherError::Generic {
+        code: "ERR_INSTANCE_STAGING".into(),
+        message: format!("{} has no instances folder", dir.display()),
+    })?;
+    std::fs::create_dir_all(root).map_err(|error| LauncherError::Generic {
+        code: "ERR_INSTANCE_STAGING".into(),
+        message: format!("Cannot create {}: {error}", root.display()),
+    })?;
+    Ok(root.join(format!(
+        ".agora-import-{instance_id}-{}",
+        uuid::Uuid::new_v4()
+    )))
+}
+
+/// Register the published instance at `dir`: its row and the publication's receipt in one
+/// transaction, the commit point. Before it, a crash leaves the folder for the next start to
+/// remove; after it, the instance.
+fn register_new_instance(
+    dir: &Path,
+    conn: &mut rusqlite::Connection,
+    row: &InstanceRow,
+) -> LauncherResult<()> {
+    new_instance::commit_with_receipt(dir, conn, |tx| {
+        agora_core::db::upsert_instance(tx, crate::GAME_ID, row).map_err(|error| {
+            LauncherError::Generic {
+                code: "ERR_LOCAL_STATE_FAILED".into(),
+                message: error.to_string(),
+            }
+        })
+    })
+}
+
 fn loader_display_name(loader: &str) -> &str {
     match loader {
         "fabric" => "Fabric",

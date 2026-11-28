@@ -60,6 +60,23 @@ struct Journal {
 /// write the publication's marker and journal into it, before the caller puts anything there.
 /// `final_dir` is where [`publish`] will move it. Returns the publication's operation id.
 pub fn begin(staging: &Path, instance_id: &str, final_dir: &Path) -> LauncherResult<String> {
+    side_by_side(staging, final_dir)?;
+    std::fs::create_dir(staging).map_err(|error| io(staging, error))?;
+    recovery::sync_parent(staging).map_err(|error| io(staging, error))?;
+    record(staging, instance_id, final_dir)
+}
+
+/// [`begin`] for a staging folder a writer has just built itself in one step (a clone makes its
+/// copy aside and renames it into place): the record is written into it straight away. Prefer
+/// [`begin`], which covers the build too; between the build and this call the folder is not yet
+/// the publication's.
+pub fn adopt(staging: &Path, instance_id: &str, final_dir: &Path) -> LauncherResult<String> {
+    side_by_side(staging, final_dir)?;
+    plain_directory(staging)?;
+    record(staging, instance_id, final_dir)
+}
+
+fn side_by_side(staging: &Path, final_dir: &Path) -> LauncherResult<()> {
     if staging.parent().is_none() || staging.parent() != final_dir.parent() {
         return Err(refused(format!(
             "{} and {} must be folders side by side, so publishing is one rename",
@@ -70,8 +87,10 @@ pub fn begin(staging: &Path, instance_id: &str, final_dir: &Path) -> LauncherRes
     if let Some(parent) = staging.parent() {
         plain_directory(parent)?;
     }
-    std::fs::create_dir(staging).map_err(|error| io(staging, error))?;
-    recovery::sync_parent(staging).map_err(|error| io(staging, error))?;
+    Ok(())
+}
+
+fn record(staging: &Path, instance_id: &str, final_dir: &Path) -> LauncherResult<String> {
     let resource = LockResource::Instance(instance_id.to_string());
     let mut envelope = Envelope::new(&resource, State::Building, Vec::new())?;
     let operation = envelope.operation_id.clone();
@@ -529,6 +548,28 @@ mod tests {
             "{outcome:?}"
         );
         assert!(other.join("keep.txt").exists());
+    }
+
+    #[test]
+    fn an_adopted_folder_is_published_and_recovered_like_a_begun_one() {
+        let (_dir, ctx, mut conn) = fixture();
+        let (staging, final_dir) = names(&ctx);
+        std::fs::create_dir_all(staging.join("mods")).unwrap();
+        std::fs::write(staging.join("mods/a.jar"), b"a").unwrap();
+
+        adopt(&staging, "new", &final_dir).unwrap();
+        publish(&staging, &final_dir).unwrap();
+        commit_with_receipt(&final_dir, &mut conn, register).unwrap();
+
+        assert_eq!(std::fs::read(final_dir.join("mods/a.jar")).unwrap(), b"a");
+        assert!(!final_dir.join(JOURNAL).exists());
+        assert!(registered(&conn));
+        assert!(adopt(
+            &final_dir.join("mods/a.jar"),
+            "x",
+            &final_dir.join("mods/b")
+        )
+        .is_err());
     }
 
     #[test]
