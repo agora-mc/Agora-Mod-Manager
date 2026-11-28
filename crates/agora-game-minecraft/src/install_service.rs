@@ -844,7 +844,7 @@ impl InstallService {
             crate::content_bridge::content_path(&entry.content_type, &effective_filename(&entry))?;
         // The folder the install placed it in gets the same right the install gave it, so a placed
         // link can be moved out of it (and back, if the removal is rolled back).
-        let folder = dir.join(agora_core::helpers::content_subdir(&entry.content_type));
+        let folder = dir.join(ac::helpers::content_subdir(&entry.content_type));
         crate::content_bridge::staged_change(&guard, &dir, &[&folder], |stage| {
             stage.remove(&path, ac::staged_apply::Expect::Agora(recorded))?;
             stage.write_manifest(&manifest)

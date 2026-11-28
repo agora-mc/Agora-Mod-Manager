@@ -486,7 +486,7 @@ pub fn place_file_at(ctx: &Ctx, sha256: &str, target: &Path) -> LauncherResult<s
 /// The SHA-256 the manifest recorded for the file Agora placed: its stored object's, or (for an
 /// entry written before the content store) its own. `None` when neither is recorded, which means
 /// Agora cannot say the file is its own.
-pub(crate) fn recorded_sha256(entry: &agora_core::models::InstalledMod) -> Option<&str> {
+pub(crate) fn recorded_sha256(entry: &InstalledMod) -> Option<&str> {
     entry
         .object_sha256
         .as_deref()

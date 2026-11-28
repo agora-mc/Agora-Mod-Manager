@@ -1109,7 +1109,7 @@ fn a_failed_database_change_says_every_move_was_undone() {
     let failure = stage
         .commit_with_receipt(&mut conn, |_| {
             Err(crate::error::LauncherError::Generic {
-                code: "ERR_TEST".into(),
+                code: "ERR_STAGED_APPLY".into(),
                 message: "the row would not go in".into(),
             })
         })
