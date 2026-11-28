@@ -677,7 +677,7 @@ pub struct FileStamp {
     pub identity: PathIdentity,
     /// The length in bytes.
     pub len: u64,
-    /// The last write, in nanoseconds since the Unix epoch (0 when the OS gave none).
+    /// The last write, in nanoseconds since the Unix epoch.
     pub modified_ns: u64,
 }
 
@@ -711,13 +711,13 @@ pub(crate) fn file_stamp(path: &Path) -> std::io::Result<Option<FileStamp>> {
     if !metadata.is_file() || agora_game_api::is_a_reparse_point(&metadata) {
         return Err(std::io::Error::other("expected a plain file"));
     }
-    let modified_ns = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |since| {
-            u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
-        });
+    // A time the OS would not give is an error, never "no time": a stamp without it could match
+    // a file rewritten in place.
+    let modified_ns = match metadata.modified()?.duration_since(std::time::UNIX_EPOCH) {
+        Ok(since) => u64::try_from(since.as_nanos()).unwrap_or(u64::MAX),
+        // Before 1970: a real (if odd) time, kept distinct from the times after it.
+        Err(before) => u64::MAX - u64::try_from(before.duration().as_nanos()).unwrap_or(u64::MAX),
+    };
     #[cfg(unix)]
     let identity = {
         use std::os::unix::fs::MetadataExt;

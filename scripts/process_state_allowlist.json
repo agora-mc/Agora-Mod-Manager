@@ -24,6 +24,7 @@
   "crates/agora-core/src/log_sanitizer.rs::macos_home_re::RE": {"category": "cache", "why": "a compiled regex, kept once rather than per log line"},
   "crates/agora-core/src/log_sanitizer.rs::token_re::RE": {"category": "cache", "why": "a compiled regex, kept once rather than per log line"},
   "crates/agora-core/src/network_gate.rs::slot::SLOT": {"category": "config", "why": "the outbound policy every request is checked against, installed at startup; it moves onto Ctx with the rest of the network configuration (32.9)"},
+  "crates/agora-core/src/network_gate.rs::install_for_test::EXCLUSIVE": {"category": "guard", "why": "tests only: the gate it serialises is itself one slot per process, and cargo test runs a crate's tests as threads of one process"},
   "crates/agora-core/src/plugins/events.rs::CURRENT_ORIGIN": {"category": "guard", "why": "the plugin whose event is being dispatched, for permission checks; it is per thread because a plugin callback may not cross threads"},
   "crates/agora-core/src/process_job.rs::registry::REGISTRY": {"category": "cache", "why": "the running-jobs registry of the process; a job is started by one adapter and read by another"},
   "crates/agora-core/src/registry_sync.rs::header_cache::CACHE": {"category": "cache", "why": "a header cache for registry downloads, keyed by file path"},
