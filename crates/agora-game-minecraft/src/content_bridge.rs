@@ -213,54 +213,6 @@ pub fn store_staged_content(
     Ok(Some(stored))
 }
 
-/// Re-place every manifest entry that recorded a store object, using the current link/copy
-/// setting. A rollback restores bytes from a snapshot of copies; this puts the links back.
-/// Missing objects and files whose bytes no longer match the record are left alone.
-pub fn relink_recorded_content(ctx: &Ctx, instance_dir: &Path) -> LauncherResult<()> {
-    let manifest_path = instance_dir.join("instance_manifest.json");
-    if !manifest_path.is_file() {
-        return Ok(());
-    }
-    let manifest = helpers::read_manifest(&manifest_path)?;
-    let mode = store::placement_mode(ctx).map_err(content_error)?;
-    for entry in manifest
-        .mods
-        .iter()
-        .chain(manifest.resourcepacks.iter())
-        .chain(manifest.shaders.iter())
-        .chain(manifest.datapacks.iter())
-    {
-        let Some(object) = entry.object_sha256.as_deref() else {
-            continue;
-        };
-        if !ctx.paths.content_object_path(object).is_file() {
-            continue;
-        }
-        let subdir = subdir_for_content_type(&entry.content_type);
-        if subdir == "saves" {
-            continue;
-        }
-        let physical = if entry.enabled {
-            entry.filename.clone()
-        } else {
-            format!("{}.disabled", entry.filename)
-        };
-        let target = instance_dir.join(subdir).join(&physical);
-        if target.exists() {
-            if !file_matches_recorded(&target, &entry.sha256)? {
-                continue;
-            }
-            if let Some(folder) = target.parent() {
-                ensure_folder_can_delete_children(instance_dir, folder)?;
-            }
-            std::fs::remove_file(&target)
-                .map_err(|error| write_error("replace a restored file", &target, error))?;
-        }
-        store::place_object_at(ctx, object, &target, mode).map_err(content_error)?;
-    }
-    Ok(())
-}
-
 /// Store one file's bytes as a single-file item when `relative_path` is in a tracked content
 /// folder, without placing it anywhere yet. Returns `None` for any other path.
 pub fn store_bytes(
@@ -309,7 +261,9 @@ pub fn store_and_place_bytes(
 
 /// Store an existing file and place the object at `instance_dir/<relative_path>` when that path
 /// is in a tracked content folder. Returns `None` (having written nothing) for any other path.
-pub fn store_and_place_file(
+/// Tests only: store a file and place it straight into the instance (writers stage it instead).
+#[cfg(test)]
+pub(crate) fn store_and_place_file(
     ctx: &Ctx,
     instance_dir: &Path,
     relative_path: &str,
@@ -329,6 +283,26 @@ pub fn store_and_place_file(
     )?;
     place_at_relative(ctx, &stored.sha256, instance_dir, relative_path)?;
     Ok(Some(stored))
+}
+
+/// Store the file at `source` as the tracked content at `relative_path`, without placing it: a
+/// staged apply places it ([`stage_object`]). `None` for a path that is not tracked content.
+pub(crate) fn store_tracked_file(
+    ctx: &Ctx,
+    relative_path: &str,
+    source: &Path,
+) -> LauncherResult<Option<StoredFile>> {
+    let Some(content_type) = tracked_content_type(relative_path) else {
+        return Ok(None);
+    };
+    validate_relative_path(relative_path)?;
+    store_file_at(
+        ctx,
+        source,
+        &store_details(content_type, file_name_of(relative_path), None, None),
+        Some(relative_path),
+    )
+    .map(Some)
 }
 
 /// The folder a content type is installed into.

@@ -71,9 +71,12 @@ use crate::pack_merge::{plan_pack_update_with_mod_ids, PackMergePlan};
 use agora_core::{
     ctx::Ctx,
     db::{list_instance_pack_files, replace_instance_pack_files, InstancePackFile},
+    error::LauncherError,
     helpers,
+    instance_runtime::InstanceGuard,
     models::InstalledMod,
     snapshot,
+    staged_apply::{Expect, NotApplied, Stage},
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -781,6 +784,8 @@ pub struct MergeOutcome {
     pub snapshot_id: String,
     /// Whether a failure occurred and the pre-merge snapshot was restored.
     pub rollback_performed: bool,
+    /// Files the user had changed that the merge replaced or removed: kept here instead.
+    pub kept_aside: Vec<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1428,17 +1433,20 @@ pub fn reconcile_manifest(
 /// Apply a merge plan against a fully staged THEIRS tree.
 ///
 /// `staged_dir` must already contain every file the plan references (jars and
-/// overrides extracted with real bytes — see [`stage_pack`]). The mandatory
-/// snapshot is taken before any mutation; if any step fails the snapshot is
-/// restored, leaving the instance exactly as it was. On success the new baseline
-/// (THEIRS) is written to `instance_pack_files`.
+/// overrides extracted with real bytes — see [`stage_pack`]). The merge is one staged apply
+/// (MASTER_SPEC §32.4) under `guard`: its files and manifest are staged, then moved, and the new
+/// baseline (THEIRS) in `instance_pack_files` with the apply's receipt is the commit point. A
+/// failure leaves the instance exactly as it was; so does a crash before the commit point, once
+/// the next start (or the next change to the instance) settles it, and a crash after it finishes.
+/// The mandatory snapshot is still taken first, as a recovery point the user can restore.
 ///
 /// `resolutions` maps every conflicting key to how it was settled. A plan with an
 /// unresolved conflict is rejected rather than guessed at.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_merge(
+    guard: &InstanceGuard,
     ctx: Option<&Ctx>,
-    conn: &rusqlite::Connection,
+    conn: &mut rusqlite::Connection,
     instance_id: &str,
     instance_dir: &Path,
     staged_dir: &Path,
@@ -1530,23 +1538,28 @@ pub fn apply_merge(
     }
     let snapshot = snapshot::create_snapshot_scoped(instance_dir, Some("pack-merge"), &scope_refs)?;
 
-    // Everything that can leave the instance inconsistent belongs inside this
-    // closure, because everything inside it is undone by the snapshot restore
-    // below. The baseline write used to sit *after* it: a failure there left
-    // the files merged but `instance_pack_files` still describing the old pack,
-    // so the next update would diff against a baseline that never existed and
-    // read the whole previous update as the user's own edits.
-    let apply_result = (|| -> Result<(), String> {
+    let mut stage =
+        Stage::begin_with_receipts(guard, instance_dir, conn).map_err(|e| e.to_string())?;
+    if ctx.is_some() {
+        // A placed link can only be moved out of a folder that grants delete-child.
+        crate::content_bridge::ensure_folder_can_delete_children(instance_dir, stage.dir())
+            .map_err(|e| e.to_string())?;
+    }
+    // Everything the merge changes is staged here; nothing in the instance changes until the
+    // commit below, and a failure on the way drops the stage with the instance untouched.
+    let staged = (|| -> Result<Vec<InstancePackFile>, String> {
         let mut stored: BTreeMap<String, crate::content_bridge::StoredFile> = BTreeMap::new();
         for action in &plan.actions {
-            if let Some((path, file)) = apply_one_action(ctx, instance_dir, staged_dir, action)? {
+            if let Some((path, file)) =
+                stage_one_action(ctx, instance_dir, staged_dir, &mut stage, action)?
+            {
                 stored.insert(path, file);
             }
         }
         for conflict in &plan.conflicts {
             if resolutions.get(&conflict.key) == Some(&ConflictResolution::TakeTheirs) {
                 if let Some((path, file)) =
-                    apply_theirs_for_conflict(ctx, instance_dir, staged_dir, conflict)?
+                    stage_theirs_for_conflict(ctx, instance_dir, staged_dir, &mut stage, conflict)?
                 {
                     stored.insert(path, file);
                 }
@@ -1561,9 +1574,6 @@ pub fn apply_merge(
         // for jars that were never fetched, and stamping those would make the
         // manifest disagree with the baseline it is supposed to summarize.
         let baseline = crate::pack_inventory::collect_pack_inventory(staged_dir)?;
-
-        // Reconciled manifest write is inside the protected region so the
-        // snapshot's `instance_manifest.json` coverage makes rollback free.
         let mut manifest_to_write = reconciled_manifest.clone();
         for (path, file) in &stored {
             stamp_stored_file(&mut manifest_to_write, path, file);
@@ -1571,62 +1581,72 @@ pub fn apply_merge(
         if let Some(origin) = manifest_to_write.pack_origin.as_mut() {
             origin.pack_content_hash = Some(crate::pack_inventory::pack_content_hash(&baseline));
         }
-        helpers::atomic_write_manifest(
-            &instance_dir.join("instance_manifest.json"),
-            &manifest_to_write,
-        )
-        .map_err(|e| format!("failed to write reconciled manifest: {e:?}"))?;
-
-        replace_instance_pack_files(conn, instance_id, &baseline)
-            .map_err(|e| format!("failed to record the new pack baseline: {e}"))?;
-
-        // Bump the mutation generation, exactly as the install pipeline does
-        // after its own apply. This is what tells the pre-launch snapshot logic
-        // that an existing recovery point no longer describes the instance;
-        // without it a merge is invisible to that check and a stale pre-launch
-        // snapshot stays eligible for reuse.
-        snapshot::mark_instance_mutated(instance_dir)?;
-        Ok(())
+        stage
+            .write_manifest(&manifest_to_write)
+            .map_err(|e| format!("failed to stage the reconciled manifest: {e}"))?;
+        Ok(baseline)
     })();
-
-    if let Err(error) = apply_result {
-        let restore = snapshot::restore_snapshot(
-            instance_dir,
-            &snapshot.id,
-            crate::snapshot_scope::tracked_entries(),
-        );
-        return match restore {
-            Ok(outcome) => {
-                // The snapshot restores copies. Put back the store links for everything the
-                // update did not have to change, so a failed merge leaves the instance as it
-                // was (bytes, manifest and placement) in the user's current placement mode.
-                let relink_note = match ctx {
-                    Some(ctx) => crate::content_bridge::relink_recorded_content(ctx, instance_dir)
-                        .err()
-                        .map(|e| format!("; restoring store placements failed: {e}"))
-                        .unwrap_or_default(),
-                    None => String::new(),
-                };
-                Err(match outcome.coverage {
-                    snapshot::RestoreCoverageKind::Exact => format!(
-                        "merge apply failed and the pre-merge snapshot was restored: {error}{relink_note}"
-                    ),
-                    snapshot::RestoreCoverageKind::LegacyPartial => format!(
-                        "merge apply failed and the pre-merge snapshot was restored, but it predates scoped \
-                         snapshots so roots outside {:?} were left as they are: {error}{relink_note}",
-                        outcome.restored_roots
-                    ),
-                })
-            }
-            Err(restore_error) => Err(format!(
-                "merge apply failed and automatic restore could not complete; original state is protected in recovery storage. apply: {error}; restore: {restore_error}"
-            )),
-        };
+    let restored = |error: String| {
+        format!(
+            "merge apply failed and the instance was restored to its state before the merge \
+             (nothing in it was changed; the pre-merge snapshot {} is kept): {error}",
+            snapshot.id
+        )
+    };
+    let baseline = match staged {
+        Ok(staged) => staged,
+        Err(error) => {
+            drop(stage);
+            return Err(restored(error));
+        }
+    };
+    #[cfg(test)]
+    if let Some(boundary) = PACK_UPDATE_TEST_CRASH.with(|slot| slot.take()) {
+        stage.crash_at(boundary);
     }
+
+    // The commit point: the new baseline and this apply's receipt, in one transaction, after the
+    // staged files and manifest are moved in. The baseline used to be written after the files, so
+    // a failure (or a crash) between left the next update diffing against a baseline that never
+    // existed.
+    let committed = stage.commit_with_receipt(conn, |tx| {
+        replace_instance_pack_files(tx, instance_id, &baseline).map_err(|e| {
+            LauncherError::Generic {
+                code: "ERR_LOCAL_STATE_FAILED".into(),
+                message: format!("failed to record the new pack baseline: {e}"),
+            }
+        })
+    });
+    let report = match committed {
+        Ok(report) => report,
+        Err(failure) => {
+            return Err(match failure.state {
+                NotApplied::Unchanged | NotApplied::RolledBack => restored(failure.to_string()),
+                NotApplied::RecoveryPending => format!(
+                    "merge apply failed and putting the instance back did not finish; it is \
+                     tried again the next time Agora starts or changes this instance, and the \
+                     pre-merge snapshot {} can restore it: {failure}",
+                    snapshot.id
+                ),
+            })
+        }
+    };
+
+    // Bump the mutation generation, exactly as the install pipeline does
+    // after its own apply. This is what tells the pre-launch snapshot logic
+    // that an existing recovery point no longer describes the instance;
+    // without it a merge is invisible to that check and a stale pre-launch
+    // snapshot stays eligible for reuse.
+    let _ = snapshot::mark_instance_mutated(instance_dir);
 
     Ok(MergeOutcome {
         snapshot_id: snapshot.id,
         rollback_performed: false,
+        kept_aside: report
+            .kept_aside
+            .into_iter()
+            .map(|kept| kept.kept_at)
+            .collect(),
     })
 }
 
@@ -1678,31 +1698,32 @@ fn planned_write_paths(
     paths
 }
 
-fn apply_one_action(
+fn stage_one_action(
     ctx: Option<&Ctx>,
     instance_dir: &Path,
     staged_dir: &Path,
+    stage: &mut Stage<'_>,
     action: &crate::pack_merge::PlanAction,
 ) -> Result<Option<(String, crate::content_bridge::StoredFile)>, String> {
     match action.kind.as_str() {
         "keep" | "keep_user_added" => Ok(None),
         "remove" => {
-            let dest = safe_join(instance_dir, &action.target_path)?;
-            if dest.exists() {
-                refuse_if_changed(&dest, action.ours_sha.as_deref(), &action.target_path)?;
-                remove_instance_file(instance_dir, &dest)?;
-            }
+            stage_remove(
+                instance_dir,
+                stage,
+                &action.target_path,
+                action.ours_sha.as_deref(),
+            )?;
             Ok(None)
         }
         "add" | "update" | "update_keep_disabled" => {
             let src = safe_join(staged_dir, &action.logical_path)?;
-            let dest = safe_join(instance_dir, &action.target_path)?;
             let was_update = action.kind.as_str() != "add";
-            replace_with_content(
+            stage_replace(
                 ctx,
                 instance_dir,
+                stage,
                 &src,
-                &dest,
                 &action.target_path,
                 was_update,
                 action.ours_sha.as_deref(),
@@ -1710,19 +1731,14 @@ fn apply_one_action(
         }
         "rename_update" | "rename_update_keep_disabled" => {
             if let Some(previous) = &action.previous_path {
-                let prev = safe_join(instance_dir, previous)?;
-                if prev.exists() {
-                    refuse_if_changed(&prev, action.ours_sha.as_deref(), previous)?;
-                    remove_instance_file(instance_dir, &prev)?;
-                }
+                stage_remove(instance_dir, stage, previous, action.ours_sha.as_deref())?;
             }
             let src = safe_join(staged_dir, &action.logical_path)?;
-            let dest = safe_join(instance_dir, &action.target_path)?;
-            replace_with_content(
+            stage_replace(
                 ctx,
                 instance_dir,
+                stage,
                 &src,
-                &dest,
                 &action.target_path,
                 true,
                 action.ours_sha.as_deref(),
@@ -1732,10 +1748,11 @@ fn apply_one_action(
     }
 }
 
-fn apply_theirs_for_conflict(
+fn stage_theirs_for_conflict(
     ctx: Option<&Ctx>,
     instance_dir: &Path,
     staged_dir: &Path,
+    stage: &mut Stage<'_>,
     conflict: &crate::pack_merge::PlanConflict,
 ) -> Result<Option<(String, crate::content_bridge::StoredFile)>, String> {
     let theirs_path = conflict.theirs_path.as_deref().ok_or_else(|| {
@@ -1745,21 +1762,16 @@ fn apply_theirs_for_conflict(
         )
     })?;
     let src = safe_join(staged_dir, theirs_path)?;
-    let dest = safe_join(instance_dir, theirs_path)?;
     if let Some(ours_path) = &conflict.ours_path {
         if logical_path(ours_path) != logical_path(theirs_path) {
-            let old = safe_join(instance_dir, ours_path)?;
-            if old.exists() {
-                refuse_if_changed(&old, conflict.ours_sha.as_deref(), ours_path)?;
-                remove_instance_file(instance_dir, &old)?;
-            }
+            stage_remove(instance_dir, stage, ours_path, conflict.ours_sha.as_deref())?;
         }
     }
-    replace_with_content(
+    stage_replace(
         ctx,
         instance_dir,
+        stage,
         &src,
-        &dest,
         theirs_path,
         true,
         conflict.ours_sha.as_deref(),
@@ -1767,8 +1779,8 @@ fn apply_theirs_for_conflict(
 }
 
 /// Refuse to replace or delete a file whose bytes are no longer the ones the plan decided
-/// about. A file the user changed after the preview is theirs; the merge stops and the
-/// pre-merge snapshot is restored rather than deleting their edit.
+/// about. A file the user changed after the preview is theirs; the merge stops, and nothing in
+/// the instance is changed, rather than deleting their edit.
 fn refuse_if_changed(
     path: &Path,
     recorded_sha256: Option<&str>,
@@ -1788,57 +1800,92 @@ fn refuse_if_changed(
     }
 }
 
-/// Put staged bytes in place, through the shared store when the target is tracked content.
-/// Anything the plan decided to replace is removed first: a hard link to a protected store
-/// object cannot be written through, and a stale file must not make the placement fail.
-fn replace_with_content(
-    ctx: Option<&Ctx>,
-    instance_dir: &Path,
-    src: &Path,
-    dest: &Path,
-    target_path: &str,
-    was_update: bool,
-    recorded_sha256: Option<&str>,
-) -> Result<Option<(String, crate::content_bridge::StoredFile)>, String> {
-    if dest.exists() {
-        if !was_update {
-            return Err(format!(
-                "'{target_path}' appeared after the update was reviewed, so it was left as it is"
-            ));
-        }
-        refuse_if_changed(dest, recorded_sha256, target_path)?;
-        remove_instance_file(instance_dir, dest)?;
-    }
-    let stored = match ctx {
-        Some(ctx) => crate::content_bridge::store_and_place_file(
-            ctx,
-            instance_dir,
-            target_path,
-            src,
-            None,
-            None,
-        )
-        .map_err(|error| error.to_string())?,
-        None => None,
-    };
-    match stored {
-        Some(file) => {
-            // Fail after the write so a rollback test exercises restoring an already-mutated
-            // file rather than failing before any mutation.
-            check_failpoint("apply-one")?;
-            Ok(Some((target_path.to_string(), file)))
-        }
-        None => {
-            copy_file(src, dest)?;
-            Ok(None)
-        }
+/// Whose file is at a path the merge replaces or removes: Agora's (the hash the plan recorded), or,
+/// with no record, the user's, which staged apply keeps aside rather than deleting.
+fn expect_for(recorded_sha256: Option<&str>) -> Expect {
+    match recorded_sha256 {
+        Some(recorded) if !recorded.trim().is_empty() => Expect::Agora(recorded.to_string()),
+        _ => Expect::Unknown,
     }
 }
 
-/// Remove one instance file. Only a file in a content folder Agora places links in (or its own
-/// `.agora` staging/trash) can need the folder's delete-child right; a user folder such as
-/// `config/` must keep its ACL exactly as it was.
-fn remove_instance_file(instance_dir: &Path, path: &Path) -> Result<(), String> {
+fn strict(relative: &str) -> Result<agora_game_api::StrictRelPath, String> {
+    agora_game_api::RelPath::strict(relative.replace('\\', "/"))
+        .map_err(|error| format!("'{relative}' cannot be a path in an instance: {error}"))
+}
+
+/// Stage the removal of the file at `relative`, when there is one.
+fn stage_remove(
+    instance_dir: &Path,
+    stage: &mut Stage<'_>,
+    relative: &str,
+    recorded_sha256: Option<&str>,
+) -> Result<(), String> {
+    let live = safe_join(instance_dir, relative)?;
+    if !live.exists() {
+        return Ok(());
+    }
+    refuse_if_changed(&live, recorded_sha256, relative)?;
+    grant_delete_if_managed(instance_dir, &live)?;
+    stage
+        .remove(&strict(relative)?, expect_for(recorded_sha256))
+        .map_err(|error| error.to_string())
+}
+
+/// Stage staged bytes to become the file at `relative`, through the shared store when it is
+/// tracked content. What the plan decided to replace is judged by its recorded hash.
+fn stage_replace(
+    ctx: Option<&Ctx>,
+    instance_dir: &Path,
+    stage: &mut Stage<'_>,
+    src: &Path,
+    relative: &str,
+    was_update: bool,
+    recorded_sha256: Option<&str>,
+) -> Result<Option<(String, crate::content_bridge::StoredFile)>, String> {
+    let live = safe_join(instance_dir, relative)?;
+    let expect = if live.exists() {
+        if !was_update {
+            return Err(format!(
+                "'{relative}' appeared after the update was reviewed, so it was left as it is"
+            ));
+        }
+        refuse_if_changed(&live, recorded_sha256, relative)?;
+        grant_delete_if_managed(instance_dir, &live)?;
+        expect_for(recorded_sha256)
+    } else {
+        Expect::Absent
+    };
+    let path = strict(relative)?;
+    let stored = match ctx {
+        Some(ctx) => crate::content_bridge::store_tracked_file(ctx, relative, src)
+            .map_err(|error| error.to_string())?,
+        None => None,
+    };
+    let placed = match (ctx, stored) {
+        (Some(ctx), Some(file)) => {
+            // The folder the link goes into must let it be moved back out on a rollback.
+            grant_delete_if_managed(instance_dir, &live)?;
+            crate::content_bridge::stage_object(ctx, stage, &path, &file.sha256, expect)
+                .map_err(|error| error.to_string())?;
+            Some((relative.to_string(), file))
+        }
+        _ => {
+            stage
+                .write_from(&path, src, expect)
+                .map_err(|error| error.to_string())?;
+            None
+        }
+    };
+    // A failure after a file is staged: a test shows the instance is still untouched.
+    check_failpoint("apply-one")?;
+    Ok(placed)
+}
+
+/// Give the folder of `path` the delete-child right a placed link needs, when it is a content
+/// folder Agora places links in (or its own `.agora`). A user folder such as `config/` keeps its
+/// ACL exactly as it was.
+fn grant_delete_if_managed(instance_dir: &Path, path: &Path) -> Result<(), String> {
     let agora_managed = path
         .strip_prefix(instance_dir)
         .ok()
@@ -1856,7 +1903,7 @@ fn remove_instance_file(instance_dir: &Path, path: &Path) -> Result<(), String> 
                 .map_err(|error| error.to_string())?;
         }
     }
-    remove_file(path)
+    Ok(())
 }
 
 /// Record the store item on the manifest entry this merge just placed.
@@ -1883,23 +1930,16 @@ fn stamp_stored_file(
     }
 }
 
-fn copy_file(src: &Path, dest: &Path) -> Result<(), String> {
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("cannot create dir {}: {e}", parent.display()))?;
-    }
-    fs::copy(src, dest)
-        .map_err(|e| format!("cannot copy {} -> {}: {e}", src.display(), dest.display()))?;
-    // Fail after the write so a rollback test exercises restoring an already-
-    // mutated file rather than failing before any mutation.
-    check_failpoint("apply-one")?;
-    Ok(())
-}
+#[cfg(test)]
+use agora_core::staged_apply::{recover_with_receipts, Boundary, StagedRecovery};
 
 #[cfg(test)]
 thread_local! {
     static PACK_UPDATE_TEST_FAILPOINT: std::cell::RefCell<Option<&'static str>> =
         const { std::cell::RefCell::new(None) };
+    /// Where the next merge's commit stops, as a crash would (test seam).
+    static PACK_UPDATE_TEST_CRASH: std::cell::Cell<Option<Boundary>> =
+        const { std::cell::Cell::new(None) };
 }
 
 fn check_failpoint(name: &'static str) -> Result<(), String> {
@@ -1912,10 +1952,6 @@ fn check_failpoint(name: &'static str) -> Result<(), String> {
     #[cfg(not(test))]
     let _ = name;
     Ok(())
-}
-
-fn remove_file(path: &Path) -> Result<(), String> {
-    fs::remove_file(path).map_err(|e| format!("cannot remove {}: {e}", path.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1977,8 +2013,9 @@ pub enum PackUpdateOutcome {
 /// already unhealthy.
 #[allow(clippy::too_many_arguments)]
 pub fn update_pack<F: PackFileFetcher>(
+    guard: &InstanceGuard,
     ctx: Option<&Ctx>,
-    conn: &rusqlite::Connection,
+    conn: &mut rusqlite::Connection,
     instance_id: &str,
     instance_dir: &Path,
     mrpack_path: &Path,
@@ -2050,6 +2087,7 @@ pub fn update_pack<F: PackFileFetcher>(
     };
 
     let outcome = match apply_merge(
+        guard,
         ctx,
         conn,
         instance_id,
@@ -2061,8 +2099,8 @@ pub fn update_pack<F: PackFileFetcher>(
     ) {
         Ok(outcome) => outcome,
         Err(error) => {
-            // apply_merge restores the snapshot itself on failure and says so
-            // in the message; anything it could not restore is flagged there.
+            // apply_merge leaves the instance as it was on failure and says so in the
+            // message; an undo it could not finish is flagged there.
             return PackUpdateOutcome::Failed {
                 phase: "apply".into(),
                 error,
@@ -2158,21 +2196,18 @@ pub fn apply_pack_update(
         .paths
         .staging_dir(&format!("pack-update-{sanitized}"))
         .map_err(|e| e.to_string())?;
-    let _guard = if allow_while_running {
-        agora_core::instance_runtime::InstanceGuard::for_mutation_while_running(
-            ctx,
-            &sanitized,
-            "pack-update",
-        )
+    let guard = if allow_while_running {
+        InstanceGuard::for_mutation_while_running(ctx, &sanitized, "pack-update")
     } else {
-        agora_core::instance_runtime::InstanceGuard::for_mutation(ctx, &sanitized, "pack-update")
+        InstanceGuard::for_mutation(ctx, &sanitized, "pack-update")
     }
     .map_err(|e| e.to_string())?;
-    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db())
+    let mut conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db())
         .map_err(|e| e.to_string())?;
     let outcome = update_pack(
+        &guard,
         Some(ctx),
-        &conn,
+        &mut conn,
         &sanitized,
         instance_dir,
         mrpack_path,
@@ -2296,13 +2331,23 @@ fn write_staged(staged_dir: &Path, rel: &str, bytes: &[u8]) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agora_core::db::{run_migrations, InstancePackFile};
+    use agora_core::db::{init_local_state_db, run_migrations, InstancePackFile};
     use rusqlite::Connection;
     use std::io::Write;
     use tempfile::TempDir;
 
     fn sha(c: char) -> String {
         std::iter::repeat_n(c, 64).collect()
+    }
+
+    /// The instance guard a merge runs under: a lock on a throwaway context (the instances these
+    /// tests merge into are plain folders).
+    fn test_guard() -> (TempDir, InstanceGuard) {
+        let dir = TempDir::new().unwrap();
+        let ctx = Ctx::for_testing(dir.path().to_path_buf());
+        init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+        let guard = InstanceGuard::for_mutation(&ctx, "inst", "pack merge test").unwrap();
+        (dir, guard)
     }
 
     fn test_conn() -> (Connection, TempDir) {
@@ -2691,7 +2736,8 @@ mod tests {
         write(&staged, "mods/packmod.jar", b"packB");
         write(&staged, "config/foo.toml", b"configB");
 
-        let (conn, _dbtmp) = test_conn();
+        let (mut conn, _dbtmp) = test_conn();
+        let (_guard_dir, guard) = test_guard();
         seed_instance_row(&conn, "inst");
         let old_manifest = helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
         let theirs_struct = MrpackTheirs {
@@ -2717,8 +2763,9 @@ mod tests {
         )
         .unwrap();
         let outcome = apply_merge(
+            &guard,
             None,
-            &conn,
+            &mut conn,
             "inst",
             &inst,
             &staged,
@@ -2781,12 +2828,14 @@ mod tests {
         write(&staged, "config/foo.toml", b"x"); // wrong file present
         let before =
             snapshot::live_file_index(&inst, crate::snapshot_scope::tracked_entries()).unwrap();
-        let (conn, _dbtmp) = test_conn();
+        let (mut conn, _dbtmp) = test_conn();
+        let (_guard_dir, guard) = test_guard();
         seed_instance_row(&conn, "inst");
         let old_manifest = helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
         let err = apply_merge(
+            &guard,
             None,
-            &conn,
+            &mut conn,
             "inst",
             &inst,
             &staged,
@@ -2819,7 +2868,8 @@ mod tests {
             sha256: sha2_256_hex(b"a-old"),
             size: 5,
         }];
-        let (conn, _dbtmp) = test_conn();
+        let (mut conn, _dbtmp) = test_conn();
+        let (_guard_dir, guard) = test_guard();
         seed_instance_row(&conn, "inst");
         agora_core::db::replace_instance_pack_files(&conn, "inst", &base).unwrap();
 
@@ -2853,8 +2903,9 @@ mod tests {
         )
         .unwrap();
         let error = apply_merge(
+            &guard,
             None,
-            &conn,
+            &mut conn,
             "inst",
             &inst,
             &staged,
@@ -2893,7 +2944,8 @@ mod tests {
         let staged = tmp.path().join("staged");
         write(&staged, "mods/a.jar", b"a-new");
 
-        let (conn, _dbtmp) = test_conn();
+        let (mut conn, _dbtmp) = test_conn();
+        let (_guard_dir, guard) = test_guard();
         seed_instance_row(&conn, "inst");
         let before =
             snapshot::live_metadata_fingerprint(&inst, crate::snapshot_scope::tracked_entries())
@@ -2922,8 +2974,9 @@ mod tests {
         )
         .unwrap();
         apply_merge(
+            &guard,
             None,
-            &conn,
+            &mut conn,
             "inst",
             &inst,
             &staged,
@@ -2967,7 +3020,8 @@ mod tests {
 
         // A connection with no `user_instances` row: the FK on
         // instance_pack_files rejects the baseline write.
-        let (conn, _dbtmp) = test_conn();
+        let (mut conn, _dbtmp) = test_conn();
+        let (_guard_dir, guard) = test_guard();
         let old_manifest = helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
         let theirs_struct = MrpackTheirs {
             files: theirs.clone(),
@@ -2992,8 +3046,9 @@ mod tests {
         )
         .unwrap();
         let error = apply_merge(
+            &guard,
             None,
-            &conn,
+            &mut conn,
             "inst",
             &inst,
             &staged,
@@ -3040,7 +3095,8 @@ mod tests {
             snapshot::live_file_index(&inst, crate::snapshot_scope::tracked_entries()).unwrap();
         // Inject a failure after one file has been applied.
         PACK_UPDATE_TEST_FAILPOINT.with(|s| *s.borrow_mut() = Some("apply-one"));
-        let (conn, _dbtmp) = test_conn();
+        let (mut conn, _dbtmp) = test_conn();
+        let (_guard_dir, guard) = test_guard();
         seed_instance_row(&conn, "inst");
         let old_manifest = helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
         let theirs_struct = MrpackTheirs {
@@ -3066,8 +3122,9 @@ mod tests {
         )
         .unwrap();
         let err = apply_merge(
+            &guard,
             None,
-            &conn,
+            &mut conn,
             "inst",
             &inst,
             &staged,
@@ -3129,7 +3186,8 @@ mod tests {
         let before =
             snapshot::live_file_index(&inst, crate::snapshot_scope::tracked_entries()).unwrap();
         PACK_UPDATE_TEST_FAILPOINT.with(|s| *s.borrow_mut() = Some("apply-one"));
-        let (conn, _dbtmp) = test_conn();
+        let (mut conn, _dbtmp) = test_conn();
+        let (_guard_dir, guard) = test_guard();
         seed_instance_row(&conn, "inst");
         let old_manifest = helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
         let theirs_struct = MrpackTheirs {
@@ -3155,8 +3213,9 @@ mod tests {
         )
         .unwrap();
         let err = apply_merge(
+            &guard,
             None,
-            &conn,
+            &mut conn,
             "inst",
             &inst,
             &staged,
@@ -3263,7 +3322,8 @@ mod tests {
     #[test]
     fn update_pack_with_matching_runtime_still_applies() {
         let tmp = TempDir::new().unwrap();
-        let (conn, _dbtmp) = test_conn();
+        let (mut conn, _dbtmp) = test_conn();
+        let (_guard_dir, guard) = test_guard();
         seed_instance_row(&conn, "inst");
         let inst = seed_instance(&tmp, "inst");
         let mrpack = build_mrpack(
@@ -3274,8 +3334,9 @@ mod tests {
         );
 
         let outcome = update_pack(
+            &guard,
             None,
-            &conn,
+            &mut conn,
             "inst",
             &inst,
             &mrpack,
@@ -3297,7 +3358,8 @@ mod tests {
         skip_health_scan: bool,
     ) {
         let tmp = TempDir::new().unwrap();
-        let (conn, _dbtmp) = test_conn();
+        let (mut conn, _dbtmp) = test_conn();
+        let (_guard_dir, guard) = test_guard();
         seed_instance_row(&conn, "inst");
         let inst = seed_instance(&tmp, "inst");
         write(&inst, "mods/existing.jar", b"existing bytes");
@@ -3354,8 +3416,9 @@ mod tests {
         let staged = tmp.path().join("staged");
 
         let outcome = update_pack(
+            &guard,
             None,
-            &conn,
+            &mut conn,
             "inst",
             &inst,
             &mrpack,
@@ -4063,7 +4126,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let inst = seed_instance(&tmp, "inst");
         write(&inst, "config/foo.toml", b"user edited this");
-        let (conn, _dbtmp) = test_conn();
+        let (mut conn, _dbtmp) = test_conn();
+        let (_guard_dir, guard) = test_guard();
         seed_instance_row(&conn, "inst");
         agora_core::db::replace_instance_pack_files(
             &conn,
@@ -4087,8 +4151,9 @@ mod tests {
         let before =
             snapshot::live_file_index(&inst, crate::snapshot_scope::tracked_entries()).unwrap();
         let outcome = update_pack(
+            &guard,
             None,
-            &conn,
+            &mut conn,
             "inst",
             &inst,
             &mrpack,
@@ -4685,6 +4750,73 @@ mod tests {
         staged
     }
 
+    /// A merge cut off by a crash: before its commit point the next settle puts back the old files
+    /// and leaves the old baseline; after it the new files and the new baseline stand. Never the
+    /// new files with the old baseline (MASTER_SPEC §32.4's receipt rule).
+    #[test]
+    fn a_merge_cut_off_by_a_crash_settles_to_the_old_pack_or_the_new_one() {
+        for (boundary, committed) in [
+            (Boundary::AfterPlan, false),
+            (Boundary::AfterMove(1), false),
+            (Boundary::AfterReceipt, true),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let inst = seed_instance(&tmp, "inst");
+            write(&inst, "mods/packmod.jar", b"packA");
+            let staged = staged_update(b"packB");
+            let (guard_dir, guard) = test_guard();
+            let (plan, reconciled, _dbtmp, mut conn) =
+                update_plan_and_reconcile(&inst, b"packA", staged.path());
+            let manifest_before = fs::read(inst.join("instance_manifest.json")).unwrap();
+
+            PACK_UPDATE_TEST_CRASH.with(|slot| slot.set(Some(boundary)));
+            let result = apply_merge(
+                &guard,
+                None,
+                &mut conn,
+                "inst",
+                &inst,
+                staged.path(),
+                &plan,
+                &BTreeMap::new(),
+                &reconciled,
+            );
+            PACK_UPDATE_TEST_CRASH.with(|slot| slot.set(None));
+            assert!(result.is_err(), "{boundary:?}: the seam stops the commit");
+            drop(guard);
+
+            // The next start (or the next change to the instance) settles it.
+            let ctx = Ctx::for_testing(guard_dir.path().to_path_buf());
+            let outcomes = recover_with_receipts(&ctx.lock_manager, "inst", &inst, &conn);
+            assert_eq!(outcomes.len(), 1, "{boundary:?}: {outcomes:?}");
+            let baseline = list_instance_pack_files(&conn, "inst").unwrap();
+            if committed {
+                assert!(
+                    matches!(outcomes[0], StagedRecovery::Finished { .. }),
+                    "{boundary:?}"
+                );
+                assert_eq!(fs::read(inst.join("mods/packmod.jar")).unwrap(), b"packB");
+                assert_eq!(baseline.len(), 1, "{boundary:?}");
+                assert_eq!(baseline[0].sha256, sha2_256_hex(b"packB"), "{boundary:?}");
+            } else {
+                assert!(
+                    matches!(outcomes[0], StagedRecovery::RolledBack { .. }),
+                    "{boundary:?}"
+                );
+                assert_eq!(fs::read(inst.join("mods/packmod.jar")).unwrap(), b"packA");
+                assert_eq!(
+                    fs::read(inst.join("instance_manifest.json")).unwrap(),
+                    manifest_before,
+                    "{boundary:?}"
+                );
+                assert!(
+                    baseline.is_empty(),
+                    "{boundary:?}: the old (empty) baseline stands"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_pack_update_replaces_a_linked_mod_and_rollback_restores_it() {
         let tmp = TempDir::new().unwrap();
@@ -4706,12 +4838,14 @@ mod tests {
 
         // A normal update replaces the linked file and records its new item.
         let staged = staged_update(b"packB");
-        let (plan, reconciled, _dbtmp, conn) =
+        let (_guard_dir, guard) = test_guard();
+        let (plan, reconciled, _dbtmp, mut conn) =
             update_plan_and_reconcile(&inst, b"packA", staged.path());
         assert_eq!(plan.actions.len(), 1);
         apply_merge(
+            &guard,
             Some(&ctx),
-            &conn,
+            &mut conn,
             "inst",
             &inst,
             staged.path(),
@@ -4755,12 +4889,14 @@ mod tests {
 
         // A failure after the replacement rolls back to the previous file and its entry.
         let staged = staged_update(b"packC");
-        let (plan, reconciled, _dbtmp, conn) =
+        let (_guard_dir, guard) = test_guard();
+        let (plan, reconciled, _dbtmp, mut conn) =
             update_plan_and_reconcile(&inst, b"packB", staged.path());
         PACK_UPDATE_TEST_FAILPOINT.with(|s| *s.borrow_mut() = Some("apply-one"));
         let error = apply_merge(
+            &guard,
             Some(&ctx),
-            &conn,
+            &mut conn,
             "inst",
             &inst,
             staged.path(),
@@ -4793,14 +4929,16 @@ mod tests {
         let ctx = store_ctx(&tmp);
         write(&inst, "mods/packmod.jar", b"packA");
         let staged = staged_update(b"packB");
-        let (plan, reconciled, _dbtmp, conn) =
+        let (_guard_dir, guard) = test_guard();
+        let (plan, reconciled, _dbtmp, mut conn) =
             update_plan_and_reconcile(&inst, b"packA", staged.path());
 
         // The user edits the file after the preview, before the apply.
         write(&inst, "mods/packmod.jar", b"user edit");
         let error = apply_merge(
+            &guard,
             Some(&ctx),
-            &conn,
+            &mut conn,
             "inst",
             &inst,
             staged.path(),
@@ -4886,12 +5024,14 @@ mod tests {
         );
 
         let staged = staged_update(b"packB");
-        let (plan, reconciled, _dbtmp, conn) =
+        let (_guard_dir, guard) = test_guard();
+        let (plan, reconciled, _dbtmp, mut conn) =
             update_plan_and_reconcile(&inst, b"packA", staged.path());
         PACK_UPDATE_TEST_FAILPOINT.with(|s| *s.borrow_mut() = Some("apply-one"));
         let error = apply_merge(
+            &guard,
             Some(&ctx),
-            &conn,
+            &mut conn,
             "inst",
             &inst,
             staged.path(),
@@ -4938,7 +5078,8 @@ mod tests {
         for (rel, bytes) in staged_files {
             write(staged.path(), rel, bytes);
         }
-        let (conn, _dbtmp) = test_conn();
+        let (mut conn, _dbtmp) = test_conn();
+        let (_guard_dir, guard) = test_guard();
         seed_instance_row(&conn, "inst");
         let old_manifest = helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
         let mut resolutions = BTreeMap::new();
@@ -4954,8 +5095,9 @@ mod tests {
         )
         .unwrap();
         apply_merge(
+            &guard,
             None,
-            &conn,
+            &mut conn,
             "inst",
             inst,
             staged.path(),
@@ -5078,12 +5220,14 @@ mod tests {
         );
 
         let staged = staged_update(b"packB");
-        let (plan, reconciled, _dbtmp, conn) =
+        let (_guard_dir, guard) = test_guard();
+        let (plan, reconciled, _dbtmp, mut conn) =
             update_plan_and_reconcile(&inst, b"packA", staged.path());
         PACK_UPDATE_TEST_FAILPOINT.with(|s| *s.borrow_mut() = Some("apply-one"));
         apply_merge(
+            &guard,
             Some(&ctx),
-            &conn,
+            &mut conn,
             "inst",
             &inst,
             staged.path(),
@@ -5138,7 +5282,9 @@ mod tests {
             "precondition: the config folder has no delete-child right"
         );
 
-        remove_instance_file(&inst, &config_dir.join("foo.toml")).unwrap();
+        let config_file = config_dir.join("foo.toml");
+        grant_delete_if_managed(&inst, &config_file).unwrap();
+        std::fs::remove_file(&config_file).unwrap();
 
         let after = crate::content_bridge::folder_grants_delete_child(&config_dir);
         assert_eq!(
