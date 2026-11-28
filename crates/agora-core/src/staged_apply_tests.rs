@@ -1154,3 +1154,45 @@ fn an_apply_whose_committed_record_cannot_be_written_is_put_back() {
     assert_eq!(tree(&root), old_tree());
     no_stage_left(&root);
 }
+
+// ---------------------------------------------------------------------------
+// 9. What a staged file is made from
+// ---------------------------------------------------------------------------
+
+fn read_only_source(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+    let source = dir.join(name);
+    fs::write(&source, bytes).unwrap();
+    let mut permissions = fs::metadata(&source).unwrap().permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&source, permissions).unwrap();
+    source
+}
+
+#[test]
+fn a_read_only_source_is_staged_as_an_ordinary_file() {
+    let (dir, ctx, root) = fixture();
+    let copied = read_only_source(dir.path(), "copied.jar", b"copied");
+    let moved = read_only_source(dir.path(), "moved.jar", b"moved");
+    let guard = guard(&ctx);
+    let mut stage = Stage::begin(&guard, &root).unwrap();
+    stage
+        .write_from(&rel("mods/copied.jar"), &copied, Expect::Absent)
+        .unwrap();
+    stage
+        .write_moving(&rel("mods/moved.jar"), &moved, Expect::Absent)
+        .unwrap();
+    stage.commit().unwrap();
+
+    for (name, bytes) in [
+        ("mods/copied.jar", b"copied".as_slice()),
+        ("mods/moved.jar", b"moved"),
+    ] {
+        let live = root.join(name);
+        assert_eq!(fs::read(&live).unwrap(), bytes);
+        assert!(
+            !fs::metadata(&live).unwrap().permissions().readonly(),
+            "{name} is Agora's to replace or remove later, so it is not read-only"
+        );
+    }
+    no_stage_left(&root);
+}

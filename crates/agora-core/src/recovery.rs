@@ -313,6 +313,9 @@ pub(crate) fn move_file_below(base: &Path, from: &Path, to: &Path) -> LauncherRe
                         return Ok(None);
                     }
                     std::fs::create_dir(&current).map_err(|error| path_error(&current, error))?;
+                    // The new folder's own entry, so a power cut cannot leave a move into a folder
+                    // its parent never recorded.
+                    sync_parent(&current).map_err(|error| path_error(&current, error))?;
                     continue;
                 }
                 Err(error) => return Err(path_error(&current, error)),
@@ -350,6 +353,55 @@ pub(crate) fn move_file_below(base: &Path, from: &Path, to: &Path) -> LauncherRe
     sync_parent(from).map_err(|error| path_error(from, error))
 }
 
+/// `rename`, refused by the OS itself when `to` exists: a check beforehand alone leaves a moment in
+/// which a file another program creates there would be replaced.
+#[cfg(not(windows))]
+fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c = |path: &Path| {
+            std::ffi::CString::new(path.as_os_str().as_bytes())
+                .map_err(|_| std::io::Error::other("a path holds a nul byte"))
+        };
+        let (source, destination) = (c(from)?, c(to)?);
+        // SAFETY: both strings are nul-terminated and live through the call.
+        #[cfg(target_os = "linux")]
+        let done = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        // SAFETY: as above.
+        #[cfg(target_os = "macos")]
+        let done =
+            unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+        if done == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        // A filesystem without the call (some network and FUSE ones) falls back to the check.
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL | libc::ENOSYS | libc::ENOTSUP)
+        ) {
+            return Err(error);
+        }
+    }
+    match std::fs::symlink_metadata(to) {
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} exists", to.display()),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::rename(from, to),
+        Err(error) => Err(error),
+    }
+}
+
 /// Move a directory and persist the changed entries before advancing a journal.
 pub(crate) fn rename_directory(from: &Path, to: &Path) -> std::io::Result<()> {
     durable_rename(from, to, false)
@@ -384,8 +436,11 @@ pub(crate) fn durable_rename(from: &Path, to: &Path, replace: bool) -> std::io::
     }
     #[cfg(not(windows))]
     {
-        let _ = replace;
-        std::fs::rename(from, to)?;
+        if replace {
+            std::fs::rename(from, to)?;
+        } else {
+            rename_no_replace(from, to)?;
+        }
     }
     sync_parent(to)?;
     if from.parent() != to.parent() {
@@ -1560,16 +1615,29 @@ impl<'a, S> RecoveryCapability<'a, S> {
         }
     }
 
-    /// Finish the operation: remove the ownership markers, then delete the journal — last, so a
-    /// crash before this point still recovers.
+    /// Finish the operation: delete the journal, then remove the ownership markers.
     ///
-    /// A marker that cannot be removed is reported; the journal is still deleted, because the
-    /// operation is over and a journal left behind would be recovered again over a finished job.
+    /// The work is done by now, so the order only matters to a crash between the two. Journal first
+    /// leaves at worst a marker no journal names, which proves nothing and is cleared as an orphan;
+    /// markers first would leave a journal whose proof is gone, which no recovery can act on.
+    ///
+    /// A marker that cannot be removed is reported; the journal is deleted all the same, because
+    /// the operation is over and a journal left behind would be recovered again over a finished job.
     pub fn finish(self) -> LauncherResult<()> {
         let journal_path = self
             .journal_path
             .as_deref()
             .ok_or_else(|| journal_error("the journal must be finished in its own store".into()))?;
+        match std::fs::remove_file(journal_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(journal_error(format!(
+                    "could not remove the journal {}: {error}",
+                    journal_path.display()
+                )))
+            }
+        }
         let mut first_error = None;
         for marker in &self.markers {
             match std::fs::remove_file(marker) {
@@ -1583,16 +1651,6 @@ impl<'a, S> RecoveryCapability<'a, S> {
                         )));
                     }
                 }
-            }
-        }
-        match std::fs::remove_file(journal_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(journal_error(format!(
-                    "could not remove the journal {}: {error}",
-                    journal_path.display()
-                )))
             }
         }
         match first_error {
@@ -1729,6 +1787,21 @@ mod tests {
             owned: Vec::new(),
             state: TestState::Starting,
         }
+    }
+
+    #[test]
+    fn a_move_that_must_not_replace_never_replaces_whatever_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let (from, to) = (dir.path().join("from"), dir.path().join("to"));
+        std::fs::write(&from, b"moving").unwrap();
+        std::fs::write(&to, b"already there").unwrap();
+
+        assert!(durable_rename(&from, &to, false).is_err());
+
+        assert_eq!(std::fs::read(&to).unwrap(), b"already there");
+        assert_eq!(std::fs::read(&from).unwrap(), b"moving");
+        durable_rename(&from, &dir.path().join("free"), false).unwrap();
+        assert_eq!(std::fs::read(dir.path().join("free")).unwrap(), b"moving");
     }
 
     #[test]

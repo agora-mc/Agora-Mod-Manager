@@ -341,6 +341,9 @@ impl<'g> Stage<'g> {
         let operation = envelope.operation_id.clone();
         let dir = stage_dir(root, &operation);
         std::fs::create_dir_all(&dir).map_err(|error| io(&dir, error))?;
+        // Both folders' entries, so a power cut cannot lose the stage its journal names.
+        recovery::sync_parent(&dir).map_err(|error| io(&dir, error))?;
+        recovery::sync_parent(&stage_root(root)).map_err(|error| io(root, error))?;
         let marker = dir.join(MARKER);
         recovery::write_marker(&marker, &operation)?;
         let marked = |path: &Path| -> LauncherResult<OwnedPath> {
@@ -406,8 +409,7 @@ impl<'g> Stage<'g> {
         self.claim(path)?;
         let staged = self.new_name("new");
         let file = self.dir.join(&staged);
-        std::fs::copy(source, &file).map_err(|error| io(source, error))?;
-        sync_file(&file)?;
+        copy_synced(source, &file)?;
         self.pending.push(Pending::Write {
             path: path.clone(),
             staged,
@@ -428,9 +430,13 @@ impl<'g> Stage<'g> {
         self.claim(path)?;
         let staged = self.new_name("new");
         let file = self.dir.join(&staged);
-        if std::fs::rename(source, &file).is_err() {
-            std::fs::copy(source, &file).map_err(|error| io(source, error))?;
+        if std::fs::rename(source, &file).is_ok() {
+            // The caller may not have synced it: it is part of the change now, so make it durable,
+            // and make it an ordinary file Agora can replace or remove later.
+            writable(&file)?;
             sync_file(&file)?;
+        } else {
+            copy_synced(source, &file)?;
             std::fs::remove_file(source).map_err(|error| io(source, error))?;
         }
         self.pending.push(Pending::Write {
@@ -1668,6 +1674,35 @@ fn write_synced(path: &Path, bytes: &[u8]) -> LauncherResult<()> {
     let mut file = std::fs::File::create(path).map_err(|error| io(path, error))?;
     file.write_all(bytes).map_err(|error| io(path, error))?;
     file.sync_all().map_err(|error| io(path, error))
+}
+
+/// Copy `source` to a new file at `path` and make it durable. The copy is a new ordinary file: it
+/// does not take the source's read-only bit (std::fs::copy does, and then cannot sync it).
+fn copy_synced(source: &Path, path: &Path) -> LauncherResult<()> {
+    let mut from = std::fs::File::open(source).map_err(|error| io(source, error))?;
+    let mut to = std::fs::File::create(path).map_err(|error| io(path, error))?;
+    std::io::copy(&mut from, &mut to).map_err(|error| io(path, error))?;
+    to.sync_all().map_err(|error| io(path, error))
+}
+
+/// Clear a staged file's read-only bit.
+fn writable(path: &Path) -> LauncherResult<()> {
+    let mut permissions = std::fs::metadata(path)
+        .map_err(|error| io(path, error))?
+        .permissions();
+    if permissions.readonly() {
+        // Only the owner's write bit: `set_readonly(false)` on Unix would let everyone write it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(permissions.mode() | 0o200);
+        }
+        #[cfg(not(unix))]
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(path, permissions).map_err(|error| io(path, error))?;
+    }
+    Ok(())
 }
 
 fn sync_file(path: &Path) -> LauncherResult<()> {
