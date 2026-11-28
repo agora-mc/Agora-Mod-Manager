@@ -2,11 +2,17 @@
 
 use crate::clone::ClonePrefs;
 use crate::loader_service::LoaderService;
-use agora_core::db::instance_id_exists;
+use agora_core::db::{self, instance_id_exists};
 use agora_core::error::{LauncherError, LauncherResult};
 use agora_core::event_sink::{CoreEvent, EventStatus, ProgressEvent, ProgressPhase};
 use agora_core::models::{InstanceManifest, InstanceRow};
-use agora_core::{ctx::Ctx, lock_manager::LockResource, staged_apply::new_instance};
+use agora_core::{
+    ctx::Ctx,
+    helpers::hash_file_sha256,
+    instance_runtime::InstanceGuard,
+    lock_manager::LockResource,
+    staged_apply::{new_instance, Expect, Stage},
+};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -319,6 +325,48 @@ impl InstanceService {
     /// A `None` field means "leave the instance's own value alone", so a
     /// profile that only pins heap size does not silently reset a GC choice
     /// the user made per instance. Returns whether anything changed.
+    /// What applying `jvm` to the instance would write, checked, or `None` when the template sets
+    /// nothing. The same resolution as [`Self::apply_template_jvm`], without writing.
+    fn resolve_template_jvm(
+        &self,
+        instance_id: &str,
+        jvm: &crate::template_service::TemplateJvm,
+    ) -> LauncherResult<Option<TemplateJvmChange>> {
+        if jvm.is_empty() {
+            return Ok(None);
+        }
+        agora_core::settings::admit_major_action(&self.ctx)?;
+        let conn = self.connection()?;
+        let row = db::get_instance(&conn, instance_id)
+            .map_err(|error| LauncherError::Generic {
+                code: "ERR_LOCAL_STATE_FAILED".into(),
+                message: error.to_string(),
+            })?
+            .ok_or_else(|| LauncherError::Generic {
+                code: "ERR_INSTANCE_NOT_FOUND".into(),
+                message: format!("Instance '{instance_id}' not found"),
+            })?;
+        let memory_mb = jvm.jvm_memory_mb.unwrap_or(row.jvm_memory_mb);
+        let gc = jvm.jvm_gc.clone().unwrap_or_else(|| row.jvm_gc.clone());
+        Ok(Some(TemplateJvmChange {
+            memory_mb,
+            gc: checked_jvm(memory_mb, &gc)?,
+            always_pre_touch: jvm.jvm_always_pre_touch.unwrap_or(row.jvm_always_pre_touch),
+            custom_args: jvm
+                .jvm_custom_args
+                .clone()
+                .unwrap_or_else(|| row.jvm_custom_args.clone()),
+            memory_mode: jvm
+                .jvm_memory_mode
+                .clone()
+                .unwrap_or_else(|| row.jvm_memory_mode.clone()),
+            java: jvm
+                .java_path
+                .clone()
+                .map(|java_path| (java_path, row.java_incompatible_override)),
+        }))
+    }
+
     pub fn apply_template_jvm(
         &self,
         instance_id: &str,
@@ -400,10 +448,10 @@ impl InstanceService {
         )?;
         let instance_dir = self.ctx.paths.instance_dir(&instance_id)?;
 
-        let _lock = self.ctx.lock_manager.acquire(
-            agora_core::lock_manager::LockResource::Instance(instance_id.clone()),
-            "apply_template",
-        )?;
+        // The guard, not only the lock: an interrupted change is settled before anything is read.
+        // A template has always applied while the game runs, so it still may.
+        let guard =
+            InstanceGuard::for_mutation_while_running(&self.ctx, &instance_id, "apply_template")?;
 
         // Nothing to do is not a failure, and must not cost a snapshot.
         if template.jvm.is_empty() && template.files.is_empty() {
@@ -420,8 +468,7 @@ impl InstanceService {
             message,
         };
 
-        // Only the file half can leave the instance visibly half-changed, so
-        // that is what the snapshot has to cover.
+        // An undo point the user can restore; the apply itself is all or nothing without it.
         let undo_snapshot_id = if template.files.is_empty() {
             None
         } else {
@@ -436,37 +483,46 @@ impl InstanceService {
             )
         };
 
-        let files_applied = match crate::template_service::apply_template_files(
-            templates_root,
-            template_id,
-            &instance_dir,
-        ) {
-            Ok(applied) => applied,
-            Err(message) => {
-                if let Some(snapshot_id) = undo_snapshot_id.as_deref() {
-                    let _ = agora_core::snapshot::restore_snapshot(
-                        &instance_dir,
-                        snapshot_id,
-                        crate::snapshot_scope::tracked_entries(),
-                    );
-                }
-                return Err(template_error(message));
-            }
-        };
+        // Everything is decided and checked before anything changes.
+        let jvm = self.resolve_template_jvm(&instance_id, &template.jvm)?;
+        let sources = crate::template_service::template_sources(templates_root, template_id)
+            .map_err(template_error)?;
 
-        let jvm_applied = match self.apply_template_jvm(&instance_id, &template.jvm) {
-            Ok(applied) => applied,
-            Err(error) => {
-                if let Some(snapshot_id) = undo_snapshot_id.as_deref() {
-                    let _ = agora_core::snapshot::restore_snapshot(
-                        &instance_dir,
-                        snapshot_id,
-                        crate::snapshot_scope::tracked_entries(),
-                    );
-                }
-                return Err(error);
+        // One staged apply (MASTER_SPEC §32.4): the files are staged, then moved in, and the JVM
+        // settings with the apply's receipt are the commit point, so the files and the settings
+        // change together or not at all.
+        let mut conn = self.connection()?;
+        let mut stage = Stage::begin_with_receipts(&guard, &instance_dir, &conn)?;
+        for (relative, src) in &sources {
+            let path = agora_game_api::RelPath::strict(relative.as_str()).map_err(|error| {
+                template_error(format!(
+                    "'{relative}' cannot be a file in an instance: {error}"
+                ))
+            })?;
+            let live = instance_dir.join(relative);
+            // A template replaces what is there: today's bytes are what it replaces, and they stay
+            // in the undo snapshot. A file that changes before the commit is kept aside instead.
+            let expect = if live.is_file() {
+                Expect::Agora(hash_file_sha256(&live).map_err(|error| {
+                    template_error(format!("Cannot read '{relative}': {error}"))
+                })?)
+            } else {
+                Expect::Absent
+            };
+            stage.write_from(&path, src, expect)?;
+        }
+        stage.commit_with_receipt(&mut conn, |tx| match &jvm {
+            Some(jvm) => jvm.write(tx, &instance_id),
+            None => Ok(()),
+        })?;
+        let files_applied = sources.len();
+        let jvm_applied = jvm.is_some();
+        if let Some(jvm) = &jvm {
+            self.record_change(&instance_id, "update_jvm");
+            if jvm.java.is_some() {
+                self.record_change(&instance_id, "update_java");
             }
-        };
+        }
 
         // Config changes are exactly the kind of drift the pre-launch snapshot
         // reuse check must notice.
@@ -476,7 +532,7 @@ impl InstanceService {
             jvm_applied,
             files_applied,
             // A file recorded in the template but absent on disk is skipped by
-            // `apply_template_files`. Counting the difference is what lets the
+            // `template_sources`. Counting the difference is what lets the
             // UI say the template is damaged instead of quietly under-applying.
             files_missing: template.files.len().saturating_sub(files_applied),
             undo_snapshot_id,
@@ -494,25 +550,7 @@ impl InstanceService {
     ) -> LauncherResult<()> {
         agora_core::settings::admit_major_action(&self.ctx)?;
         let instance_id = self.validate_id(instance_id)?;
-        if !crate::gc::memory_mb_is_possible(memory_mb) {
-            return Err(LauncherError::Generic {
-                code: "ERR_INVALID_JVM_MEMORY".into(),
-                message: format!(
-                    "Heap size must be a positive number of megabytes the JVM can represent (at most {} MB); got {memory_mb} MB.",
-                    crate::gc::JVM_MAX_HEAP_MB
-                ),
-            });
-        }
-        let gc_selection = crate::gc::GcSelection::from_input(gc).ok_or_else(|| {
-            LauncherError::Generic {
-                code: "ERR_INVALID_JVM_GC".into(),
-                message: format!(
-                    "Unsupported JVM GC selection '{}'. Expected auto, low_latency, high_efficiency, or manual.",
-                    gc.trim()
-                ),
-            }
-        })?;
-        let gc = gc_selection.as_str();
+        let gc = checked_jvm(memory_mb, gc)?;
         let conn = self.connection()?;
         let _row = agora_core::db::get_instance(&conn, &instance_id)
             .map_err(|error| LauncherError::Generic {
@@ -2099,6 +2137,69 @@ fn manifest_has_file(manifest: &InstanceManifest, filename: &str) -> bool {
 /// Fill unset JVM fields on a create request from a template.
 ///
 /// One-directional on purpose: the template is a default, never an override.
+/// Check a heap size and a GC selection, and give the GC's stored name.
+fn checked_jvm(memory_mb: i64, gc: &str) -> LauncherResult<&'static str> {
+    if !crate::gc::memory_mb_is_possible(memory_mb) {
+        return Err(LauncherError::Generic {
+            code: "ERR_INVALID_JVM_MEMORY".into(),
+            message: format!(
+                "Heap size must be a positive number of megabytes the JVM can represent (at most {} MB); got {memory_mb} MB.",
+                crate::gc::JVM_MAX_HEAP_MB
+            ),
+        });
+    }
+    let gc_selection = crate::gc::GcSelection::from_input(gc).ok_or_else(|| LauncherError::Generic {
+        code: "ERR_INVALID_JVM_GC".into(),
+        message: format!(
+            "Unsupported JVM GC selection '{}'. Expected auto, low_latency, high_efficiency, or manual.",
+            gc.trim()
+        ),
+    })?;
+    Ok(gc_selection.as_str())
+}
+
+/// A template's JVM settings, resolved against the instance's row and checked: what applying them
+/// writes, inside the apply's transaction.
+struct TemplateJvmChange {
+    memory_mb: i64,
+    gc: &'static str,
+    always_pre_touch: bool,
+    custom_args: String,
+    memory_mode: String,
+    /// The Java binary and the row's incompatible-override flag, when the template names one.
+    java: Option<(String, bool)>,
+}
+
+impl TemplateJvmChange {
+    fn write(&self, tx: &rusqlite::Transaction<'_>, instance_id: &str) -> LauncherResult<()> {
+        let failed = |error: anyhow::Error| LauncherError::Generic {
+            code: "ERR_LOCAL_STATE_FAILED".into(),
+            message: error.to_string(),
+        };
+        db::update_instance_jvm(
+            tx,
+            instance_id,
+            self.memory_mb,
+            self.gc,
+            self.always_pre_touch,
+            &self.custom_args,
+            &self.memory_mode,
+        )
+        .map_err(failed)?;
+        if let Some((java_path, allow_incompatible)) = &self.java {
+            db::update_instance_java(
+                tx,
+                instance_id,
+                Some(java_path.as_str()),
+                *allow_incompatible,
+                None,
+            )
+            .map_err(failed)?;
+        }
+        Ok(())
+    }
+}
+
 fn apply_template_jvm_to_request(
     request: &mut CreateInstanceRequest,
     jvm: &crate::template_service::TemplateJvm,
@@ -2926,6 +3027,108 @@ mod tests {
             "fabric-loader-0.19.3-26.2"
         );
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An instance with a row and `options.txt`, and a template holding a different
+    /// `options.txt` and a heap size.
+    fn instance_and_template(ctx: &Ctx, root: &Path) -> PathBuf {
+        let request = CreateInstanceRequest {
+            name: "Target".into(),
+            instance_id: "target".into(),
+            minecraft_version: "1.21".into(),
+            loader: "vanilla".into(),
+            loader_version: "".into(),
+            jvm_memory_mb: Some(2048),
+            jvm_memory_mode: None,
+            jvm_gc: None,
+            jvm_custom_args: None,
+            jvm_always_pre_touch: None,
+            is_modpack: None,
+            pack_icon_url: None,
+            template_id: None,
+        };
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        db::upsert_instance(&conn, crate::GAME_ID, &prepare_row("target", &request)).unwrap();
+        let dir = ctx.paths.instance_dir("target").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("options.txt"), b"fov:70").unwrap();
+        std::fs::write(
+            ctx.paths.instance_manifest("target").unwrap(),
+            serde_json::to_vec(&manifest_from_request("target", &request)).unwrap(),
+        )
+        .unwrap();
+
+        let source = root.join("template-source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("options.txt"), b"fov:90").unwrap();
+        let templates = root.join("templates");
+        crate::template_service::create_template(
+            &templates,
+            crate::template_service::CreateTemplateRequest {
+                id: "starter",
+                name: "Starter",
+                description: None,
+                jvm: crate::template_service::TemplateJvm {
+                    jvm_memory_mb: Some(6144),
+                    ..crate::template_service::TemplateJvm::default()
+                },
+                source_instance_dir: Some(&source),
+                selected_paths: &["options.txt".into()],
+                now: "2026-11-28T00:00:00Z",
+            },
+        )
+        .unwrap();
+        templates
+    }
+
+    fn heap(ctx: &Ctx) -> i64 {
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        db::get_instance(&conn, "target")
+            .unwrap()
+            .unwrap()
+            .jvm_memory_mb
+    }
+
+    #[test]
+    fn a_template_applies_its_files_and_its_settings_together() {
+        let (ctx, root) = context();
+        let templates = instance_and_template(&ctx, &root);
+
+        let outcome = InstanceService::new(ctx.clone())
+            .apply_template("target", &templates, "starter")
+            .unwrap();
+
+        assert!(outcome.jvm_applied);
+        assert_eq!(outcome.files_applied, 1);
+        let dir = ctx.paths.instance_dir("target").unwrap();
+        assert_eq!(std::fs::read(dir.join("options.txt")).unwrap(), b"fov:90");
+        assert_eq!(heap(&ctx), 6144);
+        assert!(!dir.join(".agora_stage").exists(), "no stage is left");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The settings are the commit point: when they cannot be written, no file is changed either.
+    #[test]
+    fn a_template_whose_settings_cannot_be_written_changes_no_file() {
+        let (ctx, root) = context();
+        let templates = instance_and_template(&ctx, &root);
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_jvm BEFORE UPDATE ON minecraft_instances
+             BEGIN SELECT RAISE(ABORT, 'the disk is full'); END;",
+        )
+        .unwrap();
+
+        let error = InstanceService::new(ctx.clone())
+            .apply_template("target", &templates, "starter")
+            .unwrap_err();
+
+        assert!(error.to_string().contains("disk is full"), "{error}");
+        let dir = ctx.paths.instance_dir("target").unwrap();
+        assert_eq!(std::fs::read(dir.join("options.txt")).unwrap(), b"fov:70");
+        conn.execute_batch("DROP TRIGGER refuse_jvm").unwrap();
+        assert_eq!(heap(&ctx), 2048);
         let _ = std::fs::remove_dir_all(root);
     }
 

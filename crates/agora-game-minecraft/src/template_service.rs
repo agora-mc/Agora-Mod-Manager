@@ -536,29 +536,38 @@ pub fn delete_template(root: &Path, id: &str) -> Result<(), String> {
 /// Paths are re-validated here rather than trusted from `template.json`, since
 /// a template directory can be edited or copied in from elsewhere.
 pub fn apply_template_files(root: &Path, id: &str, dest_dir: &Path) -> Result<usize, String> {
-    let template = get_template(root, id)?;
-    let files_root = template_dir(root, id)?.join("files");
-    let mut applied = 0usize;
-    for file in &template.files {
-        let src = join_validated(&files_root, &file.relative_path)?;
-        let metadata = match fs::symlink_metadata(&src) {
-            Ok(metadata) => metadata,
-            // A file recorded but missing on disk is a damaged template, not a
-            // reason to abort: apply what is there and report the count.
-            Err(_) => continue,
-        };
-        if helpers::unsafe_filesystem_entry(&src) || !metadata.is_file() {
-            continue;
-        }
-        let dst = join_validated(dest_dir, &file.relative_path)?;
+    let sources = template_sources(root, id)?;
+    for (relative_path, src) in &sources {
+        let dst = join_validated(dest_dir, relative_path)?;
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("Cannot create '{}': {e}", parent.display()))?;
         }
-        fs::copy(&src, &dst).map_err(|e| format!("Cannot apply '{}': {e}", file.relative_path))?;
-        applied += 1;
+        fs::copy(src, &dst).map_err(|e| format!("Cannot apply '{relative_path}': {e}"))?;
     }
-    Ok(applied)
+    Ok(sources.len())
+}
+
+/// The template's files that are there to apply, as (instance-relative path, stored copy). A file
+/// the template recorded whose copy is missing, or is not a plain file, is a damaged template, not
+/// a reason to abort: it is left out, and the caller reports the difference.
+pub fn template_sources(root: &Path, id: &str) -> Result<Vec<(String, PathBuf)>, String> {
+    let template = get_template(root, id)?;
+    let files_root = template_dir(root, id)?.join("files");
+    let mut sources = Vec::new();
+    for file in &template.files {
+        let src = join_validated(&files_root, &file.relative_path)?;
+        let metadata = match fs::symlink_metadata(&src) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("Cannot read '{}': {error}", file.relative_path)),
+        };
+        if helpers::unsafe_filesystem_entry(&src) || !metadata.is_file() {
+            continue;
+        }
+        sources.push((file.relative_path.clone(), src));
+    }
+    Ok(sources)
 }
 
 #[cfg(test)]
