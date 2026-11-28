@@ -1210,27 +1210,68 @@ impl PackBackend for CoreBackend {
             };
             return installed.map(installed_file).map_err(install_error);
         }
+        let request = pack_install_request(
+            instance_id,
+            candidate,
+            expected_sha256,
+            required_sha256,
+            self.accept_pack_hash,
+        )
+        .map_err(install_error)?;
         installer
-            .install_artifact_pinned(
-                instance_id,
-                &candidate.filename,
-                &candidate.content_type,
-                &candidate.download_url,
-                candidate.registry_id.as_deref(),
-                candidate.modrinth_id.as_deref(),
-                &candidate.source,
-                Some(&candidate.version),
-                candidate.sha1.as_deref(),
-                expected_sha256,
-                required_sha256,
-                candidate.sha512.as_deref(),
-                candidate.curator_pin.as_deref(),
-                self.accept_pack_hash,
-            )
+            .install_artifact(&request)
             .await
             .map(installed_file)
             .map_err(install_error)
     }
+}
+
+/// A catalog candidate of a pack, as an install request. Its hash strings are
+/// parsed here, before anything is downloaded: a blank or malformed one is an
+/// error, never "none published".
+fn pack_install_request(
+    instance_id: &str,
+    candidate: &PackCandidate,
+    expected_sha256: Option<&str>,
+    required_sha256: Option<&str>,
+    accept_hash_confirmation: bool,
+) -> LauncherResult<crate::install_service::InstallRequest> {
+    use crate::install_service::{ExpectedHashes, InstallRequest, InstallSource, InstallTarget};
+    let file = candidate.filename.as_str();
+    let registry_id = match (candidate.source.as_str(), &candidate.registry_id) {
+        ("registry", Some(id)) => id.clone(),
+        _ => {
+            return Err(LauncherError::Generic {
+                code: "ERR_PACK_ENTRY_SOURCE".into(),
+                message: format!(
+                "'{file}' is neither a catalog entry nor a Modrinth version; it was not installed."
+            ),
+            })
+        }
+    };
+    let hashes = ExpectedHashes::published(
+        file,
+        candidate.sha1.as_deref(),
+        expected_sha256,
+        candidate.sha512.as_deref(),
+    )?
+    .with_pack_hash(file, required_sha256)?
+    .with_curator_pin(file, candidate.curator_pin.as_deref())?;
+    Ok(InstallRequest {
+        instance_id: instance_id.to_string(),
+        target: InstallTarget {
+            filename: candidate.filename.clone(),
+            content_type: candidate.content_type.clone(),
+            version: Some(candidate.version.clone()),
+            download_url: candidate.download_url.clone(),
+        },
+        source: InstallSource::Catalog {
+            registry_id,
+            modrinth_id: candidate.modrinth_id.clone(),
+        },
+        hashes,
+        accept_hash_confirmation,
+    })
 }
 
 fn installed_file(installed: InstalledMod) -> InstalledFile {
@@ -1242,9 +1283,8 @@ fn installed_file(installed: InstalledMod) -> InstalledFile {
 
 fn describe_install_error(error: LauncherError) -> String {
     match error {
-        LauncherError::HashMismatch => "The downloaded file does not match the SHA-256 \
-            hash its source published (or the hash the pack lists is not a valid SHA-256). \
-            It was not installed."
+        LauncherError::HashMismatch => "The downloaded file does not match the hash its \
+            source published. It was not installed."
             .to_string(),
         other => other.to_string(),
     }
@@ -1713,6 +1753,7 @@ pub async fn retry_agora_pack_entries_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::install_service::{ExpectedHashes, InstallRequest, InstallSource, InstallTarget};
     use agora_core::download::{sha1_hex, sha256_hex, sha512_hex};
     use agora_core::helpers::read_manifest;
     use std::sync::Mutex;
@@ -2269,20 +2310,21 @@ mod tests {
                 .unwrap();
         crate::install_service::InstallService::new(ctx.clone()).commit_verified_artifact(
             &guard,
-            "inst",
-            "m.jar",
-            "mod",
-            "https://cdn.modrinth.com/m.jar",
-            None,
-            Some("proj"),
-            "modrinth_raw",
-            Some("1"),
-            sha1,
-            None,
-            required,
-            sha512,
-            None,
-            accept,
+            &InstallRequest {
+                instance_id: "inst".into(),
+                target: InstallTarget {
+                    filename: "m.jar".into(),
+                    content_type: "mod".into(),
+                    version: Some("1".into()),
+                    download_url: "https://cdn.modrinth.com/m.jar".into(),
+                },
+                source: InstallSource::Modrinth {
+                    project_id: "proj".into(),
+                },
+                hashes: ExpectedHashes::published("m.jar", sha1, None, sha512)?
+                    .with_pack_hash("m.jar", required)?,
+                accept_hash_confirmation: accept,
+            },
             bytes.to_vec(),
         )
     }
@@ -2508,7 +2550,8 @@ mod tests {
                 let (ctx, root) = temp_ctx_with_instance();
                 let err =
                     commit_full(&ctx, bytes, Some(&sha1), Some(bad), None, accept).unwrap_err();
-                assert_eq!(err.code(), "ERR_HASH_MISMATCH", "{bad:?} accept={accept}");
+                // Malformed is its own refusal, not a mismatch: the file was never compared.
+                assert_eq!(err.code(), "ERR_HASH_MALFORMED", "{bad:?} accept={accept}");
                 assert!(!mod_on_disk(&ctx), "{bad:?} wrote a file");
                 let _ = std::fs::remove_dir_all(root);
             }
@@ -2766,6 +2809,145 @@ mod tests {
         }
     }
 
+    /// MASTER_SPEC §32.5: a hash an install request carries is parsed when the request is built,
+    /// before anything is downloaded. Blank is an error, never "none published"; malformed is an
+    /// error, never a pin the user can wave through.
+    #[test]
+    fn a_catalog_request_refuses_a_blank_or_malformed_hash_before_any_download() {
+        let github = catalog_item("github_release", None, None);
+        // GitHub's digest field read as "sha256:" is a blank published hash.
+        let mut blank_digest = served("github_release", None);
+        blank_digest.sha256 = Some(String::new());
+        let error =
+            InstallRequest::for_catalog_candidate("inst", &github, &blank_digest).unwrap_err();
+        assert_eq!(error.code(), "ERR_ASSERTED_HASH_BLANK", "{error}");
+        assert!(error.to_string().contains("old.jar"), "{error}");
+
+        let mut bad_sha1 = served("modrinth", Some("not-hex"));
+        bad_sha1.sha512 = Some("ab".repeat(64));
+        let modrinth = catalog_item("modrinth", None, None);
+        let error =
+            InstallRequest::for_catalog_candidate("inst", &modrinth, &bad_sha1).unwrap_err();
+        assert_eq!(error.code(), "ERR_HASH_MALFORMED", "{error}");
+
+        let mut bad_sha512 = served("modrinth", Some(&"ab".repeat(20)));
+        bad_sha512.sha512 = Some("  ".into());
+        let error =
+            InstallRequest::for_catalog_candidate("inst", &modrinth, &bad_sha512).unwrap_err();
+        assert_eq!(error.code(), "ERR_ASSERTED_HASH_BLANK", "{error}");
+
+        // A direct_hash entry's own hash is what its file is checked against.
+        let direct = catalog_item("direct_hash", Some("not-a-digest"), None);
+        let error =
+            InstallRequest::for_catalog_candidate("inst", &direct, &served("direct_hash", None))
+                .unwrap_err();
+        assert_eq!(error.code(), "ERR_HASH_MALFORMED", "{error}");
+
+        // A malformed curator pin used to become a pin no file could meet, which "install
+        // anyway" then overrode: an unchecked file. It is refused instead.
+        let pinned = catalog_item(
+            "github_release",
+            None,
+            Some(
+                r#"[{"strategy":"github_release","identifier":"owner/repo","pins":[{"tag":"v1","asset":"old.jar","sha256":"zz"}]}]"#,
+            ),
+        );
+        let error =
+            InstallRequest::for_catalog_candidate("inst", &pinned, &served("github_release", None))
+                .unwrap_err();
+        assert_eq!(error.code(), "ERR_HASH_MALFORMED", "{error}");
+        assert!(error.to_string().contains("curator pin"), "{error}");
+    }
+
+    #[test]
+    fn a_catalog_request_carries_its_parsed_hashes_and_its_source() {
+        let item = catalog_item(
+            "github_release",
+            None,
+            Some(&format!(
+                r#"[{{"strategy":"github_release","identifier":"owner/repo","pins":[{{"tag":"v1","asset":"old.jar","sha256":"{}"}}]}}]"#,
+                CURATOR.to_uppercase()
+            )),
+        );
+        let mut candidate = served("github_release", None);
+        candidate.sha256 = Some(format!(" {} ", "AB".repeat(32)));
+        let request = InstallRequest::for_catalog_candidate("inst", &item, &candidate).unwrap();
+        assert_eq!(
+            request
+                .hashes
+                .published_sha256
+                .as_ref()
+                .map(|d| d.as_str().to_string()),
+            Some("ab".repeat(32))
+        );
+        assert_eq!(
+            request
+                .hashes
+                .curator_sha256
+                .as_ref()
+                .map(|d| d.as_str().to_string()),
+            Some(CURATOR.to_lowercase())
+        );
+        assert_eq!(request.hashes.pack_sha256, None);
+        assert_eq!(request.hashes.published_sha1, None);
+        assert_eq!(request.source.stored_source(), "registry");
+        assert_eq!(
+            request.source,
+            InstallSource::Catalog {
+                registry_id: "oldmod".into(),
+                modrinth_id: None
+            }
+        );
+        assert!(!request.accept_hash_confirmation);
+    }
+
+    #[test]
+    fn a_pack_entry_request_parses_every_hash_and_needs_a_catalog_id() {
+        let candidate = PackCandidate {
+            version: "1".into(),
+            filename: "m.jar".into(),
+            download_url: "https://example.invalid/m.jar".into(),
+            sha1: Some("ab".repeat(20)),
+            sha512: None,
+            expected_sha256: None,
+            curator_pin: None,
+            content_type: "mod".into(),
+            registry_id: Some("oldmod".into()),
+            modrinth_id: None,
+            source: "registry".into(),
+        };
+        let request = pack_install_request("inst", &candidate, None, Some(GOOD_PIN), true).unwrap();
+        assert_eq!(
+            request.hashes.pack_sha256.as_ref().unwrap().as_str(),
+            GOOD_PIN
+        );
+        assert!(request.accept_hash_confirmation);
+
+        for (sha1, pack, curator, code) in [
+            (Some(""), None, None, "ERR_ASSERTED_HASH_BLANK"),
+            (Some("xy"), None, None, "ERR_HASH_MALFORMED"),
+            (None, Some(" "), None, "ERR_ASSERTED_HASH_BLANK"),
+            (None, Some("ab"), None, "ERR_HASH_MALFORMED"),
+            (None, None, Some("\t"), "ERR_ASSERTED_HASH_BLANK"),
+            (None, None, Some("ab"), "ERR_HASH_MALFORMED"),
+        ] {
+            let mut bad = candidate.clone();
+            bad.sha1 = sha1.map(str::to_string);
+            bad.curator_pin = curator.map(str::to_string);
+            let error = pack_install_request("inst", &bad, None, pack, true).unwrap_err();
+            assert_eq!(error.code(), code, "{sha1:?} {pack:?} {curator:?}");
+        }
+
+        let mut no_id = candidate.clone();
+        no_id.registry_id = None;
+        let error = pack_install_request("inst", &no_id, None, None, false).unwrap_err();
+        assert_eq!(error.code(), "ERR_PACK_ENTRY_SOURCE");
+        let mut odd = candidate;
+        odd.source = "curated".into();
+        let error = pack_install_request("inst", &odd, None, None, false).unwrap_err();
+        assert_eq!(error.code(), "ERR_PACK_ENTRY_SOURCE");
+    }
+
     #[test]
     fn the_catalog_hash_is_a_curator_pin_only_when_the_source_published_nothing() {
         let item = catalog_item("curseforge_id", Some(&CURATOR.to_uppercase()), None);
@@ -2928,20 +3110,22 @@ mod tests {
                 .unwrap();
         crate::install_service::InstallService::new(ctx.clone()).commit_verified_artifact(
             &guard,
-            "inst",
-            "m.jar",
-            "mod",
-            "https://cdn.modrinth.com/m.jar",
-            Some("oldmod"),
-            None,
-            "registry",
-            Some("1"),
-            None,
-            None,
-            None,
-            None,
-            Some(pinned),
-            accept,
+            &InstallRequest {
+                instance_id: "inst".into(),
+                target: InstallTarget {
+                    filename: "m.jar".into(),
+                    content_type: "mod".into(),
+                    version: Some("1".into()),
+                    download_url: "https://cdn.modrinth.com/m.jar".into(),
+                },
+                source: InstallSource::Catalog {
+                    registry_id: "oldmod".into(),
+                    modrinth_id: None,
+                },
+                hashes: ExpectedHashes::published("m.jar", None, None, None)?
+                    .with_curator_pin("m.jar", Some(pinned))?,
+                accept_hash_confirmation: accept,
+            },
             bytes.to_vec(),
         )
     }
@@ -2980,20 +3164,26 @@ mod tests {
         let stop = crate::install_service::InstallService::new(ctx.clone())
             .commit_verified_artifact(
                 &guard,
-                "inst",
-                "m.jar",
-                "mod",
-                "https://cdn.modrinth.com/m.jar",
-                Some("oldmod"),
-                None,
-                "registry",
-                Some("1"),
-                None,
-                None,
-                Some(GOOD_PIN),
-                None,
-                Some(CURATOR),
-                false,
+                &InstallRequest {
+                    instance_id: "inst".into(),
+                    target: InstallTarget {
+                        filename: "m.jar".into(),
+                        content_type: "mod".into(),
+                        version: Some("1".into()),
+                        download_url: "https://cdn.modrinth.com/m.jar".into(),
+                    },
+                    source: InstallSource::Catalog {
+                        registry_id: "oldmod".into(),
+                        modrinth_id: None,
+                    },
+                    hashes: ExpectedHashes::published("m.jar", None, None, None)
+                        .unwrap()
+                        .with_pack_hash("m.jar", Some(GOOD_PIN))
+                        .unwrap()
+                        .with_curator_pin("m.jar", Some(CURATOR))
+                        .unwrap(),
+                    accept_hash_confirmation: false,
+                },
                 bytes.to_vec(),
             )
             .unwrap_err();
@@ -3013,20 +3203,26 @@ mod tests {
         let one_met = crate::install_service::InstallService::new(ctx.clone())
             .commit_verified_artifact(
                 &guard,
-                "inst",
-                "m.jar",
-                "mod",
-                "https://cdn.modrinth.com/m.jar",
-                Some("oldmod"),
-                None,
-                "registry",
-                Some("1"),
-                None,
-                None,
-                Some(&actual),
-                None,
-                Some(CURATOR),
-                false,
+                &InstallRequest {
+                    instance_id: "inst".into(),
+                    target: InstallTarget {
+                        filename: "m.jar".into(),
+                        content_type: "mod".into(),
+                        version: Some("1".into()),
+                        download_url: "https://cdn.modrinth.com/m.jar".into(),
+                    },
+                    source: InstallSource::Catalog {
+                        registry_id: "oldmod".into(),
+                        modrinth_id: None,
+                    },
+                    hashes: ExpectedHashes::published("m.jar", None, None, None)
+                        .unwrap()
+                        .with_pack_hash("m.jar", Some(&actual))
+                        .unwrap()
+                        .with_curator_pin("m.jar", Some(CURATOR))
+                        .unwrap(),
+                    accept_hash_confirmation: false,
+                },
                 bytes.to_vec(),
             )
             .unwrap_err();

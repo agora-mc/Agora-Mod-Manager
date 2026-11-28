@@ -199,33 +199,14 @@ pub async fn install_mod_version(
 ) -> LauncherResult<InstalledMod> {
     let ctx = crate::core_context(app)?;
     let item = load_registry_item(app, item_id)?;
-    let content_type = if item.content_type.is_empty() {
-        "mod"
-    } else {
-        &item.content_type
-    };
-    let exp_sha256 =
-        agora_game_minecraft::agora_pack_import::expected_sha256_for_candidate(&item, candidate)?;
-    let pinned = agora_game_minecraft::resolver::curator_pins_for(&item, candidate)
-        .into_iter()
-        .next()
-        .map(|pin| pin.sha256);
-    let svc = agora_game_minecraft::install_service::InstallService::new(ctx);
-    svc.install_artifact(
+    let mut request = agora_game_minecraft::install_service::InstallRequest::for_catalog_candidate(
         instance_id,
-        &candidate.filename,
-        content_type,
-        &candidate.download_url,
-        Some(item_id),
-        item.modrinth_id.as_deref(),
-        "registry",
-        Some(&candidate.version),
-        candidate.sha1.as_deref(),
-        exp_sha256.as_deref(),
-        pinned.as_deref(),
-        accept_hash_confirmation,
-    )
-    .await
+        &item,
+        candidate,
+    )?;
+    request.accept_hash_confirmation = accept_hash_confirmation;
+    let svc = agora_game_minecraft::install_service::InstallService::new(ctx);
+    svc.install_artifact(&request).await
 }
 
 /// Remove artifact via core InstallService.

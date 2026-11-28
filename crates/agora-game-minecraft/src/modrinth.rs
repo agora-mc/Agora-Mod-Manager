@@ -1566,7 +1566,7 @@ impl ModrinthService {
         }
 
         let expected_sha1 = match candidate.sha1.as_deref() {
-            Some(h) if !h.trim().is_empty() => h.trim().to_lowercase(),
+            Some(h) if !h.trim().is_empty() => h,
             _ => {
                 return Err(LauncherError::Generic {
                     code: "ERR_HASH_UNAVAILABLE".to_string(),
@@ -1582,30 +1582,97 @@ impl ModrinthService {
             project_type
         };
 
-        let svc = InstallService::new(self.ctx.clone());
-        svc.install_artifact_pinned(
-            instance_id,
-            &candidate.filename,
-            content_type,
-            &candidate.download_url,
+        // Parsed before the download: a malformed SHA-1, SHA-512 or pack hash stops here.
+        let file = candidate.filename.as_str();
+        let hashes = crate::install_service::ExpectedHashes::published(
+            file,
+            Some(expected_sha1),
             None,
-            Some(project_id),
-            "modrinth_raw",
-            Some(&candidate.version),
-            Some(&expected_sha1),
-            None,
-            required_sha256,
             candidate.sha512.as_deref(),
-            None,
+        )?
+        .with_pack_hash(file, required_sha256)?;
+        let request = crate::install_service::InstallRequest {
+            instance_id: instance_id.to_string(),
+            target: crate::install_service::InstallTarget {
+                filename: candidate.filename.clone(),
+                content_type: content_type.to_string(),
+                version: Some(candidate.version.clone()),
+                download_url: candidate.download_url.clone(),
+            },
+            source: crate::install_service::InstallSource::Modrinth {
+                project_id: project_id.to_string(),
+            },
+            hashes,
             accept_hash_confirmation,
-        )
-        .await
+        };
+        InstallService::new(self.ctx.clone())
+            .install_artifact(&request)
+            .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MASTER_SPEC §32.5: a malformed hash Modrinth lists is refused before the download. The
+    /// URL is one no request can reach without failing as a network error, so a refusal that came
+    /// after a download attempt would show up as a different error.
+    #[tokio::test]
+    async fn a_malformed_modrinth_hash_is_refused_before_any_download() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = crate::testing_context(root.path().to_owned());
+        let svc = ModrinthService::new(ctx);
+        let good_sha1 = "ab".repeat(20);
+        for (sha1, sha512, pack, code) in [
+            (
+                good_sha1.as_str(),
+                Some("not-hex"),
+                None,
+                "ERR_HASH_MALFORMED",
+            ),
+            (
+                good_sha1.as_str(),
+                Some(" "),
+                None,
+                "ERR_ASSERTED_HASH_BLANK",
+            ),
+            ("ab", None, None, "ERR_HASH_MALFORMED"),
+            (good_sha1.as_str(), None, Some("ab"), "ERR_HASH_MALFORMED"),
+            (
+                good_sha1.as_str(),
+                None,
+                Some(""),
+                "ERR_ASSERTED_HASH_BLANK",
+            ),
+        ] {
+            let candidate = RawModrinthVersionCandidate {
+                version: "1".into(),
+                version_id: String::new(),
+                name: "1".into(),
+                filename: "m.jar".into(),
+                download_url: "https://127.0.0.1/m.jar".into(),
+                sha1: Some(sha1.into()),
+                sha512: sha512.map(str::to_string),
+                size: None,
+                dependencies: Vec::new(),
+                mc_versions: Vec::new(),
+                loaders: Vec::new(),
+                release_date: None,
+                primary: true,
+                changelog: None,
+                is_prerelease: false,
+                version_type: String::new(),
+            };
+            let error = svc
+                .install_raw_modrinth_pinned_unchecked(
+                    "inst", "proj", &candidate, "mod", pack, true,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), code, "{sha1:?} {sha512:?} {pack:?}: {error}");
+        }
+    }
 
     fn exempt() -> Vec<String> {
         LOADER_EXEMPT_PROJECT_TYPES

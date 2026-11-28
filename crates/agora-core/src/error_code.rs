@@ -204,6 +204,7 @@ error_codes! {
     Pack = "ERR_PACK", Install, 1;
     PackChanged = "ERR_PACK_CHANGED", Install, 1;
     PackEmpty = "ERR_PACK_EMPTY", Install, 1;
+    PackEntrySource = "ERR_PACK_ENTRY_SOURCE", Install, 1;
     PackNotReviewed = "ERR_PACK_NOT_REVIEWED", Install, 1;
     PackParse = "ERR_PACK_PARSE", Install, 1;
     PackRead = "ERR_PACK_READ", Install, 1;

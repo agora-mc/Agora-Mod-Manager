@@ -6,6 +6,7 @@
 //! alone.
 
 use super::*;
+use crate::install_service::{ExpectedHashes, InstallRequest, InstallSource, InstallTarget};
 use agora_core::instance_runtime::InstanceGuard as TestGuard;
 
 fn test_guard(ctx: &Ctx, id: &str, label: &str) -> TestGuard {
@@ -53,28 +54,11 @@ fn review_a_blank_curator_pin_is_refused_not_dropped() {
     let source = write_mod_jar(tmp.path(), "blank-pin", "1.0.0");
     let bytes = std::fs::read(&source).unwrap();
     let sha = super::sha256_hex(&bytes);
-    let service = crate::install_service::InstallService::new(ctx.clone());
-    let guard = test_guard(&ctx, "test", "test-blank-curator-pin");
-
-    let error = service
-        .commit_verified_artifact(
-            &guard,
-            "test",
-            "blank-pin.jar",
-            "mod",
-            "https://example.invalid/blank-pin.jar",
-            None,
-            None,
-            "registry",
-            Some("1.0.0"),
-            None,
-            Some(&sha), // the source published a matching hash
-            None,
-            None,
-            Some("   "), // but the curator's pin is blank
-            false,
-            bytes,
-        )
+    // The source published a matching hash, but the curator's pin is blank: the request is
+    // refused while it is built, before anything is downloaded or written.
+    let error = ExpectedHashes::published("blank-pin.jar", None, Some(&sha), None)
+        .unwrap()
+        .with_curator_pin("blank-pin.jar", Some("   "))
         .unwrap_err();
     assert_eq!(error.code(), "ERR_ASSERTED_HASH_BLANK");
     let message = error.to_string();
@@ -101,28 +85,10 @@ fn review_a_blank_pack_hash_is_refused_with_a_named_error() {
     let source = write_mod_jar(tmp.path(), "blank-pack-hash", "1.0.0");
     let bytes = std::fs::read(&source).unwrap();
     let sha = super::sha256_hex(&bytes);
-    let service = crate::install_service::InstallService::new(ctx.clone());
-    let guard = test_guard(&ctx, "test", "test-blank-pack-hash");
-
-    let error = service
-        .commit_verified_artifact(
-            &guard,
-            "test",
-            "blank-pack.jar",
-            "mod",
-            "https://example.invalid/blank-pack.jar",
-            None,
-            None,
-            "registry",
-            Some("1.0.0"),
-            None,
-            Some(&sha),
-            Some("  "), // the pack's hash is blank
-            None,
-            None,
-            false,
-            bytes,
-        )
+    // The pack's hash is blank: refused while the request is built.
+    let error = ExpectedHashes::published("blank-pack.jar", None, Some(&sha), None)
+        .unwrap()
+        .with_pack_hash("blank-pack.jar", Some("  "))
         .unwrap_err();
     assert_eq!(error.code(), "ERR_ASSERTED_HASH_BLANK");
     let message = error.to_string();
@@ -575,20 +541,21 @@ fn a_direct_artifact_install_links_from_the_store() {
     let installed = service
         .commit_verified_artifact(
             &guard,
-            "test",
-            "manual.jar",
-            "mod",
-            "https://example.invalid/manual.jar",
-            None,
-            None,
-            "registry",
-            Some("1.0.0"),
-            None,
-            Some(&sha),
-            None,
-            None,
-            None,
-            false,
+            &InstallRequest {
+                instance_id: "test".into(),
+                target: InstallTarget {
+                    filename: "manual.jar".into(),
+                    content_type: "mod".into(),
+                    version: Some("1.0.0".into()),
+                    download_url: "https://example.invalid/manual.jar".into(),
+                },
+                source: InstallSource::Catalog {
+                    registry_id: "test-item".into(),
+                    modrinth_id: None,
+                },
+                hashes: ExpectedHashes::published("manual.jar", None, Some(&sha), None).unwrap(),
+                accept_hash_confirmation: false,
+            },
             bytes,
         )
         .unwrap();
@@ -682,20 +649,22 @@ fn catalog_and_modrinth_provenance_survive_an_offline_add() {
     let catalog = service
         .commit_verified_artifact(
             &guard,
-            "first",
-            "catalog.jar",
-            "mod",
-            "https://example.invalid/catalog.jar",
-            Some("catalog-mod"),
-            None,
-            "registry",
-            Some("1.0.0"),
-            None,
-            Some(&catalog_sha),
-            None,
-            None,
-            None,
-            false,
+            &InstallRequest {
+                instance_id: "first".into(),
+                target: InstallTarget {
+                    filename: "catalog.jar".into(),
+                    content_type: "mod".into(),
+                    version: Some("1.0.0".into()),
+                    download_url: "https://example.invalid/catalog.jar".into(),
+                },
+                source: InstallSource::Catalog {
+                    registry_id: "catalog-mod".into(),
+                    modrinth_id: None,
+                },
+                hashes: ExpectedHashes::published("catalog.jar", None, Some(&catalog_sha), None)
+                    .unwrap(),
+                accept_hash_confirmation: false,
+            },
             catalog_bytes,
         )
         .unwrap();
@@ -706,20 +675,21 @@ fn catalog_and_modrinth_provenance_survive_an_offline_add() {
     let raw = service
         .commit_verified_artifact(
             &guard,
-            "first",
-            "raw.jar",
-            "mod",
-            "https://cdn.modrinth.com/data/modrinth-raw/versions/1/raw.jar",
-            None,
-            Some("modrinth-raw"),
-            "modrinth_raw",
-            Some("1.0.0"),
-            None,
-            Some(&raw_sha),
-            None,
-            None,
-            None,
-            false,
+            &InstallRequest {
+                instance_id: "first".into(),
+                target: InstallTarget {
+                    filename: "raw.jar".into(),
+                    content_type: "mod".into(),
+                    version: Some("1.0.0".into()),
+                    download_url: "https://cdn.modrinth.com/data/modrinth-raw/versions/1/raw.jar"
+                        .into(),
+                },
+                source: InstallSource::Modrinth {
+                    project_id: "modrinth-raw".into(),
+                },
+                hashes: ExpectedHashes::published("raw.jar", None, Some(&raw_sha), None).unwrap(),
+                accept_hash_confirmation: false,
+            },
             raw_bytes,
         )
         .unwrap();
@@ -1034,20 +1004,21 @@ fn review_remove_never_deletes_a_same_named_file_in_another_folder() {
     service
         .commit_verified_artifact(
             &guard,
-            "test",
-            "Pack.zip",
-            "shader",
-            "https://example.invalid/Pack.zip",
-            None,
-            None,
-            "registry",
-            Some("1.0.0"),
-            None,
-            Some(&sha),
-            None,
-            None,
-            None,
-            false,
+            &InstallRequest {
+                instance_id: "test".into(),
+                target: InstallTarget {
+                    filename: "Pack.zip".into(),
+                    content_type: "shader".into(),
+                    version: Some("1.0.0".into()),
+                    download_url: "https://example.invalid/Pack.zip".into(),
+                },
+                source: InstallSource::Catalog {
+                    registry_id: "test-item".into(),
+                    modrinth_id: None,
+                },
+                hashes: ExpectedHashes::published("Pack.zip", None, Some(&sha), None).unwrap(),
+                accept_hash_confirmation: false,
+            },
             bytes,
         )
         .unwrap();

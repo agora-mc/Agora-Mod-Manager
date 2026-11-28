@@ -10,9 +10,7 @@ use crate::install_pipeline::{
 };
 use crate::resolver::Resolver;
 use ac::{
-    artifact_hash::{
-        blank_asserted_hash, is_sha256_hex, verify_download, ConfirmableHash, HashOrigin,
-    },
+    artifact_hash::{verify_download, ConfirmableHash, HashOrigin, Sha1, Sha256, Sha512},
     ctx::Ctx,
     dependency_ops::AliasMap,
     error::{LauncherError, LauncherResult},
@@ -31,6 +29,182 @@ pub struct InstanceLoadResult {
     pub instance_dir: PathBuf,
     pub manifest: InstanceManifest,
     pub registry_revision: String,
+}
+
+// ---------------------------------------------------------------------------
+// InstallRequest (MASTER_SPEC §32.5)
+// ---------------------------------------------------------------------------
+
+/// Where a single-file install comes from. The manifest's `source` string and
+/// the content store's provenance are derived from the variant, never passed
+/// beside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallSource {
+    /// A catalog entry, resolved through its download sources.
+    Catalog {
+        registry_id: String,
+        /// The entry's Modrinth project, when it has one.
+        modrinth_id: Option<String>,
+    },
+    /// A Modrinth project version installed directly, outside the catalog.
+    Modrinth { project_id: String },
+}
+
+impl InstallSource {
+    /// The manifest's `source` value for a file installed from here.
+    pub fn stored_source(&self) -> &'static str {
+        match self {
+            InstallSource::Catalog { .. } => "registry",
+            InstallSource::Modrinth { .. } => "modrinth_raw",
+        }
+    }
+
+    fn registry_id(&self) -> Option<&str> {
+        match self {
+            InstallSource::Catalog { registry_id, .. } => Some(registry_id),
+            InstallSource::Modrinth { .. } => None,
+        }
+    }
+
+    fn modrinth_id(&self) -> Option<&str> {
+        match self {
+            InstallSource::Catalog { modrinth_id, .. } => modrinth_id.as_deref(),
+            InstallSource::Modrinth { project_id } => Some(project_id),
+        }
+    }
+
+    /// The content store's provider and its id for the item.
+    fn provenance(&self) -> (&'static str, &str) {
+        match self {
+            InstallSource::Catalog { registry_id, .. } => ("catalog", registry_id),
+            InstallSource::Modrinth { project_id } => ("modrinth", project_id),
+        }
+    }
+}
+
+/// The file a single-file install writes, and where it is downloaded from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallTarget {
+    /// One portable file name; refused before anything is written otherwise.
+    pub filename: String,
+    /// `mod`, `resourcepack`, `shader`, ...; empty means `mod`.
+    pub content_type: String,
+    /// The release the file belongs to, when the source names one.
+    pub version: Option<String>,
+    pub download_url: String,
+}
+
+/// Every hash a single-file install is checked against, other than the one
+/// Agora remembers from an earlier install of the same release file (that is
+/// read from the instance, [`HashOrigin::PreviousInstall`]).
+///
+/// Each one is a parsed digest: a field that is present was supplied and is
+/// well formed, and "none" is `None`, never an empty string. So a blank or
+/// malformed hash is refused where it is read, before any download.
+///
+/// The five are separate on purpose: they differ in who vouches for the file
+/// and in what a mismatch does, so none of them merges into another.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExpectedHashes {
+    /// Published by the source (Modrinth's file hashes, GitHub's asset digest,
+    /// the manifest hash of a `direct_hash` or `technic_pack` entry, which names
+    /// its one file). Every one present must match, and nothing overrides a
+    /// mismatch. A file with none of the three is installed as not verified.
+    pub published_sha1: Option<Sha1>,
+    pub published_sha256: Option<Sha256>,
+    pub published_sha512: Option<Sha512>,
+    /// The SHA-256 a shared pack file lists for this file
+    /// ([`HashOrigin::PackPin`]). A mismatch asks the user first; a match is
+    /// never counted as the source having verified the file.
+    pub pack_sha256: Option<Sha256>,
+    /// The catalog curator's pin for this release file
+    /// ([`HashOrigin::CuratorPin`]). A mismatch asks the user first.
+    pub curator_sha256: Option<Sha256>,
+}
+
+impl ExpectedHashes {
+    /// The hashes a source published for `file`, parsed (`None` for one it did
+    /// not publish).
+    pub fn published(
+        file: &str,
+        sha1: Option<&str>,
+        sha256: Option<&str>,
+        sha512: Option<&str>,
+    ) -> LauncherResult<Self> {
+        Ok(Self {
+            published_sha1: Sha1::parse_optional(file, "published SHA-1", sha1)?,
+            published_sha256: Sha256::parse_optional(file, "published SHA-256", sha256)?,
+            published_sha512: Sha512::parse_optional(file, "published SHA-512", sha512)?,
+            pack_sha256: None,
+            curator_sha256: None,
+        })
+    }
+
+    /// Add the pack file's hash for `file`, if it lists one.
+    pub fn with_pack_hash(mut self, file: &str, sha256: Option<&str>) -> LauncherResult<Self> {
+        self.pack_sha256 = Sha256::parse_optional(file, "pack hash", sha256)?;
+        Ok(self)
+    }
+
+    /// Add the curator's pin for `file`, if the catalog has one.
+    pub fn with_curator_pin(mut self, file: &str, sha256: Option<&str>) -> LauncherResult<Self> {
+        self.curator_sha256 = Sha256::parse_optional(file, "curator pin", sha256)?;
+        Ok(self)
+    }
+}
+
+/// One single-file install: what to write, from where, checked against what.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallRequest {
+    pub instance_id: String,
+    pub target: InstallTarget,
+    pub source: InstallSource,
+    pub hashes: ExpectedHashes,
+    /// The user's answer to `ERR_HASH_CONFIRMATION_REQUIRED`: install a file
+    /// that differs from a pack hash, a curator pin or an earlier install's
+    /// hash. Never lets a mismatch against a published hash through.
+    pub accept_hash_confirmation: bool,
+}
+
+impl InstallRequest {
+    /// A catalog entry's release file, with the hashes its source and its
+    /// curator assert for it. Fails, before anything is downloaded, when one of
+    /// them is blank or malformed.
+    pub fn for_catalog_candidate(
+        instance_id: &str,
+        item: &ac::registry::RegistryItem,
+        candidate: &ac::models::ModVersionCandidate,
+    ) -> LauncherResult<Self> {
+        let file = candidate.filename.as_str();
+        let published_sha256 =
+            crate::agora_pack_import::expected_sha256_for_candidate(item, candidate)?;
+        let curator_pin = crate::resolver::curator_pins_for(item, candidate)
+            .into_iter()
+            .next()
+            .map(|pin| pin.sha256);
+        let hashes = ExpectedHashes::published(
+            file,
+            candidate.sha1.as_deref(),
+            published_sha256.as_deref(),
+            candidate.sha512.as_deref(),
+        )?
+        .with_curator_pin(file, curator_pin.as_deref())?;
+        Ok(Self {
+            instance_id: instance_id.to_string(),
+            target: InstallTarget {
+                filename: candidate.filename.clone(),
+                content_type: item.content_type.clone(),
+                version: Some(candidate.version.clone()),
+                download_url: candidate.download_url.clone(),
+            },
+            source: InstallSource::Catalog {
+                registry_id: item.id.clone(),
+                modrinth_id: item.modrinth_id.clone(),
+            },
+            hashes,
+            accept_hash_confirmation: false,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -425,130 +599,39 @@ impl InstallService {
     /// This is a convenience method for direct installs that bypass the full
     /// pipeline (snapshot, staging, health scan). For production use, prefer
     /// `resolve_and_execute` through the pipeline.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn install_artifact(
-        &self,
-        instance_id: &str,
-        filename: &str,
-        content_type: &str,
-        download_url: &str,
-        registry_id: Option<&str>,
-        modrinth_id: Option<&str>,
-        source: &str,
-        version: Option<&str>,
-        expected_sha1: Option<&str>,
-        expected_sha256: Option<&str>,
-        pinned_sha256: Option<&str>,
-        accept_hash_confirmation: bool,
-    ) -> LauncherResult<InstalledMod> {
-        self.check_not_locked(instance_id)?;
-
-        let dir = self.ctx.paths.instance_dir(instance_id)?;
-        ac::helpers::check_disk_space(&dir)?;
-
-        let bytes = ac::download::download_mod_bytes(&self.ctx.http_clients, download_url).await?;
-        let guard = self.mutation_guard(instance_id, "install_artifact")?;
-
-        self.commit_verified_artifact(
-            &guard,
-            instance_id,
-            filename,
-            content_type,
-            download_url,
-            registry_id,
-            modrinth_id,
-            source,
-            version,
-            expected_sha1,
-            expected_sha256,
-            None,
-            None,
-            pinned_sha256,
-            accept_hash_confirmation,
-            bytes,
-        )
-    }
-
-    /// [`install_artifact`](Self::install_artifact) plus a SHA-256 a shared pack
-    /// file pinned for this exact file, on top of whatever the source published.
     ///
-    /// A hash published by the source is checked whenever there is one, and a
-    /// mismatch there is final. The pack's hash is a separate pin: checked before
-    /// anything is written, and a mismatch stops with
-    /// `HashConfirmationRequired` (origin `PackPin`) unless
-    /// `accept_hash_confirmation` says the user chose to install it anyway. When
-    /// the source published nothing, the pack's hash is still not counted as the
-    /// source having verified the file (`hash_verified` stays `false`).
-    /// `pinned_sha256` is the catalog's curator pin for this file, held the same
-    /// way a single-mod install holds it (a mismatch asks first).
-    #[allow(clippy::too_many_arguments)]
-    pub async fn install_artifact_pinned(
-        &self,
-        instance_id: &str,
-        filename: &str,
-        content_type: &str,
-        download_url: &str,
-        registry_id: Option<&str>,
-        modrinth_id: Option<&str>,
-        source: &str,
-        version: Option<&str>,
-        expected_sha1: Option<&str>,
-        expected_sha256: Option<&str>,
-        required_sha256: Option<&str>,
-        expected_sha512: Option<&str>,
-        pinned_sha256: Option<&str>,
-        accept_hash_confirmation: bool,
-    ) -> LauncherResult<InstalledMod> {
+    /// Every hash in the request was parsed when it was built, so a blank or
+    /// malformed one never reaches the download.
+    pub async fn install_artifact(&self, request: &InstallRequest) -> LauncherResult<InstalledMod> {
+        let instance_id = request.instance_id.as_str();
         self.check_not_locked(instance_id)?;
 
         let dir = self.ctx.paths.instance_dir(instance_id)?;
         ac::helpers::check_disk_space(&dir)?;
 
-        let bytes = ac::download::download_mod_bytes(&self.ctx.http_clients, download_url).await?;
+        let bytes =
+            ac::download::download_mod_bytes(&self.ctx.http_clients, &request.target.download_url)
+                .await?;
         let guard = self.mutation_guard(instance_id, "install_artifact")?;
 
-        self.commit_verified_artifact(
-            &guard,
-            instance_id,
-            filename,
-            content_type,
-            download_url,
-            registry_id,
-            modrinth_id,
-            source,
-            version,
-            expected_sha1,
-            expected_sha256,
-            required_sha256,
-            expected_sha512,
-            pinned_sha256,
-            accept_hash_confirmation,
-            bytes,
-        )
+        self.commit_verified_artifact(&guard, request, bytes)
     }
 
     /// Verify downloaded bytes and, only if every check passes, write them into
     /// the instance and record them in its manifest.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_verified_artifact(
         &self,
         guard: &agora_core::instance_runtime::InstanceGuard,
-        instance_id: &str,
-        filename: &str,
-        content_type: &str,
-        download_url: &str,
-        registry_id: Option<&str>,
-        modrinth_id: Option<&str>,
-        source: &str,
-        version: Option<&str>,
-        expected_sha1: Option<&str>,
-        expected_sha256: Option<&str>,
-        required_sha256: Option<&str>,
-        expected_sha512: Option<&str>,
-        pinned_sha256: Option<&str>,
-        accept_hash_confirmation: bool,
+        request: &InstallRequest,
         bytes: Vec<u8>,
     ) -> LauncherResult<InstalledMod> {
+        let instance_id = request.instance_id.as_str();
+        let filename = request.target.filename.as_str();
+        let download_url = request.target.download_url.as_str();
+        let version = request.target.version.as_deref();
+        let registry_id = request.source.registry_id();
+        let modrinth_id = request.source.modrinth_id();
+        let hashes = &request.hashes;
         if guard.instance_id() != instance_id {
             return Err(LauncherError::Generic {
                 code: "ERR_INSTANCE_GUARD".into(),
@@ -573,31 +656,16 @@ impl InstallService {
         // earlier install all ask the user before a mismatch is installed. See
         // agora_core::artifact_hash.
         let mut expectations = Vec::new();
-        if let Some(required) = required_sha256 {
-            let required = required.trim().to_lowercase();
-            if required.is_empty() {
-                return Err(blank_asserted_hash(filename, "pack hash"));
-            }
-            // A pack hash that is not a well-formed digest can never be matched, so
-            // it is refused outright: confirming it would install an unchecked file.
-            if !is_sha256_hex(&required) {
-                return Err(LauncherError::HashMismatch);
-            }
+        if let Some(pack) = &hashes.pack_sha256 {
             expectations.push(ConfirmableHash {
                 origin: HashOrigin::PackPin,
-                sha256: required,
+                sha256: pack.to_string(),
             });
         }
-        if let Some(pin) = pinned_sha256 {
-            let pin = pin.trim().to_lowercase();
-            // A blank curator pin is an assertion that cannot be checked, not
-            // an absent pin. Dropping it would install an unchecked file.
-            if pin.is_empty() {
-                return Err(blank_asserted_hash(filename, "curator pin"));
-            }
+        if let Some(pin) = &hashes.curator_sha256 {
             expectations.push(ConfirmableHash {
                 origin: HashOrigin::CuratorPin,
-                sha256: pin,
+                sha256: pin.to_string(),
             });
         }
         if let Some(remembered) = registry_id.and_then(|id| {
@@ -622,20 +690,20 @@ impl InstallService {
         }
         let check = verify_download(
             &bytes,
-            expected_sha1,
-            expected_sha256,
-            expected_sha512,
+            hashes.published_sha1.as_ref().map(Sha1::as_str),
+            hashes.published_sha256.as_ref().map(Sha256::as_str),
+            hashes.published_sha512.as_ref().map(Sha512::as_str),
             &expectations,
-            accept_hash_confirmation,
+            request.accept_hash_confirmation,
             filename,
             version,
         )?;
         let installed_sha256 = check.sha256;
         let hash_verified = check.verified;
-        let content_type = if content_type.is_empty() {
+        let content_type = if request.target.content_type.is_empty() {
             "mod"
         } else {
-            content_type
+            request.target.content_type.as_str()
         };
         let target_dir = dir.join(agora_core::helpers::content_subdir(content_type));
         let item_path = target_dir.join(filename);
@@ -648,17 +716,7 @@ impl InstallService {
             std::fs::create_dir_all(&incoming).map_err(|_| LauncherError::InstanceCreateFailed)?;
             let temp = incoming.join(format!("{}.bin", uuid::Uuid::new_v4().simple()));
             std::fs::write(&temp, &bytes).map_err(|_| LauncherError::InstanceCreateFailed)?;
-            let (provider, provider_id) = if source == "registry" || source == "curated" {
-                (Some("catalog"), registry_id)
-            } else if source == "modrinth_raw" || source == "modrinth" {
-                (Some("modrinth"), modrinth_id)
-            } else if source == "provider" {
-                (Some("provider"), registry_id.or(modrinth_id))
-            } else if source == "manual" || source == "manual_drag_drop" {
-                (Some("manual"), None)
-            } else {
-                (None, None)
-            };
+            let (provider, provider_id) = request.source.provenance();
             let stored = crate::content_bridge::store_file(
                 &self.ctx,
                 &temp,
@@ -669,8 +727,8 @@ impl InstallService {
                     page_url: Some(download_url),
                     description: None,
                     catalog_id: registry_id.or(modrinth_id),
-                    provider,
-                    provider_id,
+                    provider: Some(provider),
+                    provider_id: Some(provider_id),
                     provider_origin: None,
                 },
             );
@@ -699,7 +757,7 @@ impl InstallService {
                 filename: filename.to_string(),
                 registry_id: registry_id.map(|s| s.to_string()),
                 modrinth_id: modrinth_id.map(|s| s.to_string()),
-                source: source.to_string(),
+                source: request.source.stored_source().to_string(),
                 source_url: Some(download_url.to_string()),
                 version: version.map(|s| s.to_string()),
                 sha256: installed_sha256,

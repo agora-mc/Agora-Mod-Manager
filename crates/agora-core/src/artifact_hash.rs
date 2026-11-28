@@ -52,9 +52,13 @@ pub struct ConfirmableHash {
 
 /// A hash Agora or a pack author asserted is blank. A blank assertion is never
 /// "no pin": it would silently drop a check the curator or pack asked for, so
-/// it is an error that names the item and the field it came from. A blank hash
-/// a third-party source published is *not* this error; that still means "the
-/// source published nothing" and is reported as an unverified install.
+/// it is an error that names the item and the field it came from.
+///
+/// A digest parsed into [`Sha1`], [`Sha256`] or [`Sha512`] reports a blank as
+/// this error whoever supplied it, a source included: "the source published
+/// nothing" is `None`, never an empty string (MASTER_SPEC §32.5). Only
+/// [`verify_download`]'s string inputs, for its callers that do not parse their
+/// digests yet, still read a blank published hash as none published.
 pub fn blank_asserted_hash(item: &str, field: &str) -> crate::error::LauncherError {
     crate::error::LauncherError::Generic {
         code: "ERR_ASSERTED_HASH_BLANK".into(),
@@ -63,6 +67,85 @@ pub fn blank_asserted_hash(item: &str, field: &str) -> crate::error::LauncherErr
         ),
     }
 }
+
+/// A hash that is present but is not a digest of its kind. It can never be
+/// matched, so installing against it would install an unchecked file.
+pub fn malformed_hash(item: &str, field: &str, kind: &str) -> crate::error::LauncherError {
+    crate::error::LauncherError::Generic {
+        code: "ERR_HASH_MALFORMED".into(),
+        message: format!(
+            "'{item}' has a {field} that is not a valid {kind} digest; refusing to install it."
+        ),
+    }
+}
+
+macro_rules! digest_type {
+    ($(#[$doc:meta])* $name:ident, $hex_len:expr, $kind:expr) => {
+        $(#[$doc])*
+        ///
+        /// Lowercase hex, checked when it was parsed: holding one means a digest
+        /// was supplied and is well formed. "None supplied" is `Option::None`.
+        #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+        pub struct $name(String);
+
+        impl $name {
+            /// Parse `text` as the `field` of `item` (both name the hash in the
+            /// error). Surrounding whitespace and letter case are ignored. A blank
+            /// is [`blank_asserted_hash`]; anything else that is not
+            #[doc = concat!(stringify!($hex_len), " hex characters is [`malformed_hash`].")]
+            pub fn parse(item: &str, field: &str, text: &str) -> crate::error::LauncherResult<Self> {
+                let value = text.trim();
+                if value.is_empty() {
+                    return Err(blank_asserted_hash(item, field));
+                }
+                if value.len() != $hex_len || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err(malformed_hash(item, field, $kind));
+                }
+                Ok(Self(value.to_ascii_lowercase()))
+            }
+
+            /// [`parse`](Self::parse) for a field that may be absent: `None` stays
+            /// `None`; a present value must parse.
+            pub fn parse_optional(
+                item: &str,
+                field: &str,
+                text: Option<&str>,
+            ) -> crate::error::LauncherResult<Option<Self>> {
+                text.map(|text| Self::parse(item, field, text)).transpose()
+            }
+
+            /// The lowercase hex digest.
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+    };
+}
+
+digest_type!(
+    /// A SHA-1 digest.
+    Sha1,
+    40,
+    "SHA-1"
+);
+digest_type!(
+    /// A SHA-256 digest.
+    Sha256,
+    64,
+    "SHA-256"
+);
+digest_type!(
+    /// A SHA-512 digest.
+    Sha512,
+    128,
+    "SHA-512"
+);
 
 /// Whether `value` is a well-formed SHA-256 hex digest (64 hex characters).
 pub fn is_sha256_hex(value: &str) -> bool {
@@ -190,6 +273,85 @@ pub fn verify_download(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_digest_parses_trimmed_and_lowercased() {
+        let upper = format!("  {}	", "AB".repeat(32));
+        let parsed = Sha256::parse("a.jar", "pack hash", &upper).expect("well formed");
+        assert_eq!(parsed.as_str(), "ab".repeat(32));
+        assert_eq!(
+            Sha1::parse("a.jar", "f", &"0f".repeat(20))
+                .unwrap()
+                .as_str(),
+            "0f".repeat(20)
+        );
+        assert_eq!(
+            Sha512::parse("a.jar", "f", &"9e".repeat(64))
+                .unwrap()
+                .as_str(),
+            "9e".repeat(64)
+        );
+    }
+
+    #[test]
+    fn a_blank_digest_is_an_error_never_none_published() {
+        for blank in [
+            "", " ", "	
+",
+        ] {
+            for error in [
+                Sha1::parse("a.jar", "published SHA-1", blank).unwrap_err(),
+                Sha256::parse("a.jar", "published SHA-256", blank).unwrap_err(),
+                Sha512::parse("a.jar", "published SHA-512", blank).unwrap_err(),
+            ] {
+                assert_eq!(error.code(), "ERR_ASSERTED_HASH_BLANK", "{blank:?}");
+                assert!(error.to_string().contains("a.jar"), "{error}");
+            }
+            assert!(
+                Sha256::parse_optional("a.jar", "f", Some(blank)).is_err(),
+                "{blank:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_digest_is_an_error() {
+        type Parse = fn(&str) -> crate::error::LauncherResult<()>;
+        let cases: [(&str, Parse); 3] = [
+            ("sha1", |t| Sha1::parse("a.jar", "f", t).map(|_| ())),
+            ("sha256", |t| Sha256::parse("a.jar", "f", t).map(|_| ())),
+            ("sha512", |t| Sha512::parse("a.jar", "f", t).map(|_| ())),
+        ];
+        for (kind, parse) in cases {
+            for bad in [
+                "ab".to_string(),
+                "zz".repeat(64),
+                "ab".repeat(20) + "a",
+                "ab".repeat(32) + "ab",
+                format!("sha256:{}", "ab".repeat(32)),
+                "ab ".repeat(32),
+            ] {
+                let error = parse(&bad).unwrap_err();
+                assert_eq!(error.code(), "ERR_HASH_MALFORMED", "{kind} {bad:?}");
+            }
+        }
+        // Each kind takes only its own length.
+        assert!(Sha1::parse("a.jar", "f", &"ab".repeat(32)).is_err());
+        assert!(Sha256::parse("a.jar", "f", &"ab".repeat(20)).is_err());
+        assert!(Sha512::parse("a.jar", "f", &"ab".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn an_absent_digest_stays_absent() {
+        assert_eq!(Sha256::parse_optional("a.jar", "f", None).unwrap(), None);
+        assert_eq!(
+            Sha1::parse_optional("a.jar", "f", Some(&"AA".repeat(20)))
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "aa".repeat(20)
+        );
+    }
 
     fn pin(sha256: &str) -> ConfirmableHash {
         ConfirmableHash {
